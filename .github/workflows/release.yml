@@ -1,0 +1,74 @@
+name: Release
+
+# release-please keeps one release PR that collects every merged PR since the last release.
+# Merging that PR bumps the version, writes CHANGELOG.md, tags vX.Y.Z and publishes the GitHub release.
+# Then the branch `latest` moves to the release, so `github:Patrick-Kappen/pi-git/latest` is the newest release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          # A PR opened with GITHUB_TOKEN does not start CI. Set RELEASE_PLEASE_TOKEN (a fine-grained
+          # token with contents and pull-requests write) to get CI on the release PR.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  verify-release:
+    name: Check the released tag
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - name: nix flake check
+        run: |
+          if [ -f flake.nix ]; then
+            nix flake check --print-build-logs
+          fi
+
+  latest-branch:
+    name: Move the latest branch to the release
+    needs: [release-please, verify-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Point refs/heads/latest at the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          sha="$(gh api "repos/${REPO}/commits/${TAG}" --jq .sha)"
+          if gh api "repos/${REPO}/git/ref/heads/latest" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${REPO}/git/refs/heads/latest" -f sha="${sha}" -F force=true
+          else
+            gh api -X POST "repos/${REPO}/git/refs" -f ref=refs/heads/latest -f sha="${sha}"
+          fi

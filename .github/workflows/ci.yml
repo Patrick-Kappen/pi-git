@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pr-title:
+    name: PR title is a Conventional Commit
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      # Squash merges use the PR title as the commit message, and release-please reads that message.
+      - name: convco check
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        # convco needs a git repository, even when it reads the message from stdin.
+        run: |
+          cd "$(mktemp -d)"
+          git init -q
+          printf '%s\n' "$TITLE" | nix run nixpkgs#convco -- check --from-stdin
+
+  check:
+    name: devenv test (hooks, lint, types, tests, security, nix flake check)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: devenv
+      - name: Install devenv
+        run: nix profile install nixpkgs#devenv
+      - name: Commit messages of the PR are Conventional Commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: devenv shell -- convco check "$BASE..$HEAD"
+      - name: devenv test
+        env:
+          # CI checks main itself; the hook only stops local commits on main.
+          SKIP: no-commit-to-branch
+        run: devenv test
