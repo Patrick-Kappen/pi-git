@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Runs the hooks from devenv.nix. Global hooks call this file; otherwise core.hooksPath points here.
+set -euo pipefail
+name="$(basename "$0")"
+runner="$(git rev-parse --show-toplevel)/.devenv/profile/bin/git-hook"
+if [[ ! -x ${runner} ]]; then
+  echo "${name}: run 'devenv shell' once in this checkout to build the hooks" >&2
+  exit 1
+fi
+exec "${runner}" "${name}" "$@"

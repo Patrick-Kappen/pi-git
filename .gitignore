@@ -1,0 +1,30 @@
+# devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+.direnv
+.pre-commit-config.yaml
+
+# nix
+result
+result-*
+
+# tests
+coverage/
+
+# Agent files: local to the owner, never part of the project
+AGENTS.md
+.AGENTS.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+.claude/
+.cursor/
+.cursorrules
+.windsurfrules
+.clinerules
+.github/copilot-instructions.md
+.pi/
+
+# node
+node_modules/

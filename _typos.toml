@@ -1,0 +1,2 @@
+[files]
+extend-exclude = ["*.lock", "package-lock.json", "CHANGELOG.md"]
