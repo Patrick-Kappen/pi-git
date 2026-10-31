@@ -157,7 +157,8 @@ const watchPr = vi.fn(async (repo: string, number: number) => {
   saveEntry(config.stateDir, { id: entryId(repo, number), repo, number } as Entry);
   return undefined;
 });
-const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr });
+// One pass per tick, so each test can look at every step; "a round keeps going" tests the default.
+const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr }, 1);
 
 beforeEach(() => {
   n++;
@@ -268,8 +269,10 @@ describe("shipTick", () => {
   test("the whole chain: merge, release, lock, merge, deploy", async () => {
     await plan(["o/pi-git"]);
     let ship = await tick();
-    // pi-git merged #1; pi-skills (behind only) is done at once; NixOS waits for the libraries.
-    expect(world.merged).toContain("o/pi-git#1");
+    // At the same time: pi-git merged #1, pi-skills (behind only) is done, and NixOS merged its own
+    // #5 with a merge commit (its setting) without waiting for the libraries.
+    expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5"]);
+    expect(calls).toContain("gh pr merge 5 -R o/Nixos --merge --match-head-commit sha5");
     expect(ship?.libs.map((lib) => lib.state)).toEqual(["release", "done"]);
     expect(ship?.nixos.state).toBe("libs");
 
@@ -285,12 +288,9 @@ describe("shipTick", () => {
     world.tags["o/pi-git@v0.3.0"] = "new-git";
     world.latest["o/pi-git"] = "new-git";
     ship = await tick();
-    // pi-git done; NixOS merges #5 with a merge commit (its setting), then opens the flake.lock PR.
+    // pi-git done; NixOS locks the releases.
     expect(ship?.libs[0]?.state).toBe("done");
-    expect(ship?.nixos).toMatchObject({ state: "merge", inputs: ["pi-git", "pi-skills"] });
-    ship = await tick();
-    expect(calls).toContain("gh pr merge 5 -R o/Nixos --merge --match-head-commit sha5");
-    expect(ship?.nixos.state).toBe("update");
+    expect(ship?.nixos).toMatchObject({ state: "update", inputs: ["pi-git", "pi-skills"] });
 
     ship = await tick();
     expect(calls.some((line) => line === "nix flake update pi-git pi-skills")).toBe(true);
@@ -324,6 +324,18 @@ describe("shipTick", () => {
     expect(calls).toEqual([]);
   });
 
+  test("a round keeps going while something moves: from merge to the flake.lock PR in one round", async () => {
+    world.releaseRun = { status: "completed", conclusion: "success" };
+    world.tags["o/pi-git@v0.3.0"] = "new-git";
+    world.latest["o/pi-git"] = "new-git";
+    await plan(["o/pi-git"]);
+    const ship = await shipTick({ run: fake, config, gitPr, now: () => clock, watchPr });
+    expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5", "o/pi-git#9"]);
+    expect(ship?.libs[0]).toMatchObject({ state: "done", tag: "v0.3.0" });
+    // It stops where it has to wait: the checks of the flake.lock PR.
+    expect(ship?.nixos).toMatchObject({ state: "check", pr: 77 });
+  });
+
   test("a failing release workflow: that library needs you, the rest goes on", async () => {
     await plan(["o/pi-git"]);
     await tick();
@@ -337,7 +349,7 @@ describe("shipTick", () => {
       ["failed", "pi-git ship: o/pi-git needs you: the release workflow ended with failure"],
     ]);
     // NixOS continues with pi-skills only.
-    expect(ship?.nixos).toMatchObject({ state: "merge", inputs: ["pi-skills"] });
+    expect(ship?.nixos).toMatchObject({ state: "update", inputs: ["pi-skills"] });
   });
 
   test("waiting longer than the stage timeout fails the stage", async () => {
@@ -353,8 +365,8 @@ describe("shipTick", () => {
     world.latest = { "o/pi-git": "old-git", "o/pi-skills": "skills-latest" };
     await plan([]);
     let ship = await tick();
-    // Only NixOS #5: merged, then the deploy of its merge commit.
-    expect(ship?.nixos.state).toBe("merge");
+    // Only NixOS #5: merged at once, then the deploy of its merge commit.
+    expect(ship?.nixos.state).toBe("libs");
     ship = await tick();
     expect(ship?.nixos).toMatchObject({ state: "deploy", mergeSha: "merge-5" });
     world.deploy = { name: "x deploy-gaia", status: "completed", conclusion: "failure" };
@@ -387,7 +399,7 @@ describe("shipTick", () => {
     // Merging #1 makes #4 conflict: the watcher gets it, the ship waits.
     world.prs["o/pi-git"] = [pr(1, "feat: one"), pr(4, "feat: two", { mergeable: "CONFLICTING" })];
     let ship = await tick();
-    expect(world.merged).toEqual(["o/pi-git#1"]);
+    expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5"]);
     expect(watched).toEqual(["o/pi-git#4"]);
     expect(ship?.libs[0]).toMatchObject({ state: "merge", adopted: [4] });
     // Still conflicting while the watcher works: not handed over twice.
@@ -563,13 +575,13 @@ describe("shipTick", () => {
     ]);
     saveShip(config.stateDir, createShip(index, [], "gaia", clock));
     let ship = await tick();
-    expect(world.merged).toEqual(["o/pi-git#7"]);
+    expect(world.merged).toEqual(["o/pi-git#7", "o/Nixos#5"]);
     expect(calls.some((line) => line.startsWith("gh pr merge 8"))).toBe(false);
     expect(ship?.libs[0]?.state).toBe("merge");
     // GitHub moved #8 to main after #7 was merged.
     world.prs["o/pi-git"] = [pr(7, "feat: base"), pr(8, "feat: top", { baseRefName: "main" })];
     ship = await tick();
-    expect(world.merged).toEqual(["o/pi-git#7", "o/pi-git#8"]);
+    expect(world.merged).toEqual(["o/pi-git#7", "o/Nixos#5", "o/pi-git#8"]);
     expect(ship?.libs[0]?.state).toBe("done");
   });
 

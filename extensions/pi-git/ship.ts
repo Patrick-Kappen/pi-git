@@ -322,7 +322,7 @@ export function createShip(
         state: "merge" as const,
         since,
       })),
-    nixos: { repo: index.nixos.repo, root: index.nixos.root, prs: index.nixos.ready, state: "libs", since },
+    nixos: { repo: index.nixos.repo, root: index.nixos.root, prs: index.nixos.ready, state: "merge", since },
   };
 }
 
@@ -727,18 +727,20 @@ class Shipping {
     if (n.state === "deploy") return this.nixDeploy(n);
   }
 
+  /** The configuration's own PRs do not wait for the libraries: merged at once. */
+  private async nixMerge(n: NixItem): Promise<void> {
+    const method = await this.mergeMethod(n.repo);
+    if (!(await this.mergeAll(n, n.prs, method))) return;
+    this.move(n, "libs");
+  }
+
+  /** Once every library is done or failed: lock the releases, or deploy the merged PRs, or nothing. */
   private async nixLibs(n: NixItem): Promise<void> {
     if (this.ship.libs.some((lib) => lib.state !== "done" && lib.state !== "failed")) return;
     n.inputs = this.ship.libs
       .filter((lib) => lib.state === "done" && ((lib.release && lib.tag) || lib.behind))
       .map((lib) => lib.input);
-    this.move(n, "merge");
-  }
-
-  private async nixMerge(n: NixItem): Promise<void> {
-    const method = await this.mergeMethod(n.repo);
-    if (!(await this.mergeAll(n, n.prs, method))) return;
-    if ((n.inputs ?? []).length > 0) return this.move(n, "update");
+    if (n.inputs.length > 0) return this.move(n, "update");
     const last = n.prs.at(-1);
     if (!last) return this.move(n, "done");
     const sha = await this.gh([
@@ -901,8 +903,20 @@ class Shipping {
   }
 }
 
-/** One round of the running ship, from the watcher: every item as far as it can go without waiting. */
-export async function shipTick(deps: ShipDeps): Promise<Ship | undefined> {
+/** While a ship runs, the watcher looks this often within one run of its timer, */
+export const SHIP_POLL_MS = 10_000;
+/** for at most this long, so it ends before the timer starts it again. */
+export const SHIP_WINDOW_MS = 45_000;
+
+/** Passes per round: each moves every part as far as it can; a round stops early when nothing moved. */
+export const MAX_PASSES = 8;
+
+/**
+ * One round of the running ship, from the watcher. The libraries and the configuration move at the
+ * same time (they do not depend on each other until the flake.lock update), and a round keeps going
+ * while something moves, so nothing waits for the next round without a reason.
+ */
+export async function shipTick(deps: ShipDeps, passes = MAX_PASSES): Promise<Ship | undefined> {
   const ship = loadShip(deps.config.stateDir);
   if (ship?.status !== "running") return ship;
   const shipping = new Shipping(deps, ship);
@@ -910,12 +924,16 @@ export async function shipTick(deps: ShipDeps): Promise<Ship | undefined> {
     await shipping.review();
     saveShip(deps.config.stateDir, ship);
   }
-  for (const lib of ship.libs) {
-    await shipping.lib(lib);
+  for (let pass = 0; pass < passes && ship.status === "running"; pass++) {
+    const before = JSON.stringify(ship);
+    // The configuration merges its own PRs at the same time as the libraries; its later steps look
+    // at the libraries, so they come after them in the pass.
+    const nixFirst = ship.nixos.state === "merge";
+    await Promise.all([...ship.libs.map((lib) => shipping.lib(lib)), ...(nixFirst ? [shipping.nixos()] : [])]);
+    if (!nixFirst) await shipping.nixos();
+    await shipping.finishIfDone();
     saveShip(deps.config.stateDir, ship);
+    if (JSON.stringify(ship) === before) break;
   }
-  await shipping.nixos();
-  await shipping.finishIfDone();
-  saveShip(deps.config.stateDir, ship);
   return ship;
 }
