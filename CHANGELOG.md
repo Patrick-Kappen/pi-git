@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.2.0...v0.3.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** rebase a stacked PR on the next base after its base is merged ([#14](https://github.com/Patrick-Kappen/pi-git/issues/14)) ([dabcd3c](https://github.com/Patrick-Kappen/pi-git/commit/dabcd3c99dc3d96a584c6ee467bcd514afb830fd))
+* **pi-git:** show all open work with git_status, and watch PRs made by hand with git_watch ([#13](https://github.com/Patrick-Kappen/pi-git/issues/13)) ([8841a2c](https://github.com/Patrick-Kappen/pi-git/commit/8841a2ccb2c2517762fe04ecaf3715b78529547c))
+* **pi-git:** start changes with git_start, push with git_push, and one-shot worktree, push and pr ([#15](https://github.com/Patrick-Kappen/pi-git/issues/15)) ([2adc016](https://github.com/Patrick-Kappen/pi-git/commit/2adc01630875311b41b7dea7e8648eb5af960de7))
+
+
+### Bug Fixes
+
+* **pi-git:** deduplicate git_request guidance and attention ([#19](https://github.com/Patrick-Kappen/pi-git/issues/19)) ([a1a0276](https://github.com/Patrick-Kappen/pi-git/commit/a1a0276ac767603cbc6d6044e95d4ed52b179501))
+* **pi-git:** prune delivered summaries after seven days ([#18](https://github.com/Patrick-Kappen/pi-git/issues/18)) ([c5b62ea](https://github.com/Patrick-Kappen/pi-git/commit/c5b62ea5331d60fa16601b0b2585126aa9880dac))
+
 ## [0.2.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.1.0...v0.2.0) (2026-10-31)
 
 
