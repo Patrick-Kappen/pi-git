@@ -33,6 +33,8 @@ describe("defaults", () => {
       runtimeDir: "/home/u/.local/state/pi-git/run",
       shipNixos: undefined,
       shipHost: expect.any(String),
+      shipModel: "openai-codex/gpt-6-luna",
+      shipThinking: "medium",
       errors: [],
     });
     expect(defaults("p", { XDG_STATE_HOME: "/state" }, home).stateDir).toBe("/state/pi-git");

@@ -5,6 +5,7 @@ import { addAttention, notifyTerminals } from "./attention.ts";
 import type { Config } from "./config.ts";
 import { clipStart, outputOf, type Runner } from "./exec.ts";
 import { repoName, repoSlug } from "./git.ts";
+import { askJson } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { findMainCheckout } from "./start.ts";
 import { entryId, loadEntries } from "./state.ts";
@@ -50,8 +51,12 @@ export interface LibItem extends Stage {
   input: string;
   prs: ShipPr[];
   release: boolean;
-  /** PRs whose title becomes a feat, so their merge leads to a release (the owner chose it). */
+  /** PRs whose title gets a releasing type, so their merge leads to a release. */
   retitle?: number[];
+  /** The type for `retitle`: feat or fix, as the reviewing agent decided. */
+  retitleType?: "feat" | "fix";
+  /** PRs without a feat or fix: the reviewing agent decides whether they release. */
+  review?: number[];
   /** PRs handed to the watcher to fix (red checks, conflicts). */
   adopted?: number[];
   /** Whether the input needs a new lock even without a release here (an earlier release is not locked). */
@@ -81,6 +86,8 @@ export interface Ship {
   id: string;
   host: string;
   status: "running" | "done";
+  /** The reviewing agent decided the releases of the libraries in `review`. */
+  reviewed?: boolean;
   libs: LibItem[];
   nixos: NixItem;
 }
@@ -287,6 +294,9 @@ export function createShip(
         prs: lib.ready,
         release: releases.includes(lib.repo),
         ...(retitles[lib.repo] !== undefined ? { retitle: [retitles[lib.repo] as number] } : {}),
+        ...(lib.noRelease !== undefined && retitles[lib.repo] === undefined
+          ? { review: lib.ready.map((pr) => pr.number) }
+          : {}),
         behind: lib.behind,
         state: "merge" as const,
         since,
@@ -359,6 +369,41 @@ export async function watchPr(
   const watched = await gitWatch(tools, { pr: String(number), path: main, sessionId, quiet: true });
   return watched.ok ? undefined : watched.summary;
 }
+
+interface ReleaseDecision {
+  release: boolean;
+  pr?: number;
+  type?: "feat" | "fix";
+  reason: string;
+}
+
+function parseDecision(value: unknown): ReleaseDecision | Error {
+  if (typeof value !== "object" || value === null) return new Error("expected an object");
+  const v = value as Record<string, unknown>;
+  if (typeof v.release !== "boolean") return new Error('"release" must be true or false');
+  if (v.release && (typeof v.pr !== "number" || (v.type !== "feat" && v.type !== "fix"))) {
+    return new Error('a release needs "pr" (a number) and "type" (feat or fix)');
+  }
+  return {
+    release: v.release,
+    ...(typeof v.pr === "number" ? { pr: v.pr } : {}),
+    ...(v.type === "feat" || v.type === "fix" ? { type: v.type } : {}),
+    reason: typeof v.reason === "string" ? v.reason : "",
+  };
+}
+
+export const RELEASE_PROMPT = [
+  "You decide for pi-git /ship whether merged changes of a repository should be released.",
+  "The input has the open PRs that will be merged, with title, body and changed files; none is titled feat or fix,",
+  "so no release would follow on its own.",
+  "",
+  "Release when users of the repository get something different: code, behavior, configuration, a skill or",
+  "prompt that is shipped, or documentation that is part of the package. Do not release for CI, repository",
+  "tooling, tests only, or internal notes.",
+  "",
+  'Answer with JSON only: {"release": true, "pr": <number of the PR to retitle>, "type": "feat" | "fix",',
+  '"reason": "<one sentence>"} or {"release": false, "reason": "<one sentence>"}.',
+].join("\n");
 
 class Shipping {
   private readonly deps: ShipDeps;
@@ -491,6 +536,47 @@ class Shipping {
     return allowed?.squash === false && allowed.merge ? "--merge" : "--squash";
   }
 
+  /** The reviewing agent decides per library without a feat or fix whether it releases; no questions. */
+  async review(): Promise<void> {
+    const { config } = this.deps;
+    const agent = { ...config, model: config.shipModel, thinking: config.shipThinking, skill: undefined };
+    for (const item of this.ship.libs) {
+      if ((item.review ?? []).length === 0) continue;
+      await this.reviewLibrary(item, agent);
+    }
+    this.ship.reviewed = true;
+  }
+
+  private async reviewLibrary(
+    item: LibItem,
+    agent: Omit<Config, "model" | "thinking" | "skill"> & { model: string; thinking: string; skill: undefined },
+  ): Promise<void> {
+    const prs: string[] = [];
+    for (const number of item.review ?? []) {
+      const view = await this.gh(["pr", "view", String(number), "-R", item.repo, "--json", "number,title,body,files"]);
+      if (view) prs.push(clipStart(view, 6000));
+    }
+    const decision = await askJson(
+      this.deps.run,
+      agent,
+      {
+        cwd: this.ship.nixos.root,
+        prompt: RELEASE_PROMPT,
+        input: `Repository: ${item.repo}\n\n${prs.join("\n\n")}`,
+      },
+      parseDecision,
+    );
+    if (decision instanceof Error) {
+      this.deps.log?.(`pi-git ship: ${item.repo}: no release decision (${decision.message}); not released`);
+      return;
+    }
+    this.deps.log?.(`pi-git ship: ${item.repo}: ${decision.release ? "release" : "no release"}: ${decision.reason}`);
+    if (!decision.release || decision.pr === undefined || !(item.review ?? []).includes(decision.pr)) return;
+    item.release = true;
+    item.retitle = [decision.pr];
+    item.retitleType = decision.type ?? "feat";
+  }
+
   async lib(item: LibItem): Promise<void> {
     if (item.state === "merge") return this.libMerge(item);
     if (item.state === "release") return this.libRelease(item);
@@ -511,7 +597,7 @@ class Shipping {
     for (const number of item.retitle ?? []) {
       const pr = item.prs.find((entry) => entry.number === number);
       if (!pr || RELEASING.test(pr.title)) continue;
-      const title = pr.title.replace(/^[a-z]+/, "feat");
+      const title = pr.title.replace(/^[a-z]+/, item.retitleType ?? "feat");
       const edited = await this.deps.run("gh", ["pr", "edit", String(number), "-R", item.repo, "--title", title], {
         cwd: this.ship.nixos.root,
       });
@@ -759,6 +845,10 @@ export async function shipTick(deps: ShipDeps): Promise<Ship | undefined> {
   const ship = loadShip(deps.config.stateDir);
   if (ship?.status !== "running") return ship;
   const shipping = new Shipping(deps, ship);
+  if (!ship.reviewed) {
+    await shipping.review();
+    saveShip(deps.config.stateDir, ship);
+  }
   for (const lib of ship.libs) {
     await shipping.lib(lib);
     saveShip(deps.config.stateDir, ship);

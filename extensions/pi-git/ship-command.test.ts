@@ -7,48 +7,39 @@ import type { Runner } from "./exec.ts";
 import { indexShip, loadShip, type Ship, type ShipIndex, saveShip } from "./ship.ts";
 import { type ShipUi, shipCommand } from "./ship-command.ts";
 
-vi.mock("./ship.ts", async (original) => {
-  const real = await original<typeof import("./ship.ts")>();
-  return {
-    ...real,
-    indexShip: vi.fn(async () => ({
-      libs: [
-        {
-          repo: "o/a",
-          input: "a",
-          ready: [{ number: 1, title: "feat: x", sha: "s", url: "u" }],
-          problems: [],
-          releasable: true,
-          behind: false,
-        },
-        { repo: "o/b", input: "b", ready: [], problems: ["#2 t: draft"], releasable: false, behind: false },
-        {
-          repo: "o/c",
-          input: "c",
-          ready: [{ number: 5, title: "docs: y", sha: "s", url: "u" }],
-          problems: [],
-          releasable: false,
-          noRelease: 5,
-          behind: false,
-        },
-      ],
-      nixos: { repo: "o/Nixos", root: "/n", ready: [], problems: [], releasable: false, behind: false },
-    })),
-  };
-});
+const INDEX: ShipIndex = {
+  libs: [
+    {
+      repo: "o/a",
+      input: "a",
+      ready: [{ number: 1, title: "feat: x", sha: "s", url: "u" }],
+      problems: [],
+      releasable: true,
+      behind: false,
+    },
+    { repo: "o/b", input: "b", ready: [], problems: ["#2 t: draft"], releasable: false, behind: false },
+    {
+      repo: "o/c",
+      input: "c",
+      ready: [{ number: 5, title: "docs: y", sha: "s", url: "u" }],
+      problems: [],
+      releasable: false,
+      noRelease: 5,
+      behind: false,
+    },
+  ],
+  nixos: { repo: "o/Nixos", root: "/n", ready: [], problems: [], releasable: false, behind: false },
+};
 
-function ui(answers: { select?: string; confirm?: boolean } = {}) {
+vi.mock("./ship.ts", async (original) => ({
+  ...(await original<typeof import("./ship.ts")>()),
+  indexShip: vi.fn(async () => INDEX),
+}));
+
+function ui() {
   const log: string[] = [];
   const fake: ShipUi = {
     notify: (message) => log.push(`notify ${message}`),
-    select: async (title) => {
-      log.push(`select ${title}`);
-      return answers.select;
-    },
-    confirm: async (title) => {
-      log.push(`confirm ${title}`);
-      return answers.confirm ?? false;
-    },
     setWidget: (_key, content) => log.push(`widget ${content ? content.join(" | ") : "-"}`),
   };
   return { fake, log };
@@ -63,57 +54,30 @@ const config = () => ({
 });
 
 describe("/ship", () => {
-  test("plan, pick, confirm: the ship is saved for the watcher", async () => {
+  test("no questions: every feat or fix releases, the rest goes to the reviewing agent, and it runs", async () => {
     const c = config();
-    const { fake, log } = ui({ select: "Release", confirm: true });
+    const { fake, log } = ui();
     await shipCommand("", fake, { run, config: c });
-    expect(log).toContain(
-      "widget /ship plan | o/a: merge #1; a release follows | o/b: nothing |   not shipped: #2 t: draft | o/c: merge #5; no release follows (no feat or fix) | o/Nixos: nothing",
+    expect(log[1]).toBe(
+      "widget /ship: running in the background | o/a: merge #1; a release follows | o/b: nothing |   not shipped: #2 t: draft | o/c: merge #5; no release follows (no feat or fix) | o/Nixos: nothing",
     );
-    expect(log).toContain("select Release o/a? (the release after the merges)");
+    expect(log[2]).toMatch(/running in the background.*change behavior/);
     expect(loadShip(c.stateDir)).toMatchObject({
       status: "running",
       host: "gaia",
       libs: [
         { repo: "o/a", release: true },
-        { repo: "o/c", release: false },
+        { repo: "o/c", release: false, review: [5] },
       ],
     });
   });
 
-  test("offers an existing release PR by its title", async () => {
-    const index: ShipIndex = {
-      libs: [
-        {
-          repo: "o/release",
-          ready: [],
-          problems: [],
-          releasePr: { number: 3, title: "chore(main): release 0.3.0" },
-          releasable: true,
-          behind: false,
-        },
-      ],
-      nixos: { repo: "o/Nixos", root: "/n", ready: [], problems: [], releasable: false, behind: false },
-    };
-    vi.mocked(indexShip).mockResolvedValueOnce(index);
+  test("nothing to ship", async () => {
+    vi.mocked(indexShip).mockResolvedValueOnce({ libs: [], nixos: INDEX.nixos });
     const c = config();
-    const { fake, log } = ui({ select: "Skip" });
+    const { fake, log } = ui();
     await shipCommand("", fake, { run, config: c });
-    expect(log).toContain("select Release o/release? (chore(main): release 0.3.0)");
-  });
-
-  test("making a docs PR a feat releases it", async () => {
-    const c = config();
-    const answers = ["Skip", "Make it a feat and release"];
-    const { fake } = ui({ confirm: true });
-    fake.select = async () => answers.shift();
-    await shipCommand("", fake, { run, config: c });
-    expect(loadShip(c.stateDir)?.libs.find((lib) => lib.repo === "o/c")).toMatchObject({ release: true, retitle: [5] });
-  });
-
-  test("not confirmed: nothing is saved", async () => {
-    const c = config();
-    await shipCommand("", ui({ select: "Skip", confirm: false }).fake, { run, config: c });
+    expect(log.at(-1)).toBe("notify pi-git ship: nothing to ship.");
     expect(loadShip(c.stateDir)).toBeUndefined();
   });
 

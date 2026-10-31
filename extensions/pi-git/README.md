@@ -163,9 +163,10 @@ from open PRs to a deployed host:
    and are shipped when green. Also: waiting release PRs, releases that are not locked yet, and
    changes that lead to no release (no feat or fix). The `flake.lock` is read from GitHub's default
    branch.
-2. **Plan**: a widget lists what ships, what waits or is fixed first, and what does not and why.
-   For each library that would release, you pick Release or Skip; for one whose changes lead to no
-   release, you can make a PR a feat (its title is changed before the merge); then one confirmation.
+2. **No questions**: the plan shows as a widget, and the ship starts. Every library with a feat or fix
+   releases. For a library whose PRs have no feat or fix, an agent (`shipModel`, default
+   `openai-codex/gpt-6-luna` at `medium`) reads the PRs and decides whether users get something new;
+   then /ship gives one PR a feat or fix title before the merge, and it releases.
 3. **Run**: the watcher advances the ship every minute, out of the agents' sight:
    - merges the ready PRs (each when it is green and mergeable, on the head it just checked; a PR
      that conflicts after an earlier merge waits for the watcher's rebase);
@@ -179,8 +180,11 @@ from open PRs to a deployed host:
    - waits for the check run `…deploy-<host>` on that merge commit.
 4. **Done** when `deploy-<host>` succeeds: one notification with the released versions.
 
-A problem (a failing release workflow, a red check, a deploy that fails, or a stage that waits longer
-than 90 minutes) stops only that part, notifies you, and shows in `/git` and the tmux sign; the rest
+Red checks and conflicts are fixed by the helper, also when it is hard; it stops only when the fix
+would change behavior (choosing between behaviors, dropping a feature, changing what a test expects),
+and that PR comes back to you as a notification with the decision. Any problem (that, a failing
+release workflow, a deploy that fails, or a stage that waits longer than 90 minutes) stops only that
+part, notifies you, and shows in `/git` and the tmux sign; the rest
 goes on. `/ship status` shows every part. Settings: `shipNixos` (the configuration's main checkout)
 and `shipHost` (default: this machine's host name).
 

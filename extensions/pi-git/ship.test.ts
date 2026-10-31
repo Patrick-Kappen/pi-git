@@ -419,6 +419,133 @@ describe("shipTick", () => {
     expect(ship?.libs[0]?.state).toBe("release");
   });
 
+  test("the reviewing agent decides a release for changes without feat or fix, with luna at medium", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    const index = await indexShip(fake, nixos);
+    saveShip(config.stateDir, createShip(index, [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const answers: string[] = [];
+    const reviewer: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        answers.push(args.join(" "));
+        return ok('{"release": true, "pr": 6, "type": "feat", "reason": "the skill text is shipped"}');
+      }
+      if (command === "gh" && args[1] === "view" && args.includes("number,title,body,files"))
+        return ok({ number: 6, title: "docs(git): skill words", files: [{ path: "skills/git/SKILL.md" }] });
+      return fake(command, args, options);
+    };
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(answers[0]).toContain("--model openai-codex/gpt-6-luna --thinking medium");
+    expect(ship?.reviewed).toBe(true);
+    expect(ship?.libs[0]).toMatchObject({ release: true, retitle: [6], retitleType: "feat" });
+    expect(calls).toContain("gh pr edit 6 -R o/pi-git --title feat(git): skill words");
+  });
+
+  test("the reviewing agent says no release: merged, not released", async () => {
+    world.prs["o/pi-git"] = [pr(6, "ci: runner")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const reviewer: Runner = async (command, args, options) =>
+      command === "pi-fake" ? ok('{"release": false, "reason": "only CI"}') : fake(command, args, options);
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+  });
+
+  test("an unusable review answer is retried and does not release when a PR disappeared", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const answers: string[] = [];
+    const logs: string[] = [];
+    const reviewer: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        answers.push(args.join(" "));
+        return ok('{"release": true, "pr": 6, "type": "docs"}');
+      }
+      if (command === "gh" && args[1] === "view" && args.includes("number,title,body,files")) return no;
+      return fake(command, args, options);
+    };
+    const ship = await shipTick({
+      run: reviewer,
+      config,
+      gitPr,
+      now: () => clock,
+      watchPr,
+      log: (text) => logs.push(text),
+    });
+    expect(answers).toHaveLength(2);
+    expect(answers[1]).toContain("previous answer could not be used");
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+    expect(logs[0]).toContain("no release decision");
+  });
+
+  test.each([
+    ["not JSON", "no JSON object in the answer"],
+    ["{}", '"release" must be true or false'],
+    ['{"release":true}', 'a release needs "pr" (a number) and "type" (feat or fix)'],
+  ])("an unusable release decision (%s) is retried, then safely ignored", async (answer, problem) => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const prompts: string[] = [];
+    const reviewer: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        prompts.push(args.at(-1) ?? "");
+        return ok(answer);
+      }
+      return fake(command, args, options);
+    };
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(`previous answer could not be used (${problem})`);
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+  });
+
+  test("a release decision for an unknown PR is ignored, including a non-string reason", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const reviewer: Runner = async (command, args, options) =>
+      command === "pi-fake" ? ok('{"release":true,"pr":999,"type":"fix","reason":2}') : fake(command, args, options);
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+    expect(calls).not.toContain("gh pr edit 6 -R o/pi-git --title fix(git): skill words");
+  });
+
+  test("the reviewing agent can classify a change as a fix", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const reviewer: Runner = async (command, args, options) =>
+      command === "pi-fake"
+        ? ok('{"release":true,"pr":6,"type":"fix","reason":"corrects shipped guidance"}')
+        : fake(command, args, options);
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ release: true, retitle: [6], retitleType: "fix" });
+    expect(calls).toContain("gh pr edit 6 -R o/pi-git --title fix(git): skill words");
+  });
+
+  test("a prefixed release version is preserved even when the merge SHA is unavailable", async () => {
+    world.prs["o/pi-git"] = [
+      pr(1, "feat: start"),
+      pr(9, "chore(main): release v0.3.0", { labels: [{ name: "autorelease: pending" }] }),
+    ];
+    await plan(["o/pi-git"]);
+    const commitQueries: string[] = [];
+    const runner: Runner = async (command, args, options) => {
+      if (command === "gh" && args[0] === "api" && args[1] === "repos/o/pi-git/commits/HEAD") return ok("");
+      if (command === "gh" && args[0] === "run") commitQueries.push(args[args.indexOf("--commit") + 1] ?? "missing");
+      return fake(command, args, options);
+    };
+
+    await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+    world.releaseRun = { status: "completed", conclusion: "success" };
+    const ship = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+
+    expect(commitQueries).toContain("");
+    expect(ship?.libs[0]).toMatchObject({ state: "tag", tag: "v0.3.0" });
+  });
+
   test("no release PR after the merges", async () => {
     world.prs["o/pi-git"] = [pr(1, "feat: start")];
     await plan(["o/pi-git"]);
@@ -482,6 +609,28 @@ describe("shipTick", () => {
     world.nixosPr = { ...pr(77, "flake: lock", { mergeable: "CONFLICTING" }), state: "OPEN" };
     gitPr.mockResolvedValueOnce({ ok: false, summary: "rejected", notes: [] } as never);
     expect((await tick())?.nixos.error).toBe("the new flake.lock could not be pushed: rejected");
+  });
+
+  test("status lines include errors for failed libraries and NixOS", () => {
+    const ship: Ship = {
+      id: "x",
+      host: "gaia",
+      status: "running",
+      libs: [
+        {
+          repo: "o/lib",
+          input: "lib",
+          prs: [],
+          release: false,
+          behind: false,
+          state: "failed",
+          since: "",
+          error: "needs review",
+        },
+      ],
+      nixos: { repo: "o/Nixos", root: nixos, prs: [], state: "failed", since: "", error: "CI failed" },
+    };
+    expect(shipLines(ship)).toEqual(["o/lib: failed (needs review)", "o/Nixos: failed (CI failed)"]);
   });
 
   test("nothing running: no ship, nothing done", async () => {

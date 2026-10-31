@@ -9,6 +9,10 @@ const STAGE_TEXT: Record<Stage, string> = {
 };
 
 /** Fix a failing check in the worktree. */
+/** The one reason to stop: everything else is solved, also when it is hard. */
+export const BEHAVIOR_RULE =
+  'Solve it, also when it is hard. Stop only when the fix needs a change of behavior: choosing between two behaviors, dropping or changing a feature, or changing what a test expects. Then do not guess: answer "CANNOT FIX: behavior:" with the decision and the options.';
+
 export function fixPrompt(stage: Stage, attempt: number, attempts: number): string {
   return [
     `You are the helper of pi-git, attempt ${attempt} of ${attempts}. ${STAGE_TEXT[stage]} in this worktree.`,
@@ -19,6 +23,7 @@ export function fixPrompt(stage: Stage, attempt: number, attempts: number): stri
     "- Do not stage, commit, push, switch branches, or call gh: pi-git does those steps.",
     "- Never weaken or skip a check, a hook, a test or a threshold.",
     "- Generated files (lock files, files from a generator) are regenerated with their tool, not edited.",
+    `- ${BEHAVIOR_RULE}`,
     "",
     "End with one or two sentences on what you changed. When you cannot fix it within the intent,",
     'answer "CANNOT FIX:" and the reason.',
@@ -36,6 +41,7 @@ export function ciFixPrompt(attempt: number, attempts: number): string {
     "- Do not stage, commit, push, switch branches, or call gh: pi-git does those steps.",
     "- Never weaken or skip a check, a test or a threshold, and do not change CI to make it pass.",
     "- When the failure is not caused by the PR (an outage, a flaky runner), change nothing: pi-git then runs the failed jobs again.",
+    `- ${BEHAVIOR_RULE}`,
     "",
     'End with one or two sentences on what you changed. When it cannot be fixed within the intent, answer "CANNOT FIX:" and the reason.',
   ].join("\n");
@@ -50,6 +56,7 @@ export function conflictPrompt(base: string): string {
     "Resolve every conflict in the files: keep the intent of both sides, not just one; remove all markers.",
     "Generated files (lock files, files from a generator) are regenerated with their tool, not merged by hand.",
     "Do not run git commands that change the repository and do not call gh: pi-git continues the rebase.",
+    BEHAVIOR_RULE,
     "",
     'End with one sentence on how you resolved it. When you cannot, answer "CANNOT FIX:" and the reason.',
   ].join("\n");
@@ -65,7 +72,7 @@ export function checkFixPrompt(command: string, attempt: number, attempts: numbe
     "- Run the failing part yourself to see the problem and to confirm your fix.",
     "- Do not stage, commit, push, switch branches, or call gh.",
     "- Never weaken or skip a check, a test or a threshold; never delete a failing test to make it pass.",
-    '- When the fix needs a decision about behavior, do not guess: answer "CANNOT FIX:" and what has to be decided.',
+    `- ${BEHAVIOR_RULE}`,
     "",
     "End with one or two sentences on what you changed.",
   ].join("\n");
