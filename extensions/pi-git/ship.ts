@@ -7,10 +7,11 @@ import { clipStart, outputOf, type Runner } from "./exec.ts";
 import { repoName, repoSlug } from "./git.ts";
 import { askJson } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
+import { PREFLIGHT_PROMPT, parseVerdicts, preflightInput, simulate } from "./preflight.ts";
 import { findMainCheckout } from "./start.ts";
 import { addSummary, entryId, loadEntries, saveEntry } from "./state.ts";
 import { gitWatch, worktreeOf } from "./status.ts";
-import { type Check, rollup } from "./watch.ts";
+import { type Check, rollup, stepEntry } from "./watch.ts";
 
 // /ship: merge what is ready, release what the owner picks, lock the releases in the NixOS
 // configuration, merge that, and wait until the host is deployed. The owner's command: it runs in the
@@ -38,6 +39,12 @@ export interface ShipPr {
   note?: string;
   /** The PR's base when it is not the default branch: stacked, merged after its base. */
   stackedOn?: string;
+  /** The PR's branch, so stacked PRs find the PR they build on. */
+  branch?: string;
+  /** Merged by the ship. */
+  merged?: boolean;
+  /** Why the ship gave up on this PR; the other PRs go on. */
+  error?: string;
 }
 
 interface Stage {
@@ -59,6 +66,8 @@ export interface LibItem extends Stage {
   retitleType?: "feat" | "fix";
   /** PRs without a feat or fix: the reviewing agent decides whether they release. */
   review?: number[];
+  /** A release PR was waiting when the ship started. */
+  releasePr?: number;
   /** PRs handed to the watcher to fix (red checks, conflicts). */
   adopted?: number[];
   /** Not a flake input of the configuration: released, but nothing to lock. */
@@ -92,6 +101,8 @@ export interface Ship {
   status: "running" | "done";
   /** The pi session that started the ship: its agent gets the result in the history. */
   sessionId?: string;
+  /** PRs the preflight left out, with the reason, for /ship status. */
+  skipped?: string[];
   /** The reviewing agent decided the releases of the libraries in `review`. */
   reviewed?: boolean;
   libs: LibItem[];
@@ -124,6 +135,10 @@ export interface ShipDeps {
   gitPr: typeof GitPr;
   /** Hands a PR to the watcher (quietly); a string is why not. Default: a worktree on its branch, then git_watch. */
   watchPr?: (repo: string, number: number) => Promise<string | undefined>;
+  /** The preflight of one repository: the PRs to skip, with the reason. Default: simulate, then the agent. */
+  preflight?: (repo: string, prs: ShipPr[]) => Promise<Preflight>;
+  /** Starts the watcher's fix of a queued PR at once, in the background. Default: stepEntry. */
+  fixNow?: (repo: string, number: number) => void;
   now?: () => Date;
   log?: (text: string) => void;
 }
@@ -140,10 +155,11 @@ interface ListedPr {
   labels?: { name: string }[];
   author?: { login: string };
   baseRefName?: string;
+  headRefName?: string;
 }
 
 const PR_FIELDS =
-  "number,title,url,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,labels,author,baseRefName";
+  "number,title,url,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,labels,author,baseRefName,headRefName";
 /** GitHub refuses a merge while the branch moves under it: wait and try again. */
 const MOVED = /Head branch was modified|Base branch was modified|is not mergeable|try the merge again/i;
 
@@ -230,6 +246,7 @@ function addListedPr(index: RepoIndex, pr: ListedPr, defaultBranch: string): voi
     url: pr.url,
     ...(note ? { note } : {}),
     ...(stacked ? { stackedOn: stacked } : {}),
+    ...(pr.headRefName ? { branch: pr.headRefName } : {}),
   });
 }
 
@@ -243,10 +260,9 @@ async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIn
   const defaultBranch =
     (await gh(run, cwd, ["repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"])) ??
     "main";
-  // Oldest first, and stacked PRs after the others: a stacked PR ships once its base is merged.
   const sorted = [...list].sort((a, b) => a.number - b.number);
   for (const pr of sorted) addListedPr(index, pr, defaultBranch);
-  index.ready.sort((a, b) => Number(a.stackedOn !== undefined) - Number(b.stackedOn !== undefined));
+  index.ready = stackOrder(index.ready).order;
   index.releasable = index.releasePr !== undefined || index.ready.some((pr) => RELEASING.test(pr.title));
   const first = index.ready[0];
   if (!index.releasable && first) index.noRelease = first.number;
@@ -313,6 +329,27 @@ async function outsideRepos(run: Runner, cwd: string, nixosRepo: string, known: 
   );
 }
 
+/** The PR a stacked PR builds on: the one whose branch is its base. */
+export function stackBase(prs: readonly ShipPr[], pr: ShipPr): ShipPr | undefined {
+  return pr.stackedOn === undefined ? undefined : prs.find((other) => other.branch === pr.stackedOn);
+}
+
+/**
+ * The order to merge in: oldest first, and every stacked PR right after the PR it builds on (also
+ * stacks of more than two). Orphans are stacked PRs whose base PR is not in the list.
+ */
+export function stackOrder(prs: readonly ShipPr[]): { order: ShipPr[]; orphans: ShipPr[] } {
+  const byNumber = [...prs].sort((a, b) => a.number - b.number);
+  const order: ShipPr[] = [];
+  const visit = (pr: ShipPr) => {
+    order.push(pr);
+    for (const child of byNumber.filter((other) => stackBase(byNumber, other) === pr)) visit(child);
+  };
+  for (const root of byNumber.filter((pr) => pr.stackedOn === undefined)) visit(root);
+  const orphans = byNumber.filter((pr) => !order.includes(pr));
+  return { order: [...order, ...orphans], orphans };
+}
+
 /** The plan as lines for the owner: what ships, and what does not and why. */
 function planLinesForRepo(lib: RepoIndex): string[] {
   const parts = [
@@ -357,6 +394,7 @@ export function createShip(
         repo: lib.repo,
         input: lib.input ?? repoName(lib.repo),
         ...(lib.outside ? { outside: true } : {}),
+        ...(lib.releasePr ? { releasePr: lib.releasePr.number } : {}),
         prs: lib.ready,
         release: releases.includes(lib.repo),
         ...(retitles[lib.repo] !== undefined ? { retitle: [retitles[lib.repo] as number] } : {}),
@@ -399,6 +437,7 @@ export function shipLines(ship: Ship): string[] {
   );
   const n = ship.nixos;
   lines.push(`${n.repo}: ${n.state}${n.pr ? ` PR #${n.pr}` : ""}${n.error ? ` (${n.error})` : ""}`);
+  for (const line of ship.skipped ?? []) lines.push(`  not shipped: ${line}`);
   return lines;
 }
 
@@ -471,6 +510,16 @@ export const RELEASE_PROMPT = [
   '"reason": "<one sentence>"} or {"release": false, "reason": "<one sentence>"}.',
 ].join("\n");
 
+/** The preflight of one repository: the PRs to leave out, and the order in which the rest lands. */
+export interface Preflight {
+  skips: { pr: number; reason: string }[];
+  /** PR numbers in the order they land: clean ones first, conflicting ones last. */
+  order?: number[] | undefined;
+}
+
+/** PRs whose fix runs now, so a ship round does not start a second one. */
+const FIXING = new Set<string>();
+
 class Shipping {
   private readonly deps: ShipDeps;
   private readonly ship: Ship;
@@ -514,6 +563,21 @@ class Shipping {
     if (fresh) {
       await notifyTerminals(this.deps.run, "pi-git ship", text);
       this.tellAgent("failed", text, item.repo);
+    }
+  }
+
+  /** A problem with one PR: the owner and the agent hear of it; the rest of the ship goes on. */
+  private async problem(repo: string, error: string): Promise<void> {
+    const text = `pi-git ship: ${repo} needs you: ${error}`;
+    this.deps.log?.(text);
+    const { fresh } = addAttention(
+      this.deps.config.stateDir,
+      { kind: "watcher", repo, text },
+      `ship-${this.ship.id}-${error}`,
+    );
+    if (fresh) {
+      await notifyTerminals(this.deps.run, "pi-git ship", text);
+      this.tellAgent("failed", text, `${repo}-${error.slice(0, 20)}`);
     }
   }
 
@@ -599,7 +663,9 @@ class Shipping {
   private async handToWatcher(item: { adopted?: number[] }, repo: string, pr: ListedPr, why: string): Promise<string> {
     if (item.adopted?.includes(pr.number)) {
       const watched = loadEntries(this.deps.config.stateDir).some((entry) => entry.id === entryId(repo, pr.number));
-      return watched ? "wait" : `#${pr.number}: ${why}, and the watcher could not fix it`;
+      if (!watched) return `#${pr.number}: ${why}, and the watcher could not fix it`;
+      this.fixNow(repo, pr.number);
+      return "wait";
     }
     const error = await (this.deps.watchPr ?? ((r, n) => watchPr(this.deps, `ship-${this.ship.id}`, r, n)))(
       repo,
@@ -607,27 +673,46 @@ class Shipping {
     );
     if (error) return `#${pr.number}: ${why}; ${error}`;
     item.adopted = [...(item.adopted ?? []), pr.number];
+    this.fixNow(repo, pr.number);
     return "wait";
   }
 
-  /** Merge the PRs in order; false when the item has to wait or failed. */
+  /** Start the fix of a red or conflicting PR at once, beside everything else; once at a time per PR. */
+  private fixNow(repo: string, number: number): void {
+    if (this.deps.fixNow) {
+      this.deps.fixNow(repo, number);
+      return;
+    }
+    const entry = loadEntries(this.deps.config.stateDir).find((item) => item.id === entryId(repo, number));
+    if (!entry || FIXING.has(entry.id)) return;
+    FIXING.add(entry.id);
+    void stepEntry(this.deps, entry).finally(() => FIXING.delete(entry.id));
+  }
+
+  /**
+   * Every PR, oldest first, each round: green ones are merged, red or conflicting ones are being
+   * fixed (each by its own helper, at the same time), the rest waits. One PR the ship gives up on
+   * does not stop the others. True when every PR is merged or given up.
+   */
   private async mergeAll(
     item: Stage & { state: string; repo: string },
     prs: ShipPr[],
     method: string,
   ): Promise<boolean> {
+    let waiting: number | undefined;
     for (const pr of prs) {
+      if (pr.merged || pr.error) continue;
       const merged = await this.mergeWhenReady(item.repo, pr.number, method, item as { adopted?: number[] });
-      if (merged === "wait") {
-        await this.wait(item, `#${pr.number} to be ready`);
-        return false;
-      }
-      if (merged !== "merged") {
-        await this.fail(item, merged);
-        return false;
+      if (merged === "merged") pr.merged = true;
+      else if (merged === "wait") waiting ??= pr.number;
+      else {
+        pr.error = merged;
+        await this.problem(item.repo, merged);
       }
     }
-    return true;
+    if (waiting === undefined) return true;
+    await this.wait(item, `#${waiting} to be ready`);
+    return false;
   }
 
   private async mergeMethod(repo: string): Promise<string> {
@@ -644,11 +729,128 @@ class Shipping {
   async review(): Promise<void> {
     const { config } = this.deps;
     const agent = { ...config, model: config.shipModel, thinking: config.shipThinking, skill: undefined };
+    // First the preflight of every repository at the same time, then the releases of what is left.
+    const skipped = (
+      await Promise.all([
+        ...this.ship.libs.map((lib) => this.skipFrom(lib.repo, lib.prs, agent)),
+        this.skipFrom(this.ship.nixos.repo, this.ship.nixos.prs, agent),
+      ])
+    ).flat();
+    for (const lib of this.ship.libs) {
+      // Every PR that would have released was skipped, and no release PR waits: nothing to release.
+      if (lib.release && !lib.releasePr && !lib.prs.some((pr) => RELEASING.test(pr.title)) && !lib.retitle) {
+        lib.release = false;
+      }
+      lib.review = (lib.review ?? []).filter((n) => lib.prs.some((pr) => pr.number === n));
+    }
+    await Promise.all([...this.ship.libs, this.ship.nixos].map((item) => this.adoptStacks(item)));
+    if (skipped.length > 0) {
+      const text = `pi-git ship: not shipped, they need you:\n${skipped.map((line) => `- ${line}`).join("\n")}`;
+      this.deps.log?.(text);
+      await notifyTerminals(this.deps.run, "pi-git ship", `${skipped.length} PR(s) not shipped; /ship status`);
+      this.tellAgent("merged", text, "preflight");
+      this.ship.skipped = skipped;
+    }
     for (const item of this.ship.libs) {
       if ((item.review ?? []).length === 0) continue;
       await this.reviewLibrary(item, agent);
     }
     this.ship.reviewed = true;
+  }
+
+  /**
+   * Simulate the merges of one repository, and let the agent decide ship, fix or skip, when anything
+   * is not plainly clean and green. Skipped PRs leave the ship; returns them as lines for the owner.
+   */
+  /** Take the PRs the preflight skips out of the ship; returns them as lines for the owner. */
+  private async skipFrom(repo: string, prs: ShipPr[], agent: Config): Promise<string[]> {
+    if (prs.length === 0) return [];
+    const lines: string[] = [];
+    const drop = (number: number, reason: string) => {
+      const index = prs.findIndex((pr) => pr.number === number);
+      if (index < 0) return;
+      const [pr] = prs.splice(index, 1);
+      lines.push(`${repo}#${number} ${pr?.title ?? ""}: ${reason}`);
+    };
+    // A stacked PR whose base PR is not shipped cannot be shipped either; also down a stack.
+    const orphans = () => stackOrder(prs).orphans;
+    for (let round = orphans(); round.length > 0; round = orphans()) {
+      for (const pr of round) drop(pr.number, `stacked on ${pr.stackedOn}, whose PR is not shipped`);
+    }
+    const { skips, order } = await (this.deps.preflight ?? ((r, p) => this.preflight(r, p, agent)))(repo, prs);
+    for (const skip of skips) drop(skip.pr, skip.reason);
+    // Merge in the order the simulation found; PRs it did not see keep their place at the end.
+    if (order) {
+      const rank = (pr: ShipPr) => (order.includes(pr.number) ? order.indexOf(pr.number) : order.length);
+      prs.sort((a, b) => rank(a) - rank(b));
+    }
+    for (let round = orphans(); round.length > 0; round = orphans()) {
+      for (const pr of round) drop(pr.number, `stacked on ${pr.stackedOn}, whose PR is not shipped`);
+    }
+    return lines;
+  }
+
+  /**
+   * Stacked PRs go to the watcher before their base merges (quietly, with their current base), so
+   * when GitHub moves one to the default branch the watcher rebases only its own commits at once.
+   */
+  private async adoptStacks(item: { repo: string; prs: ShipPr[]; adopted?: number[] }): Promise<void> {
+    for (const pr of item.prs.filter((entry) => entry.stackedOn && !item.adopted?.includes(entry.number))) {
+      const error = await (this.deps.watchPr ?? ((r, n) => watchPr(this.deps, `ship-${this.ship.id}`, r, n)))(
+        item.repo,
+        pr.number,
+      );
+      if (error) {
+        this.deps.log?.(`pi-git ship: ${item.repo}#${pr.number}: not watched (${error}); it waits for its base`);
+        continue;
+      }
+      item.adopted = [...(item.adopted ?? []), pr.number];
+    }
+  }
+
+  private async preflight(repo: string, prs: ShipPr[], agent: Config): Promise<Preflight> {
+    const tools = { run: this.deps.run, config: this.deps.config, home: homedir(), progress: () => {} };
+    const main = await findMainCheckout(tools, repo);
+    const base = await this.defaultBranch(repo);
+    const items = (after: Record<number, number[]> = {}) =>
+      stackOrder(prs).order.map((pr) => ({
+        number: pr.number,
+        onto: stackBase(prs, pr)?.number,
+        after: after[pr.number],
+      }));
+    const run = (after?: Record<number, number[]>) =>
+      typeof main === "string"
+        ? simulate(this.deps.run, main, base, items(after))
+        : Promise.resolve(`no local checkout (${main.error})`);
+    let simulated = await run();
+    const order = () => (typeof simulated === "string" ? undefined : simulated.map((item) => item.number));
+    const plain = typeof simulated !== "string" && simulated.every((item) => item.clean) && prs.every((pr) => !pr.note);
+    if (plain) return { skips: [], order: order() };
+    const withBodies = await Promise.all(
+      prs.map(async (pr) => ({
+        ...pr,
+        body: (await this.gh(["pr", "view", String(pr.number), "-R", repo, "--json", "body", "--jq", ".body"])) ?? "",
+      })),
+    );
+    const verdicts = await askJson(
+      this.deps.run,
+      agent,
+      { cwd: this.ship.nixos.root, prompt: PREFLIGHT_PROMPT, input: preflightInput(repo, withBodies, simulated) },
+      parseVerdicts(prs.map((pr) => pr.number)),
+    );
+    if (verdicts instanceof Error) {
+      this.deps.log?.(
+        `pi-git ship: ${repo}: no preflight verdicts (${verdicts.message}); merging in the simulated order`,
+      );
+      return { skips: [], order: order() };
+    }
+    // PRs that use what another adds land after it: find the order again with those needs.
+    const after = Object.fromEntries(verdicts.filter((v) => v.after).map((v) => [v.pr, v.after as number[]]));
+    if (Object.keys(after).length > 0) simulated = await run(after);
+    return {
+      skips: verdicts.filter((item) => item.action === "skip").map((item) => ({ pr: item.pr, reason: item.reason })),
+      order: order(),
+    };
   }
 
   private async reviewLibrary(
@@ -947,11 +1149,6 @@ class Shipping {
     this.tellAgent("merged", text, "end");
   }
 }
-
-/** While a ship runs, the watcher looks this often within one run of its timer, */
-export const SHIP_POLL_MS = 10_000;
-/** for at most this long, so it ends before the timer starts it again. */
-export const SHIP_WINDOW_MS = 45_000;
 
 /**
  * The ship takes over the PRs it merges: the watcher keeps fixing them, but stops reporting them to

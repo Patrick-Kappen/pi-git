@@ -163,7 +163,14 @@ const watchPr = vi.fn(async (repo: string, number: number) => {
   return undefined;
 });
 // One pass per tick, so each test can look at every step; "a round keeps going" tests the default.
-const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr }, 1);
+const fixes: string[] = [];
+const fixNow = (repo: string, number: number) => {
+  fixes.push(`${repo}#${number}`);
+};
+let skips: Record<string, { pr: number; reason: string }[]> = {};
+let orders: Record<string, number[]> = {};
+const preflight = async (repo: string) => ({ skips: skips[repo] ?? [], order: orders[repo] });
+const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr, fixNow, preflight }, 1);
 
 beforeEach(() => {
   n++;
@@ -195,6 +202,9 @@ beforeEach(() => {
     fail: [],
   };
   watched.length = 0;
+  fixes.length = 0;
+  skips = {};
+  orders = {};
   gitPr.mockReset();
   gitPr.mockResolvedValue({ ok: true, summary: "PR opened", notes: [], pr: { number: 77, url: "u77" } } as never);
 });
@@ -359,7 +369,7 @@ describe("shipTick", () => {
     world.tags["o/pi-git@v0.3.0"] = "new-git";
     world.latest["o/pi-git"] = "new-git";
     await plan(["o/pi-git"]);
-    const ship = await shipTick({ run: fake, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: fake, config, gitPr, now: () => clock, watchPr, preflight });
     expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5", "o/pi-git#9"]);
     expect(ship?.libs[0]).toMatchObject({ state: "done", tag: "v0.3.0" });
     // It stops where it has to wait: the checks of the flake.lock PR.
@@ -408,7 +418,9 @@ describe("shipTick", () => {
     world.fail = ["pr merge 1"];
     await plan(["o/pi-git"]);
     let ship = await tick();
-    expect(ship?.libs[0]?.error).toMatch(/^merging #1 failed: failed: gh pr merge 1/);
+    // That PR is given up; the library goes on without it.
+    expect(ship?.libs[0]?.prs[0]?.error).toMatch(/^merging #1 failed: failed: gh pr merge 1/);
+    expect(listAttention(config.stateDir)[0]?.text).toMatch(/o\/pi-git needs you: merging #1 failed/);
 
     world.fail = [];
     world.prs["o/pi-git"] = [
@@ -431,6 +443,8 @@ describe("shipTick", () => {
     let ship = await tick();
     expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5"]);
     expect(watched).toEqual(["o/pi-git#4"]);
+    // The fix starts at once, not on the watcher's next round.
+    expect(fixes).toEqual(["o/pi-git#4"]);
     expect(ship?.libs[0]).toMatchObject({ state: "merge", adopted: [4] });
     // Still conflicting while the watcher works: not handed over twice.
     await tick();
@@ -440,6 +454,42 @@ describe("shipTick", () => {
     ship = await tick();
     expect(calls).toContain("gh pr merge 4 -R o/pi-git --squash --match-head-commit rebased4");
     expect(ship?.libs[0]?.state).toBe("done");
+  });
+
+  test("every PR each round, oldest first: a waiting one does not hold up a green one, conflicts are fixed at once and together", async () => {
+    world.prs["o/pi-git"] = [pr(1, "feat: a"), pr(2, "feat: b"), pr(3, "feat: c"), pr(4, "feat: d")];
+    await plan([]);
+    world.prs["o/pi-git"] = [
+      pr(1, "feat: a", { statusCheckRollup: pending }),
+      pr(2, "feat: b", { mergeable: "CONFLICTING" }),
+      pr(3, "feat: c"),
+      pr(4, "feat: d", { mergeable: "CONFLICTING" }),
+    ];
+    const ship = await tick();
+    expect(world.merged).toContain("o/pi-git#3");
+    expect(fixes).toEqual(["o/pi-git#2", "o/pi-git#4"]);
+    expect(ship?.libs[0]?.state).toBe("merge");
+  });
+
+  test("the preflight leaves PRs out before anything merges, and tells the owner and the agent once", async () => {
+    world.prs["o/pi-git"] = [pr(1, "feat: a"), pr(2, "fix: b")];
+    skips = { "o/pi-git": [{ pr: 2, reason: "choosing between two behaviors of the lock" }] };
+    await plan(["o/pi-git"]);
+    const ship = await tick();
+    expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5"]);
+    expect(ship?.libs[0]?.prs.map((item) => item.number)).toEqual([1]);
+    expect(ship?.skipped).toEqual(["o/pi-git#2 fix: b: choosing between two behaviors of the lock"]);
+    expect(loadSummaries(config.stateDir).map((item) => item.text)).toEqual([
+      "pi-git ship: not shipped, they need you:\n- o/pi-git#2 fix: b: choosing between two behaviors of the lock",
+    ]);
+  });
+
+  test("when every releasing PR is skipped and no release PR waits, the library does not release", async () => {
+    world.prs["o/pi-git"] = [pr(2, "feat: b")];
+    skips = { "o/pi-git": [{ pr: 2, reason: "unfinished" }] };
+    await plan(["o/pi-git"]);
+    const ship = await tick();
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
   });
 
   test("the watcher gave up on a red PR: that library needs you", async () => {
@@ -453,7 +503,8 @@ describe("shipTick", () => {
     await tick();
     removeEntry(config.stateDir, entryId("o/pi-git", 4));
     const ship = await tick();
-    expect(ship?.libs[0]?.error).toBe("#4: checks fail, and the watcher could not fix it");
+    expect(ship?.libs[0]?.prs[0]?.error).toBe("#4: checks fail, and the watcher could not fix it");
+    expect(ship?.libs[0]?.state).toBe("done");
   });
 
   test("a PR without a feat or fix: retitled to feat when the owner chose it", async () => {
@@ -483,7 +534,7 @@ describe("shipTick", () => {
         return ok({ number: 6, title: "docs(git): skill words", files: [{ path: "skills/git/SKILL.md" }] });
       return fake(command, args, options);
     };
-    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr, preflight });
     expect(answers[0]).toContain("--model openai-codex/gpt-6-luna --thinking medium");
     expect(ship?.reviewed).toBe(true);
     expect(ship?.libs[0]).toMatchObject({ release: true, retitle: [6], retitleType: "feat" });
@@ -496,7 +547,7 @@ describe("shipTick", () => {
     config = { ...config, pi: "pi-fake" };
     const reviewer: Runner = async (command, args, options) =>
       command === "pi-fake" ? ok('{"release": false, "reason": "only CI"}') : fake(command, args, options);
-    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr, preflight });
     expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
   });
 
@@ -520,6 +571,7 @@ describe("shipTick", () => {
       gitPr,
       now: () => clock,
       watchPr,
+      preflight,
       log: (text) => logs.push(text),
     });
     expect(answers).toHaveLength(2);
@@ -544,7 +596,7 @@ describe("shipTick", () => {
       }
       return fake(command, args, options);
     };
-    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr, preflight });
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain(`previous answer could not be used (${problem})`);
     expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
@@ -556,7 +608,7 @@ describe("shipTick", () => {
     config = { ...config, pi: "pi-fake" };
     const reviewer: Runner = async (command, args, options) =>
       command === "pi-fake" ? ok('{"release":true,"pr":999,"type":"fix","reason":2}') : fake(command, args, options);
-    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr, preflight });
     expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
     expect(calls).not.toContain("gh pr edit 6 -R o/pi-git --title fix(git): skill words");
   });
@@ -569,7 +621,7 @@ describe("shipTick", () => {
       command === "pi-fake"
         ? ok('{"release":true,"pr":6,"type":"fix","reason":"corrects shipped guidance"}')
         : fake(command, args, options);
-    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr, preflight });
     expect(ship?.libs[0]).toMatchObject({ release: true, retitle: [6], retitleType: "fix" });
     expect(calls).toContain("gh pr edit 6 -R o/pi-git --title fix(git): skill words");
   });
@@ -596,7 +648,10 @@ describe("shipTick", () => {
   });
 
   test("a stacked PR is never merged into its base's branch: it waits until GitHub moves it to main", async () => {
-    world.prs["o/pi-git"] = [pr(8, "feat: top", { baseRefName: "feat/base" }), pr(7, "feat: base")];
+    world.prs["o/pi-git"] = [
+      pr(8, "feat: top", { baseRefName: "feat/base" }),
+      pr(7, "feat: base", { headRefName: "feat/base" }),
+    ];
     const index = await indexShip(fake, nixos);
     // Base first, the stacked one after it, with a note.
     expect(index.libs[0]?.ready.map((item) => [item.number, item.note])).toEqual([
@@ -605,14 +660,61 @@ describe("shipTick", () => {
     ]);
     saveShip(config.stateDir, createShip(index, [], "gaia", clock));
     let ship = await tick();
+    // The stacked PR went to the watcher before its base merged, so it is rebased at once later.
+    expect(watched).toEqual(["o/pi-git#8"]);
     expect(world.merged).toEqual(["o/pi-git#7", "o/Nixos#5"]);
     expect(calls.some((line) => line.startsWith("gh pr merge 8"))).toBe(false);
     expect(ship?.libs[0]?.state).toBe("merge");
     // GitHub moved #8 to main after #7 was merged.
-    world.prs["o/pi-git"] = [pr(7, "feat: base"), pr(8, "feat: top", { baseRefName: "main" })];
+    world.prs["o/pi-git"] = [
+      pr(7, "feat: base", { headRefName: "feat/base" }),
+      pr(8, "feat: top", { baseRefName: "main" }),
+    ];
     ship = await tick();
     expect(world.merged).toEqual(["o/pi-git#7", "o/Nixos#5", "o/pi-git#8"]);
     expect(ship?.libs[0]?.state).toBe("done");
+  });
+
+  test("stacks are ordered base first, also three high, and a stack without its base is left out", async () => {
+    world.prs["o/pi-git"] = [
+      pr(9, "feat: third", { baseRefName: "feat/two", headRefName: "feat/three" }),
+      pr(4, "feat: one", { headRefName: "feat/one" }),
+      pr(6, "feat: two", { baseRefName: "feat/one", headRefName: "feat/two" }),
+      pr(5, "feat: lone", { baseRefName: "feat/gone", headRefName: "feat/lone" }),
+      pr(3, "feat: plain", { headRefName: "feat/plain" }),
+    ];
+    const index = await indexShip(fake, nixos);
+    expect(index.libs[0]?.ready.map((item) => item.number)).toEqual([3, 4, 6, 9, 5]);
+    saveShip(config.stateDir, createShip(index, [], "gaia", clock));
+    const ship = await tick();
+    expect(ship?.skipped).toEqual(["o/pi-git#5 feat: lone: stacked on feat/gone, whose PR is not shipped"]);
+    expect(watched).toEqual(["o/pi-git#6", "o/pi-git#9"]);
+  });
+
+  test("the PRs merge in the order the preflight found, not by number", async () => {
+    world.prs["o/pi-git"] = [pr(1, "feat: a"), pr(2, "feat: b"), pr(3, "feat: c")];
+    orders = { "o/pi-git": [2, 3, 1] };
+    await plan([]);
+    await tick();
+    expect(world.merged.filter((item) => item.startsWith("o/pi-git"))).toEqual([
+      "o/pi-git#2",
+      "o/pi-git#3",
+      "o/pi-git#1",
+    ]);
+  });
+
+  test("a skipped base takes its stack with it", async () => {
+    world.prs["o/pi-git"] = [
+      pr(4, "feat: one", { headRefName: "feat/one" }),
+      pr(6, "feat: two", { baseRefName: "feat/one", headRefName: "feat/two" }),
+    ];
+    skips = { "o/pi-git": [{ pr: 4, reason: "behavior decision" }] };
+    await plan([]);
+    const ship = await tick();
+    expect(ship?.skipped).toEqual([
+      "o/pi-git#4 feat: one: behavior decision",
+      "o/pi-git#6 feat: two: stacked on feat/one, whose PR is not shipped",
+    ]);
   });
 
   test("a merge refused because the branch just moved: wait and try again", async () => {
@@ -624,7 +726,7 @@ describe("shipTick", () => {
       command === "gh" && args[1] === "merge"
         ? { code: 1, stdout: "", stderr: "GraphQL: Head branch was modified. Review and try the merge again." }
         : realFake(command, args, options);
-    let ship = await shipTick({ run: moved, config, gitPr, now: () => clock, watchPr });
+    let ship = await shipTick({ run: moved, config, gitPr, now: () => clock, watchPr, preflight });
     expect(ship?.libs[0]).toMatchObject({ state: "merge" });
     expect(ship?.libs[0]?.error).toBeUndefined();
     world.fail = [];
