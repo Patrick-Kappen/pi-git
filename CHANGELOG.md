@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/Patrick-Kappen/pi-git/compare/v0.9.1...v0.9.2) (2026-10-31)
+
+
+### Bug Fixes
+
+* **pi-git:** ship the NixOS drafts that wait for releases, and never skip on a guess ([#43](https://github.com/Patrick-Kappen/pi-git/issues/43)) ([84f4f45](https://github.com/Patrick-Kappen/pi-git/commit/84f4f45db9808ede5314f06c4c759c21fc357be7))
+
 ## [0.9.1](https://github.com/Patrick-Kappen/pi-git/compare/v0.9.0...v0.9.1) (2026-10-31)
 
 
