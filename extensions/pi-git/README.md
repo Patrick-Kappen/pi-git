@@ -68,6 +68,17 @@ uses it instead of listing worktrees and PRs by hand.
 `path`: a directory in the repository). It needs a worktree that has the PR's branch checked out,
 because the watcher fixes CI there. After that, the PR is followed like one from `git_pr`.
 
+### For other extensions
+
+Another extension hands an open PR to the watcher with an event, like `git_watch`:
+
+```ts
+pi.events.emit("pi-git:watch", { pr: "12", path: "/path/to/worktree", reply: (result) => {} });
+```
+
+`path` is a worktree with the PR's branch checked out; `reply` (optional) gets `{ ok, summary }`.
+pi-orchestrator uses it for the PRs of its tasks.
+
 ## The watcher
 
 `watcher.ts` runs one round over the queued PRs; a systemd user timer starts it every minute (see the
