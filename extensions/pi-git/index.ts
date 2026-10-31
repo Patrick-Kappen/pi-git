@@ -10,7 +10,7 @@ import { gitCheck } from "./check.ts";
 import { type Config, loadConfig } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
 import { repoSlug } from "./git.ts";
-import { blockedForHelper } from "./guard.ts";
+import { blockedForHelper, gitChanges } from "./guard.ts";
 import { HELPER_ENV } from "./helper.ts";
 import { gitPr, type PrResult } from "./pr.ts";
 import {
@@ -25,6 +25,7 @@ import {
   saveEntry,
   sessionAlive,
 } from "./state.ts";
+import { effective, type Lock, loadSwitch, setGlobal, setRepo, switchPath } from "./switch.ts";
 
 export interface Options {
   env?: NodeJS.ProcessEnv;
@@ -33,7 +34,32 @@ export interface Options {
 }
 
 /** The pi methods this extension uses; a subset of ExtensionAPI, so tests can pass a fake. */
-export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool" | "sendMessage">;
+export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool" | "sendMessage" | "registerCommand">;
+
+/** Why a git change is blocked; the model cannot unlock, only the user can. */
+export function lockedReason(what: string, slug: string | undefined): string {
+  const where = slug ? `in ${slug}` : "outside a repository with an origin";
+  return `pi-git: git changes are locked ${where} (${what}). Only the user can unlock them, with /git unlock.`;
+}
+
+/** The text of /git. */
+export function describeLock(stateDir: string, slug: string | undefined, fallback: Lock): string {
+  const value = loadSwitch(stateDir);
+  const here = effective(value, slug, fallback);
+  const source = { repo: "override of this repository", global: "global setting", default: "default of the settings" }[
+    here.source
+  ];
+  const lines = [
+    `git changes ${slug ? `in ${slug}` : "here"}: ${here.lock} (${source})`,
+    `global: ${value.global ?? `not set, so the default: ${fallback}`}`,
+  ];
+  const overrides = Object.entries(value.repos);
+  if (overrides.length > 0) lines.push("overrides:", ...overrides.map(([repo, lock]) => `  ${repo}: ${lock}`));
+  lines.push("/git unlock | lock | reset: this repository. /git global unlock | lock | reset: everywhere else.");
+  return lines.join("\n");
+}
+
+const GIT_COMMANDS = ["unlock", "lock", "reset", "global unlock", "global lock", "global reset"];
 
 /** How often a session sends its heartbeat and looks for summaries. */
 export const POLL_MS = 20_000;
@@ -142,6 +168,19 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
   }
 
   let config: Config = loadConfig(env, home);
+  const fallback = (): Lock => (config.locked ? "locked" : "unlocked");
+  const slugs = new Map<string, string | undefined>();
+  const slugOf = async (dir: string): Promise<string | undefined> => {
+    if (!slugs.has(dir)) {
+      const origin = await runner("git", ["remote", "get-url", "origin"], { cwd: dir });
+      slugs.set(dir, origin.code === 0 ? repoSlug(origin.stdout) : undefined);
+    }
+    return slugs.get(dir);
+  };
+  const lockOf = (target: string | undefined): Lock => effective(loadSwitch(config.stateDir), target, fallback()).lock;
+  const showStatus = (ctx: ExtensionContext, target: string | undefined): void => {
+    if (ctx.hasUI) ctx.ui.setStatus("pi-git", `git: ${lockOf(target)}`);
+  };
   let timer: ReturnType<typeof setInterval> | undefined;
   let sessionId = "";
   let slug: string | undefined;
@@ -177,8 +216,12 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     config = loadConfig(env, home);
     if (config.errors.length > 0 && ctx.hasUI) ctx.ui.notify(`pi-git:\n${config.errors.join("\n")}`, "warning");
     sessionId = ctx.sessionManager.getSessionId();
-    const origin = await runner("git", ["remote", "get-url", "origin"], { cwd: ctx.cwd });
-    slug = origin.code === 0 ? repoSlug(origin.stdout) : undefined;
+    slugs.clear();
+    slug = await slugOf(ctx.cwd);
+    // The global git hooks read these in the agents' processes: a hard stop for locked repositories.
+    env.PI_GIT_SWITCH = switchPath(config.stateDir);
+    env.PI_GIT_DEFAULT = fallback();
+    showStatus(ctx, slug);
     if (timer) clearInterval(timer);
     poll(ctx);
     timer = setInterval(() => poll(ctx), POLL_MS);
@@ -195,6 +238,44 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     }
   });
 
+  pi.on("tool_call", async (event: ToolCallEvent, ctx): Promise<ToolCallEventResult | undefined> => {
+    if (event.toolName !== "bash" || typeof event.input.command !== "string") return undefined;
+    for (const change of gitChanges(event.input.command, ctx.cwd, home)) {
+      const target = change.slug ?? (await slugOf(change.dir));
+      if (lockOf(target) === "locked") return { block: true, reason: lockedReason(change.what, target) };
+    }
+    return undefined;
+  });
+
+  pi.registerCommand("git", {
+    description: "Lock or unlock git changes by agents: /git [unlock|lock|reset] or /git global [unlock|lock|reset]",
+    getArgumentCompletions: (prefix) =>
+      GIT_COMMANDS.filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item })),
+    handler: async (args, ctx) => {
+      const words = args
+        .trim()
+        .split(/\s+/)
+        .filter((word) => word !== "");
+      const here = await slugOf(ctx.cwd);
+      const action = (word: string | undefined): Lock | undefined | "bad" =>
+        word === "lock" ? "locked" : word === "unlock" ? "unlocked" : word === "reset" ? undefined : "bad";
+      if (words[0] === "global" && words.length === 2 && action(words[1]) !== "bad") {
+        setGlobal(config.stateDir, action(words[1]) as Lock | undefined);
+      } else if (words.length === 1 && action(words[0]) !== "bad") {
+        if (!here) {
+          ctx.ui.notify("pi-git: not in a repository with an origin; use /git global unlock|lock|reset", "warning");
+          return;
+        }
+        setRepo(config.stateDir, here, action(words[0]) as Lock | undefined);
+      } else if (words.length > 0) {
+        ctx.ui.notify("pi-git: /git [unlock|lock|reset] or /git global [unlock|lock|reset]", "warning");
+        return;
+      }
+      showStatus(ctx, here);
+      ctx.ui.notify(describeLock(config.stateDir, here, fallback()), "info");
+    },
+  });
+
   pi.registerTool({
     name: "git_pr",
     label: "Git PR",
@@ -205,6 +286,8 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     ],
     parameters: prParameters,
     async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
+      const target = await slugOf(params.path ?? ctx.cwd);
+      if (lockOf(target) === "locked") throw new Error(lockedReason("git_pr", target));
       const steps: string[] = [];
       const progress = (text: string) => {
         steps.push(text);

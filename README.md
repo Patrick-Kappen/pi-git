@@ -13,6 +13,10 @@ watcher (a systemd user timer) then follows the PR: the helper fixes red CI and 
 main agent gets a summary when the PR is green, merged, or needs you. See the
 [extension README](extensions/pi-git/README.md).
 
+Agents may not change git repositories until you allow it: `/git unlock` in pi unlocks the current
+repository and remembers it; `/git global unlock` unlocks everywhere. See
+[the lock](extensions/pi-git/README.md#the-lock).
+
 It works with the `git` skill of [pi-skills](https://github.com/Patrick-Kappen/pi-skills), which
 both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on the default branch.
 
@@ -50,11 +54,28 @@ both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on
 | `checkTimeout`, `helperTimeout` | `1800`, `900` | Seconds for one hook run and one helper run |
 | `pi` | `"pi"` | The pi command for the helper |
 | `delivery` | `"turn"` | How the watcher's summary reaches the main agent: `turn`, `message` or `notify` |
+| `locked` | `true` | Git changes by agents are locked until you run `/git unlock` in a repository (remembered) |
 | `watcher.enable` | `true` | The systemd user timer `pi-git-watcher` |
 | `watcher.interval` | `"1min"` | How often the watcher runs |
 | `watcher.environment` | `{ }` | Extra environment, for example `SSH_AUTH_SOCK = "%t/ssh-agent";` for `git push` |
 | `watcher.packages` | `[ ]` | Extra tools on the watcher's PATH, for the hooks of your repositories |
 | `package`, `agentDir` | this flake, `.pi/agent` | The extension, and pi's agent directory |
+
+## A hard stop in git hooks
+
+pi-git blocks the agents' git commands before they run. To also stop git itself, for example when a
+script of the agent runs `git commit`, a global hook can check the switch; the agents' processes
+have `PI_GIT_SWITCH` and `PI_GIT_DEFAULT`, your terminal does not:
+
+```sh
+if [ -n "${PI_GIT_SWITCH:-}" ]; then
+  slug="$(git remote get-url origin 2>/dev/null | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')"
+  state="$(jq -r --arg s "${slug,,}" --arg d "${PI_GIT_DEFAULT:-locked}" \
+    '((.repos // {}) | to_entries | map(select(.key | ascii_downcase == $s)) | first | .value) // .global // $d' \
+    "$PI_GIT_SWITCH" 2>/dev/null || echo locked)"
+  [ "$state" = unlocked ] || { echo "git changes by pi agents are locked in ${slug:-this repository}" >&2; exit 1; }
+fi
+```
 
 ## Layout
 

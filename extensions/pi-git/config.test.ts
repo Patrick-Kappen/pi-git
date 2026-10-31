@@ -28,6 +28,7 @@ describe("defaults", () => {
       worktrees: "/home/u/.worktrees",
       stateDir: "/home/u/.local/state/pi-git",
       delivery: "turn",
+      locked: true,
       errors: [],
     });
     expect(defaults("p", { XDG_STATE_HOME: "/state" }, home).stateDir).toBe("/state/pi-git");
@@ -50,6 +51,7 @@ describe("parseConfig", () => {
         worktrees: "/w",
         stateDir: "~/s",
         delivery: "notify",
+        locked: false,
       },
       base,
       home,
@@ -65,18 +67,20 @@ describe("parseConfig", () => {
       worktrees: "/w",
       stateDir: "/home/u/s",
       delivery: "notify",
+      locked: false,
       errors: [],
     });
   });
 
   test("errors keep the defaults", () => {
-    const config = parseConfig({ model: "", attempts: 0, delivery: "mail", other: 1 }, base, home);
+    const config = parseConfig({ model: "", attempts: 0, delivery: "mail", locked: "no", other: 1 }, base, home);
     expect(config.model).toBe(base.model);
     expect(config.attempts).toBe(3);
     expect(config.errors).toEqual([
       'cfg: "model" must be a string',
       'cfg: "attempts" must be a positive number',
       'cfg: "delivery" must be one of turn, message, notify',
+      'cfg: "locked" must be true or false',
       'cfg: unknown key "other"',
     ]);
     expect(parseConfig([], base, home).errors).toEqual(["cfg: expected a JSON object"]);

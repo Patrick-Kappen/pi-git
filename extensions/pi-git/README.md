@@ -87,6 +87,35 @@ and looks for summaries every 20 seconds:
 `delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
 adds it to the context for your next prompt, `notify` only shows it to you.
 
+## The lock
+
+By default, agents may not change git repositories. pi-git blocks every git and gh command of the
+main agent (and of codemode scripts) that changes something, and `git_pr` and the watcher refuse
+too. Reading stays free: `status`, `diff`, `log`, `show`, `fetch`, `branch --list`, `gh pr view`,
+`gh pr checks`, `gh run view`, `gh api` without a method or fields, and so on. Everything else counts
+as a change: `commit`, `push`, `add`, `checkout`, `rebase`, `branch <name>`, `worktree add`,
+`gh pr create`, `gh pr merge`, ...
+
+You switch it in pi; the model cannot:
+
+| Command | Effect |
+|---|---|
+| `/git` | Shows the state here, the global state and the overrides |
+| `/git unlock`, `/git lock` | This repository (owner/name of `origin`); remembered |
+| `/git reset` | Removes the override of this repository: the global state applies |
+| `/git global unlock`, `/git global lock`, `/git global reset` | The global state; `reset` goes back to the default of the settings (`locked`) |
+
+A repository's override wins over the global state, which wins over the default. The state is in
+`<stateDir>/switch.json`, so every pi session and the watcher see a change at once. The footer shows
+`git: locked` or `git: unlocked` for the repository of the session.
+
+The repository of a command is found per command: after `cd`, with `git -C <dir>`, or from
+`gh -R owner/name`. Your own commands (`!git ...` in pi, and your terminal) are never blocked.
+
+**Hard stop.** pi-git sets `PI_GIT_SWITCH` (the switch file) and `PI_GIT_DEFAULT` in pi's process, so
+the agents' commands inherit them. A git hook can read them and refuse commits and pushes in a
+locked repository, also when a script runs git; see the main README.
+
 ## The helper
 
 The helper is `pi -p` with its own model, started in the worktree:
@@ -112,6 +141,7 @@ The helper is `pi -p` with its own model, started in the worktree:
 | `checkTimeout` | `1800` | Seconds for one hook run |
 | `helperTimeout` | `900` | Seconds for one helper run |
 | `delivery` | `turn` | How a summary reaches the main agent: `turn`, `message` or `notify` |
+| `locked` | `true` | Whether git changes are locked where `/git` says nothing |
 | `stateDir` | `~/.local/state/pi-git` | The queue, the summaries and the heartbeats |
 
 | What | Default | Override |

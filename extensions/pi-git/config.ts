@@ -29,6 +29,8 @@ export interface Config {
   /** State of the watcher: queued PRs and summaries. */
   stateDir: string;
   delivery: Delivery;
+  /** Whether git changes by agents are locked where the switch says nothing (/git). */
+  locked: boolean;
   errors: string[];
 }
 
@@ -64,6 +66,7 @@ export function defaults(path: string, env: NodeJS.ProcessEnv, home: string): Co
     worktrees: join(home, ".worktrees"),
     stateDir: join(state, "pi-git"),
     delivery: "turn",
+    locked: true,
     errors: [],
   };
 }
@@ -77,6 +80,21 @@ const STRINGS: readonly Field[] = ["model", "thinking", "skill", "pi", "worktree
 const PATHS: ReadonlySet<Field> = new Set(["skill", "worktrees", "stateDir"]);
 const NUMBERS = ["attempts", "checkTimeout", "helperTimeout"] as const;
 
+/** Apply `locked` or `delivery`; a string is the error. */
+function applyChoice(config: Config, key: string, value: unknown): string | undefined {
+  if (key === "locked") {
+    if (typeof value !== "boolean") return '"locked" must be true or false';
+    config.locked = value;
+  } else if (key === "delivery") {
+    if (!(DELIVERIES as readonly unknown[]).includes(value))
+      return `"delivery" must be one of ${DELIVERIES.join(", ")}`;
+    config.delivery = value as Delivery;
+  } else {
+    return `unknown key "${key}"`;
+  }
+  return undefined;
+}
+
 /** Apply one setting; a string is the error. */
 function applyField(config: Config, key: string, value: unknown, home: string): string | undefined {
   if ((STRINGS as readonly string[]).includes(key)) {
@@ -85,12 +103,8 @@ function applyField(config: Config, key: string, value: unknown, home: string): 
   } else if ((NUMBERS as readonly string[]).includes(key)) {
     if (typeof value !== "number" || !(value > 0)) return `"${key}" must be a positive number`;
     config[key as (typeof NUMBERS)[number]] = value;
-  } else if (key === "delivery") {
-    if (!(DELIVERIES as readonly unknown[]).includes(value))
-      return `"delivery" must be one of ${DELIVERIES.join(", ")}`;
-    config.delivery = value as Delivery;
   } else {
-    return `unknown key "${key}"`;
+    return applyChoice(config, key, value);
   }
   return undefined;
 }

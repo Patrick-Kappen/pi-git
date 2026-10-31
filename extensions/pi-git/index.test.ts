@@ -52,25 +52,31 @@ function unwritable(): string {
 function load(settings: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = {}) {
   const dir = mkdtempSync(join(tmpdir(), "pi-git-index-"));
   const stateDir = join(dir, "state");
-  writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir, ...settings }));
+  writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir, locked: false, ...settings }));
   const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
   const tools: Tool[] = [];
   const sendMessage = vi.fn();
+  const commands = new Map<
+    string,
+    { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions: (prefix: string) => unknown }
+  >();
   const pi = {
     on: (name: string, handler: never) => handlers.set(name, handler),
     registerTool: (tool: never) => tools.push(tool),
+    registerCommand: (name: string, command: never) => commands.set(name, command),
     sendMessage,
   };
   createPiGit(pi as never, { env: { PI_GIT_CONFIG: join(dir, "pi-git.json"), ...env }, home: dir, run: origin });
   const notify = vi.fn();
+  const setStatus = vi.fn();
   const ctx = (sessionId = "s1", hasUI = true) => ({
     cwd: "/w",
     hasUI,
-    ui: { notify },
+    ui: { notify, setStatus },
     sessionManager: { getSessionId: () => sessionId },
   });
   const config = { ...defaults("p", {}, dir), stateDir };
-  return { handlers, tools, sendMessage, notify, ctx, stateDir, config };
+  return { handlers, tools, commands, sendMessage, notify, setStatus, ctx, stateDir, config, dir };
 }
 
 const summary = (sessionId: string, repo = "o/r") => ({
@@ -235,6 +241,7 @@ describe("summaries", () => {
     const pi = {
       on: (name: string, handler: never) => handlers.set(name, handler),
       registerTool: () => {},
+      registerCommand: () => {},
       sendMessage,
     };
     const failing: Runner = async () => ({ code: 128, stdout: "", stderr: "not a repo" });
@@ -272,6 +279,7 @@ describe("helper process", () => {
       {
         on: (name: string, handler: never) => handlers.set(name, handler),
         registerTool: (tool: never) => tools.push(tool),
+        registerCommand: vi.fn(),
         sendMessage: vi.fn(),
       } as never,
       {
@@ -300,8 +308,99 @@ describe("default export", () => {
     const registerTool = vi.fn();
     const saved = process.env.PI_GIT_HELPER;
     delete process.env.PI_GIT_HELPER;
-    piGit({ on: vi.fn(), registerTool, sendMessage: vi.fn() } as unknown as ExtensionAPI);
+    piGit({ on: vi.fn(), registerTool, registerCommand: vi.fn(), sendMessage: vi.fn() } as unknown as ExtensionAPI);
     if (saved !== undefined) process.env.PI_GIT_HELPER = saved;
     expect(registerTool).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("the lock", () => {
+  test("locked by default: git changes and git_pr are blocked, reading is not", async () => {
+    const { handlers, tools, ctx, setStatus } = load({ locked: true });
+    await handlers.get("session_start")?.({}, ctx());
+    expect(setStatus).toHaveBeenCalledWith("pi-git", "git: locked");
+    const call = (command: string) => handlers.get("tool_call")?.({ toolName: "bash", input: { command } }, ctx());
+    expect(await call("git status && git log")).toBeUndefined();
+    expect(await call("npm test && git commit -m x")).toEqual({
+      block: true,
+      reason: "pi-git: git changes are locked in o/r (git commit). Only the user can unlock them, with /git unlock.",
+    });
+    expect(await call("gh pr create -R a/b")).toMatchObject({
+      reason: expect.stringContaining("locked in a/b (gh pr create)"),
+    });
+    expect(await handlers.get("tool_call")?.({ toolName: "read", input: { path: "x" } }, ctx())).toBeUndefined();
+    await expect(tools[0]?.execute("id", { intent: "x" }, undefined, undefined, ctx())).rejects.toThrow(
+      "locked in o/r (git_pr)",
+    );
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("/git unlock remembers the repository; global and reset", async () => {
+    const { handlers, commands, ctx, notify, setStatus, stateDir } = load({ locked: true });
+    await handlers.get("session_start")?.({}, ctx());
+    const git = commands.get("git");
+    await git?.handler("unlock", ctx());
+    expect(setStatus).toHaveBeenLastCalledWith("pi-git", "git: unlocked");
+    expect(notify.mock.lastCall?.[0]).toContain("git changes in o/r: unlocked (override of this repository)");
+    expect(
+      await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git commit -m x" } }, ctx()),
+    ).toBeUndefined();
+    expect(
+      await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "gh pr merge 1 -R x/y" } }, ctx()),
+    ).toMatchObject({ block: true });
+    await git?.handler("global unlock", ctx());
+    await git?.handler("lock", ctx());
+    expect(notify.mock.lastCall?.[0]).toContain("global: unlocked\noverrides:\n  o/r: locked");
+    await git?.handler("reset", ctx());
+    await git?.handler("global reset", ctx());
+    await git?.handler("", ctx());
+    expect(notify.mock.lastCall?.[0]).toContain(
+      "git changes in o/r: locked (default of the settings)\nglobal: not set, so the default: locked",
+    );
+    await git?.handler("maybe", ctx());
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("/git [unlock|lock|reset]"), "warning");
+    expect(git?.getArgumentCompletions("glo")).toEqual([
+      { value: "global unlock", label: "global unlock" },
+      { value: "global lock", label: "global lock" },
+      { value: "global reset", label: "global reset" },
+    ]);
+    expect(stateDir).toBeDefined();
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("/git outside a repository; the hooks get the switch file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-git-index-"));
+    const env: NodeJS.ProcessEnv = { PI_GIT_CONFIG: join(dir, "pi-git.json") };
+    writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir: join(dir, "state"), locked: false }));
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const failing: Runner = async () => ({ code: 128, stdout: "", stderr: "" });
+    createPiGit(
+      {
+        on: (n: string, h: never) => handlers.set(n, h),
+        registerTool: () => {},
+        registerCommand: (n: string, c: never) => commands.set(n, c),
+        sendMessage: vi.fn(),
+      } as never,
+      { env, home: dir, run: failing },
+    );
+    const notify = vi.fn();
+    const ctx = {
+      cwd: "/",
+      hasUI: false,
+      ui: { notify, setStatus: vi.fn() },
+      sessionManager: { getSessionId: () => "s" },
+    };
+    await handlers.get("session_start")?.({}, ctx);
+    expect(env.PI_GIT_SWITCH).toBe(join(dir, "state", "switch.json"));
+    expect(env.PI_GIT_DEFAULT).toBe("unlocked");
+    await commands.get("git")?.handler("unlock", ctx);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("not in a repository with an origin"), "warning");
+    await commands.get("git")?.handler("global lock", ctx);
+    expect(notify.mock.lastCall?.[0]).toContain("git changes here: locked (global setting)");
+    expect(await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git init" } }, ctx)).toMatchObject({
+      reason: expect.stringContaining("locked outside a repository with an origin (git init)"),
+    });
+    handlers.get("session_shutdown")?.({}, ctx);
   });
 });
