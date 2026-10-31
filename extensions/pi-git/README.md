@@ -213,7 +213,7 @@ would change behavior (choosing between behaviors, dropping a feature, changing 
 and that PR comes back to you as a notification with the decision. Any problem (that, a failing
 release workflow, a deploy that fails, or a stage that waits longer than 90 minutes) stops only that
 part, notifies you, and shows in `/git` and the tmux sign; the rest
-goes on. `/ship status` shows every part. Settings: `shipNixos` (the configuration's main checkout)
+goes on. `/ship status` shows every part. Settings: `shipRepos` (the repositories it ships, owner/name globs; default `*/pi-*`, everything else is left alone), `shipNixos` (the configuration's main checkout)
 and `shipHost` (default: this machine's host name).
 
 ## The lock

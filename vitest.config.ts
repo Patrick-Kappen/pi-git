@@ -5,6 +5,8 @@ export default defineConfig({
     // Hooks run inside git; its variables would point git calls in tests at this repository.
     // No test may notify the terminals of the person running them.
     env: { GIT_DIR: "", GIT_INDEX_FILE: "", GIT_WORK_TREE: "", PI_GIT_NO_NOTIFY: "1" },
+    // Tests spawn many Git processes; bound worker forks on hosts that report excessive CPU cores.
+    maxWorkers: 4,
     projects: [
       { test: { name: "unit", include: ["extensions/**/*.test.ts"] } },
       {

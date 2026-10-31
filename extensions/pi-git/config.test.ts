@@ -37,6 +37,7 @@ describe("defaults", () => {
       shipHost: expect.any(String),
       shipModel: "openai-codex/gpt-6-luna",
       shipThinking: "medium",
+      shipRepos: ["*/pi-*"],
       errors: [],
     });
     expect(defaults("p", { XDG_STATE_HOME: "/state" }, home).stateDir).toBe("/state/pi-git");
@@ -138,5 +139,11 @@ describe("loadConfig", () => {
     writeFileSync(join(dir, "bad.json"), "{");
     expect(loadConfig({ PI_GIT_CONFIG: join(dir, "bad.json") }, home).errors[0]).toMatch(/invalid JSON/);
     expect(loadConfig({ PI_GIT_CONFIG: dir }, home).errors[0]).toMatch(/EISDIR/);
+  });
+
+  test("shipRepos: a list of patterns, or an error", () => {
+    const base = defaults("p", {}, "/home/u");
+    expect(parseConfig({ shipRepos: ["o/pi-*", "o/graft"] }, base, "/home/u").shipRepos).toEqual(["o/pi-*", "o/graft"]);
+    expect(parseConfig({ shipRepos: "o/pi-*" }, base, "/home/u").errors[0]).toMatch(/shipRepos/);
   });
 });

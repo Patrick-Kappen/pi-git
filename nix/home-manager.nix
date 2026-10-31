@@ -222,6 +222,12 @@ in
         default = "openai-codex/gpt-6-luna";
         description = "The model of the agent that decides /ship's releases for changes without feat or fix.";
       };
+      repos = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ "*/pi-*" ];
+        example = [ "my-org/*" ];
+        description = "The repositories /ship ships, as owner/name globs; others are left alone.";
+      };
       thinking = lib.mkOption {
         type = lib.types.str;
         default = "medium";
@@ -264,7 +270,12 @@ in
 
     systemd.user = lib.mkIf cfg.watcher.enable {
       services.pi-git-watcher = {
-        Unit.Description = "pi-git watcher: follows the PRs of git_pr";
+        Unit = {
+          Description = "pi-git watcher: follows the PRs of git_pr";
+          # A run stays alive while a ship runs, and a ship waits for the deploy of this machine. A
+          # switch must not wait for (or restart) the run: the timer starts the new version next time.
+          X-RestartIfChanged = false;
+        };
         Service = {
           Type = "oneshot";
           ExecStart = "${pkgs.nodejs_24}/bin/node ${cfg.package}/watcher.ts";
@@ -314,6 +325,7 @@ in
         // {
           shipModel = cfg.ship.model;
           shipThinking = cfg.ship.thinking;
+          shipRepos = cfg.ship.repos;
         }
       );
     };
