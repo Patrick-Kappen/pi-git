@@ -203,6 +203,8 @@ export interface Verdict {
   reason: string;
   /** PRs that must land first, because this one uses what they add (not for plain file overlap). */
   after?: number[];
+  /** For a draft of the configuration: what it still needs besides the new lock. */
+  todo?: string;
 }
 
 export const PREFLIGHT_PROMPT = [
@@ -222,10 +224,15 @@ export const PREFLIGHT_PROMPT = [
   "dependency is neither open nor listed as merged, say so in the reason.",
   "Be strict with skip: a skipped PR waits for the owner. Do not skip for conflicts a helper can merge.",
   "",
+  "Drafts of the NixOS configuration are listed too. A draft that only waits for library releases (in this",
+  'ship, or released already) gets "ship", and in "todo" what its body says must still happen besides',
+  "updating flake.lock (for example switching an input from a branch to latest); leave todo out when nothing",
+  'is left. A draft that is unfinished for another reason gets "skip".',
+  "",
   'When a PR uses what another PR here adds (a function, a file, a setting), give that PR in "after", so it',
   "lands first. Not for PRs that only touch the same files: the order is found by merging.",
   "",
-  'Answer with JSON only: {"verdicts": [{"pr": <number>, "action": "ship" | "fix" | "skip", "reason": "<one sentence>", "after": [<numbers>]}]}',
+  'Answer with JSON only: {"verdicts": [{"pr": <number>, "action": "ship" | "fix" | "skip", "reason": "<one sentence>", "after": [<numbers>], "todo": "<for drafts>"}]}',
   'with one verdict for every PR in the input; "after" may be left out.',
 ].join("\n");
 
@@ -241,6 +248,7 @@ function parseVerdict(item: Record<string, unknown>): Verdict | Error {
     action: item.action as Action,
     reason: typeof item.reason === "string" ? item.reason : "",
     ...(after.length > 0 ? { after } : {}),
+    ...(typeof item.todo === "string" && item.todo.trim() !== "" ? { todo: item.todo.trim() } : {}),
   };
 }
 

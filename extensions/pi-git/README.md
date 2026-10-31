@@ -200,6 +200,10 @@ from open PRs to a deployed host:
    - then one flake.lock update for every released library in the NixOS configuration, on the
      freshly fetched default branch (a fixed title, no helper), merged when its checks pass; a
      conflict makes the lock again on the fresh default branch, at most 3 times;
+   - drafts of the configuration that wait for those releases (their body says so) are taken too:
+     after the lock, each gets the default branch merged in, a helper does what its body still asks
+     (for example switching an input from a branch to latest), and it is marked ready; drafts that
+     are unfinished for another reason are left out and reported;
    - then every NixOS configuration PR: brought up to date with the new lock first (`gh pr
      update-branch`, so its checks run with it), merged when green, oldest first; with nothing
      released, straight to these PRs;
