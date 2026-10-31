@@ -37,6 +37,7 @@ import {
   saveEntry,
   sessionAlive,
 } from "./state.ts";
+import { gitStatus, gitWatch } from "./status.ts";
 import { effective, type Lock, loadSwitch, STEPS, type Step, setGlobal, setRepo, switchPath } from "./switch.ts";
 
 export interface Options {
@@ -127,6 +128,13 @@ const prParameters = Type.Object({
 const commitParameters = Type.Object({
   intent: Type.String({ description: "What the change is for and why: the basis of the commit message." }),
   path: Type.Optional(Type.String({ description: "A directory in the worktree; default: the working directory." })),
+});
+
+const statusParameters = Type.Object({});
+
+const watchParameters = Type.Object({
+  pr: Type.String({ description: "The PR: its number or URL." }),
+  path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
 });
 
 const requestParameters = Type.Object({
@@ -387,6 +395,42 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         ],
         details: undefined,
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "git_status",
+    label: "Git status",
+    description: [
+      "Show all git work in progress, across repositories: the PRs the watcher follows and their state, what needs the",
+      "user, and the worktrees with uncommitted or unpushed work. Reads only.",
+    ].join(" "),
+    promptSnippet: "Show all git work in progress: watched PRs, what needs the user, worktrees",
+    promptGuidelines: ["Use git_status to see open work instead of listing worktrees and PRs by hand."],
+    parameters: statusParameters,
+    async execute() {
+      const text = await gitStatus({ run: runner, config, home });
+      return { content: [{ type: "text", text }], details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "git_watch",
+    label: "Git watch",
+    description: [
+      "Hand an open PR that was not made with git_pr to the watcher, so it fixes CI and conflicts, cleans up after the",
+      "merge and reports back. Needs a worktree with the PR's branch checked out.",
+    ].join(" "),
+    promptSnippet: "Let the watcher follow an open PR that was made without git_pr",
+    promptGuidelines: ["After git_watch, do not watch CI yourself; the watcher reports back."],
+    parameters: watchParameters,
+    async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext) {
+      const result = await gitWatch(
+        { run: runner, config, home },
+        { pr: params.pr, path: params.path ?? ctx.cwd, sessionId: ctx.sessionManager.getSessionId() },
+      );
+      if (!result.ok) throw new Error(result.summary);
+      return { content: [{ type: "text", text: result.summary }], details: undefined };
     },
   });
 
