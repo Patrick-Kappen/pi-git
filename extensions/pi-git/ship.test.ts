@@ -113,7 +113,9 @@ function prView(repo: string, args: readonly string[]): Reply {
   }[];
   const found = all.find((item) => String(item.number) === n);
   if (!found) return no;
-  return ok({ ...found, state: merged(repo, n) ? "MERGED" : (found.state ?? "OPEN") });
+  const state = merged(repo, n) ? "MERGED" : (found.state ?? "OPEN");
+  if (args.includes(".state")) return ok(state);
+  return ok({ ...found, state });
 }
 
 function api(path: string): Reply {
@@ -128,18 +130,30 @@ function api(path: string): Reply {
   return sha ? ok(sha) : no;
 }
 
-function ghReply(args: readonly string[]): Reply {
-  const repo = args[args.indexOf("-R") + 1] ?? "";
-  const key = `${args[0]} ${args[1]}`;
+function readyPr(repo: string, args: readonly string[]): Reply {
+  const list = (world.prs[repo] ?? []) as { number: number; isDraft: boolean }[];
+  for (const item of list) if (String(item.number) === args[2]) item.isDraft = false;
+  return ok("");
+}
+
+function ghPrReply(key: string, repo: string, args: readonly string[]): Reply | undefined {
   if (key === "pr list") return prList(repo, args);
-  if (key === "repo list") return ok((world.repos ?? []).map((nameWithOwner) => ({ nameWithOwner })));
   if (key === "pr view") return prView(repo, args);
-  if (key === "pr edit") return ok("");
-  if (key === "pr update-branch") return ok("");
+  if (key === "pr edit" || key === "pr update-branch") return ok("");
+  if (key === "pr ready") return readyPr(repo, args);
   if (key === "pr merge") {
     world.merged.push(`${repo}#${args[2]}`);
     return ok("");
   }
+  return undefined;
+}
+
+function ghReply(args: readonly string[]): Reply {
+  const repo = args[args.indexOf("-R") + 1] ?? "";
+  const key = `${args[0]} ${args[1]}`;
+  const prResponse = ghPrReply(key, repo, args);
+  if (prResponse) return prResponse;
+  if (key === "repo list") return ok((world.repos ?? []).map((nameWithOwner) => ({ nameWithOwner })));
   if (args[0] === "run") return ok(world.releaseRun ? [world.releaseRun] : []);
   return args[0] === "api" ? api(args[1] ?? "") : no;
 }
@@ -171,7 +185,8 @@ const fixNow = (repo: string, number: number) => {
 };
 let skips: Record<string, { pr: number; reason: string }[]> = {};
 let orders: Record<string, number[]> = {};
-const preflight = async (repo: string) => ({ skips: skips[repo] ?? [], order: orders[repo] });
+let todos: Record<string, Record<number, string>> = {};
+const preflight = async (repo: string) => ({ skips: skips[repo] ?? [], order: orders[repo], todos: todos[repo] });
 const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr, fixNow, preflight }, 1);
 
 beforeEach(() => {
@@ -207,6 +222,7 @@ beforeEach(() => {
   fixes.length = 0;
   skips = {};
   orders = {};
+  todos = {};
   gitPr.mockReset();
   gitPr.mockResolvedValue({ ok: true, summary: "PR opened", notes: [], pr: { number: 77, url: "u77" } } as never);
 });
@@ -510,6 +526,172 @@ describe("shipTick", () => {
     expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
   });
 
+  test("the agent's skip because of a PR that is merged already is dropped", async () => {
+    world.prs["o/pi-git"] = [
+      pr(1, "feat: base"),
+      pr(2, "feat: uses base", { mergeable: "CONFLICTING" }),
+      pr(3, "feat: other", { mergeable: "CONFLICTING" }),
+      pr(4, "feat: unfinished"),
+    ];
+    await plan([]);
+    // #1 was merged by an earlier ship; #3 depends on #9, which is still open.
+    world.merged.push("o/pi-git#1");
+    world.prs["o/pi-git"].push(pr(9, "feat: still open"));
+    config = { ...config, pi: "pi-fake" };
+    const inputs: string[] = [];
+    const agent: Runner = async (command, args, options) => {
+      if (command === "pi-fake") inputs.push(options.input ?? "");
+      if (command === "gh" && args[1] === "list" && args.includes("merged"))
+        return ok([{ number: 1, title: "feat: base" }]);
+      return command === "pi-fake"
+        ? ok({
+            verdicts: [
+              { pr: 1, action: "ship", reason: "merged" },
+              { pr: 2, action: "skip", reason: "It depends on #1, and #1 is not included in this ship." },
+              { pr: 3, action: "skip", reason: "It depends on #9, which is not shipped." },
+              { pr: 4, action: "skip", reason: "This PR is unfinished." },
+            ],
+          })
+        : fake(command, args, options);
+    };
+    const ship = await shipTick({ run: agent, config, gitPr, now: () => clock, watchPr, fixNow }, 1);
+    // The agent was told which PRs are merged already.
+    expect(inputs[0]).toContain("## Merged already (on the default branch)\n- #1 feat: base");
+    expect(ship?.skipped).toEqual([
+      "o/pi-git#3 feat: other: It depends on #9, which is not shipped.",
+      "o/pi-git#4 feat: unfinished: This PR is unfinished.",
+    ]);
+    expect(ship?.libs[0]?.prs.map((item) => item.number)).toEqual([1, 2]);
+  });
+
+  test("preflight works when no PRs were merged lately", async () => {
+    world.prs["o/pi-git"] = [pr(8, "feat: unfinished", { mergeable: "CONFLICTING" })];
+    await plan([]);
+    config = { ...config, pi: "pi-fake" };
+    const inputs: string[] = [];
+    const agent: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        inputs.push(options.input ?? "");
+        return ok({ verdicts: [{ pr: 8, action: "skip", reason: "unfinished" }] });
+      }
+      if (command === "gh" && args[1] === "list" && args.includes("merged")) return ok([]);
+      return fake(command, args, options);
+    };
+
+    const ship = await shipTick({ run: agent, config, gitPr, now: () => clock, watchPr, fixNow }, 1);
+
+    expect(inputs[0]).not.toContain("Merged already");
+    expect(ship?.skipped).toEqual(["o/pi-git#8 feat: unfinished: unfinished"]);
+  });
+
+  test("a NixOS draft that waits for a release: after the lock it is brought up to date, its todo done, marked ready and merged", async () => {
+    const branch = `pi/tweaks-${n}`;
+    g(nixos, "switch", "-q", "-c", branch, "origin/main");
+    writeFileSync(join(nixos, `tweaks-${n}.nix`), "{ }\n");
+    g(nixos, "add", ".");
+    g(nixos, "commit", "-q", "-m", "pi: add tweaks");
+    g(nixos, "push", "-q", "origin", branch);
+    g(nixos, "switch", "-q", "main");
+    const foundDir = join(root, `existing-${n}`);
+    g(nixos, "worktree", "add", "-q", foundDir, branch);
+
+    const conflictBranch = `pi/conflict-${n}`;
+    g(nixos, "switch", "-q", "-c", conflictBranch, "origin/main");
+    writeFileSync(join(nixos, `conflict-${n}.nix`), "{ }");
+    g(nixos, "add", ".");
+    g(nixos, "commit", "-q", "-m", "pi: add conflict test");
+    g(nixos, "push", "-q", "origin", conflictBranch);
+    g(nixos, "switch", "-q", "main");
+    const cleanBranch = `pi/clean-${n}`;
+    g(nixos, "push", "-q", "origin", `origin/main:refs/heads/${cleanBranch}`);
+
+    world.fail = ["gh pr ready 463"];
+    world.prs["o/Nixos"] = [
+      pr(459, "pi: add opt-in pi-tweaks support", { isDraft: true, headRefName: branch }),
+      pr(461, "pi: conflict while updating", { isDraft: true, headRefName: conflictBranch }),
+      pr(462, "pi: draft without a branch", { isDraft: true }),
+      pr(463, "pi: clean draft", { isDraft: true, headRefName: cleanBranch }),
+    ];
+    world.releaseRun = { status: "completed", conclusion: "success" };
+    world.tags["o/pi-git@v0.3.0"] = "new-git";
+    world.latest["o/pi-git"] = "new-git";
+    todos = { "o/Nixos": { 459: "switch the pi-tweaks input from feat/system-prompt to latest" } };
+    config = { ...config, pi: "pi-fake" };
+    const helper: string[] = [];
+    const conflictDir = join(config.worktrees, "Nixos", "ship-pr-461");
+    const run: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        helper.push(args.at(-1) ?? "");
+        return ok("Switched the input to latest.");
+      }
+      if (command === "git" && options?.cwd === conflictDir && args[0] === "merge" && args[1] === "--no-edit") {
+        return { code: 1, stdout: "", stderr: "conflicted" };
+      }
+      return fake(command, args, options);
+    };
+    const index = await indexShip(fake, nixos);
+    // The draft is not left out: it ships once the releases are locked.
+    expect(index.nixos.ready.map((item) => [item.number, item.note])).toEqual([
+      [459, "draft: ships once the releases it waits for are locked"],
+      [461, "draft: ships once the releases it waits for are locked"],
+      [462, "draft: ships once the releases it waits for are locked"],
+      [463, "draft: ships once the releases it waits for are locked"],
+    ]);
+    saveShip(config.stateDir, { ...createShip(index, ["o/pi-git"], "gaia", clock), sessionId: "s" });
+    await shipTick({ run, config, gitPr, now: () => clock, watchPr, fixNow, preflight });
+    // Release, lock (#77), then the draft: lock merged in this round needs the lock PR green first.
+    world.nixosPr = { ...pr(77, "flake: lock"), state: "OPEN" };
+    const ship = await shipTick({ run, config, gitPr, now: () => clock, watchPr, fixNow, preflight });
+    expect(helper.some((text) => text.includes("switch the pi-tweaks input from feat/system-prompt to latest"))).toBe(
+      true,
+    );
+    expect(helper.some((text) => text.includes("Merging origin/main into it conflicted"))).toBe(true);
+    expect(calls).toContain("gh pr ready 459 -R o/Nixos");
+    expect(calls).toContain("gh pr ready 461 -R o/Nixos");
+    expect(world.merged).toContain("o/Nixos#459");
+    expect(world.merged).toContain("o/Nixos#461");
+    expect(ship?.nixos.prs[0]).toMatchObject({ draft: true, readied: true, merged: true });
+    expect(ship?.nixos.prs[1]).toMatchObject({ draft: true, readied: true, merged: true });
+    expect(ship?.nixos.prs[2]?.error).toBe("#462: no branch");
+    expect(ship?.nixos.prs[3]?.error).toContain("#463: gh pr ready failed:");
+  });
+
+  test("a NixOS draft with no todo and a clean merge is pushed and readied without a helper", async () => {
+    const branch = `pi/clean-draft-${n}`;
+    g(nixos, "switch", "-q", "-c", branch, "origin/main");
+    writeFileSync(join(nixos, `clean-draft-${n}.nix`), "{ }\n");
+    g(nixos, "add", ".");
+    g(nixos, "commit", "-q", "-m", "pi: clean draft");
+    g(nixos, "push", "-q", "origin", branch);
+    g(nixos, "switch", "-q", "main");
+    world.prs["o/Nixos"] = [pr(463, "pi: clean draft", { isDraft: true, headRefName: branch })];
+
+    const ship = createShip(await indexShip(fake, nixos), [], "gaia", clock);
+    ship.libs = [];
+    ship.reviewed = true;
+    ship.nixos.state = "merge";
+    ship.nixos.lockSha = "lock-merge";
+    saveShip(config.stateDir, ship);
+    const helpers: string[] = [];
+    const runner: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        helpers.push(args.join(" "));
+        return ok("unexpected helper call");
+      }
+      return fake(command, args, options);
+    };
+    config = { ...config, pi: "pi-fake" };
+
+    const result = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr, fixNow }, 1);
+
+    expect(helpers).toEqual([]);
+    expect(gitPr).toHaveBeenCalledTimes(1);
+    expect(gitPr.mock.calls[0]?.[0].intent).toBe("Bring the draft up to date with the new lock.");
+    expect(calls).toContain("gh pr ready 463 -R o/Nixos");
+    expect(world.merged).toContain("o/Nixos#463");
+    expect(result?.nixos.prs[0]).toMatchObject({ draft: true, readied: true, merged: true });
+  });
+
   test("the watcher gave up on a red PR: that library needs you", async () => {
     world.prs["o/pi-git"] = [
       pr(4, "feat: red", {
@@ -657,9 +839,9 @@ describe("shipTick", () => {
       return fake(command, args, options);
     };
 
-    await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+    await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr, preflight });
     world.releaseRun = { status: "completed", conclusion: "success" };
-    const ship = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr, preflight });
 
     expect(commitQueries).toContain("");
     expect(ship?.libs[0]).toMatchObject({ state: "tag", tag: "v0.3.0" });

@@ -5,7 +5,7 @@ import { addAttention, notifyTerminals } from "./attention.ts";
 import type { Config } from "./config.ts";
 import { clipStart, outputOf, type Runner } from "./exec.ts";
 import { repoName, repoSlug } from "./git.ts";
-import { askJson } from "./helper.ts";
+import { askJson, runHelper } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { PREFLIGHT_PROMPT, parseVerdicts, preflightInput, simulate } from "./preflight.ts";
 import { findMainCheckout } from "./start.ts";
@@ -43,6 +43,12 @@ export interface ShipPr {
   branch?: string;
   /** Merged by the ship. */
   merged?: boolean;
+  /** A draft of the configuration that waits for library releases: marked ready after the lock. */
+  draft?: boolean;
+  /** What a draft still needs besides the new lock, from its body (for example: an input to latest). */
+  todo?: string;
+  /** The draft was brought up to date, its todo done, and marked ready. */
+  readied?: boolean;
   /** Why the ship gave up on this PR; the other PRs go on. */
   error?: string;
 }
@@ -225,9 +231,28 @@ export function latestInputs(lockText: string): LockedInput[] {
   return result.sort((a, b) => a.input.localeCompare(b.input));
 }
 
-function addListedPr(index: RepoIndex, pr: ListedPr, defaultBranch: string): void {
+function listedPrNote(why: string | undefined, stacked: string | undefined): string | undefined {
+  if (stacked) return `stacked on ${stacked}: after it`;
+  if (why === undefined) return undefined;
+  return FIXABLE.has(why) ? `the watcher fixes it: ${why}` : "waits for its checks";
+}
+
+function addListedPr(index: RepoIndex, pr: ListedPr, defaultBranch: string, drafts = false): void {
   if (pr.labels?.some((label) => label.name === RELEASE_LABEL)) {
     index.releasePr = { number: pr.number, title: pr.title };
+    return;
+  }
+  // The configuration's drafts usually wait for library releases: the preflight decides about them.
+  if (drafts && pr.isDraft) {
+    index.ready.push({
+      number: pr.number,
+      title: pr.title,
+      sha: pr.headRefOid,
+      url: pr.url,
+      draft: true,
+      note: "draft: ships once the releases it waits for are locked",
+      ...(pr.headRefName ? { branch: pr.headRefName } : {}),
+    });
     return;
   }
   const why = notReady(pr);
@@ -236,13 +261,7 @@ function addListedPr(index: RepoIndex, pr: ListedPr, defaultBranch: string): voi
     return;
   }
   const stacked = pr.baseRefName !== undefined && pr.baseRefName !== defaultBranch ? pr.baseRefName : undefined;
-  const note = stacked
-    ? `stacked on ${stacked}: after it`
-    : why === undefined
-      ? undefined
-      : FIXABLE.has(why)
-        ? `the watcher fixes it: ${why}`
-        : "waits for its checks";
+  const note = listedPrNote(why, stacked);
   index.ready.push({
     number: pr.number,
     title: pr.title,
@@ -254,7 +273,7 @@ function addListedPr(index: RepoIndex, pr: ListedPr, defaultBranch: string): voi
   });
 }
 
-async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIndex> {
+async function indexRepo(run: Runner, cwd: string, repo: string, drafts = false): Promise<RepoIndex> {
   const list = await ghJson<ListedPr[]>(run, cwd, ["pr", "list", "-R", repo, "--state", "open", "--json", PR_FIELDS]);
   const index: RepoIndex = { repo, ready: [], problems: [], releasable: false, behind: false };
   if (!list) {
@@ -265,7 +284,7 @@ async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIn
     (await gh(run, cwd, ["repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"])) ??
     "main";
   const sorted = [...list].sort((a, b) => a.number - b.number);
-  for (const pr of sorted) addListedPr(index, pr, defaultBranch);
+  for (const pr of sorted) addListedPr(index, pr, defaultBranch, drafts);
   index.ready = stackOrder(index.ready).order;
   index.releasable = index.releasePr !== undefined || index.ready.some((pr) => RELEASING.test(pr.title));
   const first = index.ready[0];
@@ -314,7 +333,7 @@ export async function indexShip(
     new Set(inputs.map((item) => item.repo.toLowerCase())),
     patterns,
   );
-  const nixos = await indexRepo(run, nixosRoot, nixosRepo);
+  const nixos = await indexRepo(run, nixosRoot, nixosRepo, true);
   // The NixOS configuration is not released; its merges are deployed.
   const { noRelease: _none, ...plain } = nixos;
   return { libs: [...libs, ...outside], nixos: { ...plain, releasable: false, root: nixosRoot } };
@@ -548,6 +567,8 @@ export const RELEASE_PROMPT = [
 /** The preflight of one repository: the PRs to leave out, and the order in which the rest lands. */
 export interface Preflight {
   skips: { pr: number; reason: string }[];
+  /** For drafts of the configuration: what each still needs besides the new lock. */
+  todos?: Record<number, string> | undefined;
   /** PR numbers in the order they land: clean ones first, conflicting ones last. */
   order?: number[] | undefined;
 }
@@ -812,8 +833,12 @@ class Shipping {
     for (let round = orphans(); round.length > 0; round = orphans()) {
       for (const pr of round) drop(pr.number, `stacked on ${pr.stackedOn}, whose PR is not shipped`);
     }
-    const { skips, order } = await (this.deps.preflight ?? ((r, p) => this.preflight(r, p, agent)))(repo, prs);
+    const { skips, order, todos } = await (this.deps.preflight ?? ((r, p) => this.preflight(r, p, agent)))(repo, prs);
     for (const skip of skips) drop(skip.pr, skip.reason);
+    for (const pr of prs) {
+      const todo = todos?.[pr.number];
+      if (todo) pr.todo = todo;
+    }
     // Merge in the order the simulation found; PRs it did not see keep their place at the end.
     if (order) {
       const rank = (pr: ShipPr) => (order.includes(pr.number) ? order.indexOf(pr.number) : order.length);
@@ -870,7 +895,11 @@ class Shipping {
     const verdicts = await askJson(
       this.deps.run,
       agent,
-      { cwd: this.ship.nixos.root, prompt: PREFLIGHT_PROMPT, input: preflightInput(repo, withBodies, simulated) },
+      {
+        cwd: this.ship.nixos.root,
+        prompt: PREFLIGHT_PROMPT,
+        input: `${preflightInput(repo, withBodies, simulated)}${await this.mergedInput(repo)}`,
+      },
       parseVerdicts(prs.map((pr) => pr.number)),
     );
     if (verdicts instanceof Error) {
@@ -882,10 +911,121 @@ class Shipping {
     // PRs that use what another adds land after it: find the order again with those needs.
     const after = Object.fromEntries(verdicts.filter((v) => v.after).map((v) => [v.pr, v.after as number[]]));
     if (Object.keys(after).length > 0) simulated = await run(after);
+    const todos = Object.fromEntries(verdicts.filter((v) => v.todo).map((v) => [v.pr, v.todo as string]));
     return {
-      skips: verdicts.filter((item) => item.action === "skip").map((item) => ({ pr: item.pr, reason: item.reason })),
+      skips: await this.withoutMergedReasons(
+        repo,
+        verdicts.filter((item) => item.action === "skip"),
+      ),
       order: order(),
+      ...(Object.keys(todos).length > 0 ? { todos } : {}),
     };
+  }
+
+  private async draftWorktree(n: NixItem, pr: ShipPr): Promise<{ dir: string; base: string } | string> {
+    const branch = pr.branch;
+    if (!branch) return `#${pr.number}: no branch`;
+    const found = await worktreeOf(this.deps.run, n.root, branch);
+    const dir = found?.path ?? join(this.deps.config.worktrees, repoName(n.repo), `ship-pr-${pr.number}`);
+    await this.git(n.root, ["fetch", "origin", branch, "--prune"]);
+    const placed = found
+      ? await this.git(dir, ["reset", "--hard", `origin/${branch}`])
+      : await this.git(n.root, ["worktree", "add", "--track", "-B", branch, dir, `origin/${branch}`]);
+    if (placed.code !== 0) return `#${pr.number}: no worktree: ${clipStart(outputOf(placed).trim(), 200)}`;
+    const head = await this.git(n.root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    return { dir, base: head.code === 0 ? head.stdout.trim() : "origin/main" };
+  }
+
+  private async updateDraft(pr: ShipPr, dir: string, base: string): Promise<string | undefined> {
+    const merged = await this.deps.run("git", ["merge", "--no-edit", base], { cwd: dir, env: { PI_GIT_SWITCH: "" } });
+    if (merged.code !== 0) await this.git(dir, ["merge", "--abort"]);
+    if (!pr.todo && merged.code === 0) return undefined;
+    const task = [
+      "This draft PR of the NixOS configuration waited for library releases; they are now locked on the default branch.",
+      pr.todo ? `Do what it still needs before review: ${pr.todo}` : "",
+      merged.code !== 0
+        ? `Merging ${base} into it conflicted: merge it and resolve the conflicts (regenerate flake.lock with nix, never by hand).`
+        : "",
+      "Use the repository's own tools (for example `nix run .#write-flake` after changing flake-file inputs, `nix flake update <input>`).",
+      "Do not commit or push: pi-git does that.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const fix = await runHelper(this.deps.run, this.deps.config, {
+      cwd: dir,
+      prompt: task,
+      input: pr.title,
+      fix: true,
+    });
+    if (!fix.ok || /^CANNOT FIX:/m.test(fix.text)) {
+      return `#${pr.number}: the helper could not finish the draft: ${fix.ok ? fix.text : fix.failure}`;
+    }
+    return undefined;
+  }
+
+  private async publishDraft(n: NixItem, pr: ShipPr, dir: string): Promise<string | undefined> {
+    const pushed = await this.deps.gitPr(
+      {
+        path: dir,
+        intent: pr.todo ?? "Bring the draft up to date with the new lock.",
+        title: `chore(pi): get #${pr.number} ready for the new releases`,
+        updatePr: false,
+      },
+      { run: this.deps.run, config: this.deps.config, progress: () => {} },
+    );
+    if (!pushed.ok && !/nothing to/i.test(pushed.summary)) return `#${pr.number}: ${clipStart(pushed.summary, 200)}`;
+    const ready = await this.deps.run("gh", ["pr", "ready", String(pr.number), "-R", n.repo], { cwd: n.root });
+    if (ready.code !== 0) return `#${pr.number}: gh pr ready failed: ${clipStart(outputOf(ready).trim(), 200)}`;
+    pr.readied = true;
+    return undefined;
+  }
+
+  /**
+   * A draft of the configuration that waited for the releases: update its branch with the default
+   * branch, have the helper finish its todo, then push it and mark it ready. A string is why not.
+   */
+  private async readyDraft(n: NixItem, pr: ShipPr): Promise<string | undefined> {
+    const worktree = await this.draftWorktree(n, pr);
+    if (typeof worktree === "string") return worktree;
+    const error = await this.updateDraft(pr, worktree.dir, worktree.base);
+    if (error) return error;
+    return this.publishDraft(n, pr, worktree.dir);
+  }
+
+  /** The PRs merged lately (on the default branch already), so the agent does not take them for missing. */
+  private async mergedInput(repo: string): Promise<string> {
+    const list = await this.ghJson<{ number: number; title: string }[]>([
+      "pr",
+      "list",
+      "-R",
+      repo,
+      "--state",
+      "merged",
+      "--limit",
+      "30",
+      "--json",
+      "number,title",
+    ]);
+    if (!list || list.length === 0) return "";
+    return `\n\n## Merged already (on the default branch)\n${list.map((pr) => `- #${pr.number} ${pr.title}`).join("\n")}`;
+  }
+
+  /**
+   * A skip because of another PR that is merged already is wrong: its changes are on the default
+   * branch. Such skips are dropped; every other skip stays.
+   */
+  private async withoutMergedReasons(repo: string, skips: { pr: number; reason: string }[]) {
+    const kept: { pr: number; reason: string }[] = [];
+    for (const skip of skips) {
+      const cited = [...skip.reason.matchAll(/#(\d+)/g)].map((match) => Number(match[1])).filter((n) => n !== skip.pr);
+      const states = await Promise.all(
+        cited.map((n) => this.gh(["pr", "view", String(n), "-R", repo, "--json", "state", "--jq", ".state"])),
+      );
+      const merged = cited.length > 0 && states.every((state) => state === "MERGED");
+      if (merged) this.deps.log?.(`pi-git ship: ${repo}#${skip.pr}: not skipped; the PRs it depends on are merged`);
+      else kept.push({ pr: skip.pr, reason: skip.reason });
+    }
+    return kept;
   }
 
   private async reviewLibrary(
@@ -1028,8 +1168,15 @@ class Shipping {
    * merge (or of the lock, when there are no PRs).
    */
   private async nixMerge(n: NixItem): Promise<void> {
+    for (const pr of n.prs.filter((item) => item.draft && !item.readied && !item.error)) {
+      const error = await this.readyDraft(n, pr);
+      if (error) {
+        pr.error = error;
+        await this.problem(n.repo, error);
+      }
+    }
     if (n.lockSha) {
-      for (const pr of n.prs.filter((item) => !item.merged && !n.updated?.includes(item.number))) {
+      for (const pr of n.prs.filter((item) => !item.draft && !item.merged && !n.updated?.includes(item.number))) {
         await this.deps.run("gh", ["pr", "update-branch", String(pr.number), "-R", n.repo], { cwd: n.root });
         n.updated = [...(n.updated ?? []), pr.number];
       }
