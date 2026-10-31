@@ -48,6 +48,7 @@ case "$1 $2" in
   "pr view") cat "${root}/view.json" 2>/dev/null || exit 1 ;;
   "run view") echo "LOG: test failed in a.ts" ;;
   "run rerun") exit 0 ;;
+  "api -X") if [ -f "${root}/gh.apifail" ]; then echo "no permission" >&2; exit 1; fi ;;
   *) exit 1 ;;
 esac
 `,
@@ -187,8 +188,9 @@ describe("tick", () => {
     expect(existsSync(entry.worktree)).toBe(false);
     expect(sh(main, "branch", "--list", entry.branch)).toBe("");
     expect(texts()[0]).toBe(
-      `pi-git: PR #${n} (o/r) is merged; removed the worktree ${entry.worktree} and the branch ${entry.branch}.`,
+      `pi-git: PR #${n} (o/r) is merged; removed the worktree ${entry.worktree} and the branch ${entry.branch}, also on GitHub.`,
     );
+    expect(readFileSync(ghLog, "utf8")).toContain(`api -X DELETE repos/o/r/git/refs/heads/${entry.branch}`);
     expect(saved()).toBeUndefined();
   });
 
@@ -463,6 +465,22 @@ describe("tick", () => {
     view({ state: "MERGED" });
     await once();
     expect(listAttention(config.stateDir)).toEqual([]);
+  });
+
+  test("merged: a branch that GitHub deleted already is left alone; a failing delete is reported", async () => {
+    sh(main, "push", "-q", "origin", "--delete", entry.branch);
+    view({ state: "MERGED" });
+    await once();
+    expect(texts()[0]).toMatch(/and the branch feat\/t\d+\.$/);
+    expect(readFileSync(ghLog, "utf8")).not.toContain("api -X DELETE");
+  });
+
+  test("merged: the delete on GitHub fails", async () => {
+    writeFileSync(join(root, "gh.apifail"), "");
+    view({ state: "MERGED" });
+    await once();
+    rmSync(join(root, "gh.apifail"));
+    expect(texts()[0]).toContain("; the branch on GitHub could not be deleted (no permission)");
   });
 });
 

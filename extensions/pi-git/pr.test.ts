@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { type Config, defaults } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
-import { gitCommit, gitPr, type PrInput } from "./pr.ts";
+import { gitCommit, gitPr, gitPush, type PrInput } from "./pr.ts";
 import type { Step } from "./switch.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-git-pr-")));
@@ -403,5 +403,49 @@ describe("gitPr with locked steps", () => {
     sh(worktree, "add", "-A");
     sh(worktree, "commit", "-q", "-m", "feat: by hand");
     expect((await run(allow("push"))).summary).toMatch(/^Pushed|^pushed/);
+  });
+});
+
+describe("gitPush", () => {
+  const push = (allowed?: (step: Step) => boolean) =>
+    gitPush(
+      { path: worktree, intent: "Add the thing." },
+      { run: runner, config, progress: () => {}, ...(allowed ? { allowed } : {}) },
+    );
+
+  test("pushes the commits; uncommitted changes stay", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: by hand");
+    writeFileSync(join(worktree, "later.txt"), "later\n");
+    const result = await push();
+    expect(result.summary).toBe(
+      `Pushed feat/topic-${counter}; the pre-push checks passed. Uncommitted changes stay in the worktree; git_commit commits them.`,
+    );
+    expect(sh(origin, "log", "-1", "--format=%s", `feat/topic-${counter}`)).toBe("feat: by hand");
+  });
+
+  test("a failing pre-push check: the helper fixes it as a commit", async () => {
+    writeFileSync(join(worktree, "push.txt"), "FAIL\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: by hand");
+    const result = await push();
+    expect(result.ok).toBe(true);
+    expect(result.summary).toContain("The helper fixed on the way:\n- pre-push: Set push.txt to OK.");
+    expect(sh(origin, "show", `feat/topic-${counter}:push.txt`)).toBe("OK");
+  });
+
+  test("with commit locked, the push runs once and the helper does not fix", async () => {
+    writeFileSync(join(worktree, "push.txt"), "FAIL\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: by hand");
+    const result = await push((step) => step === "push");
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("The push failed:\ncheck: push.txt says FAIL");
+    expect(readFileSync(helperLog, "utf8")).toBe("");
+  });
+
+  test("nothing to push", async () => {
+    expect((await push()).summary).toContain("nothing to do: no changes");
   });
 });

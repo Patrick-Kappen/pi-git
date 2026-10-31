@@ -47,7 +47,7 @@ export function lockPrompt(states: States, slug: string | undefined): string {
   const lines = [`${statusText(states)} ${slug ? `in ${slug}` : "here (not in a repository with an origin)"}.`];
   if (open.length > 0)
     lines.push(
-      `Allowed: ${open.join(", ")}. Use the pi-git tools: git_commit, and git_pr to commit, push and open the PR.`,
+      `Allowed: ${open.join(", ")}. Use the pi-git tools: git_start, git_commit, git_push, and git_pr (commit, push and PR in one run).`,
     );
   if (closed.length > 0) {
     lines.push("Blocked for you:", ...closed.map((step) => `- ${STEP_TEXT[step]}`));
@@ -86,7 +86,8 @@ export function describeLock(
   }
   lines.push(
     "/git unlock|lock|reset [steps]: this repository. /git global unlock|lock|reset [steps]: everywhere else.",
-    "/git commit [intent]: commit once, also when commit is locked. /git clear: forget what needs you.",
+    "/git worktree <topic> [type], /git commit [intent], /git push, /git pr [intent]: once, also when the step is locked.",
+    "/git clear: forget what needs you.",
   );
   return lines.join("\n");
 }
@@ -95,7 +96,7 @@ export function describeLock(
 export type GitCommand =
   | { kind: "show" }
   | { kind: "set"; scope: "repo" | "global"; steps: Step[]; lock: Lock | undefined }
-  | { kind: "run"; step: "commit"; intent: string }
+  | { kind: "run"; step: Step; args: string }
   | { kind: "clear" }
   | { kind: "bad" };
 
@@ -108,7 +109,7 @@ export function parseGitCommand(args: string): GitCommand {
     .split(/\s+/)
     .filter((word) => word !== "");
   if (words.length === 0) return { kind: "show" };
-  if (words[0] === "commit") return { kind: "run", step: "commit", intent: words.slice(1).join(" ") };
+  if (isStep(words[0])) return { kind: "run", step: words[0], args: words.slice(1).join(" ") };
   if (words[0] === "clear" && words.length === 1) return { kind: "clear" };
   const scope = words[0] === "global" ? "global" : "repo";
   const rest = scope === "global" ? words.slice(1) : words;
@@ -127,7 +128,10 @@ export function gitCompletions(prefix: string): Array<{ value: string; label: st
     "global unlock",
     "global lock",
     "global reset",
+    "worktree",
     "commit",
+    "push",
+    "pr",
     "clear",
   ];
   return items.filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
