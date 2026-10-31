@@ -1,6 +1,60 @@
 # pi-git
 
-pi extension that commits, pushes and opens PRs with a helper agent, and watches CI until the PR is green
+pi extension that commits, pushes and opens PRs with a helper agent, and watches CI until the PR is
+green.
+
+The main agent of pi is good at making a change and expensive at the rest: running the hooks, reading
+their output, fixing lint, writing the commit message and the PR. With pi-git, the main agent calls
+`git_pr` with what the change is for. A cheap helper agent (`pi -p` with another model) fixes failing
+checks and writes the commit message and the PR; pi-git runs every git and GitHub step itself. See
+the [extension README](extensions/pi-git/README.md).
+
+It works with the `git` skill of [pi-skills](https://github.com/Patrick-Kappen/pi-skills), which
+both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on the default branch.
+
+## Use with Home Manager
+
+```nix
+{
+  inputs.pi-git = {
+    url = "github:Patrick-Kappen/pi-git/latest"; # the latest release
+    inputs.nixpkgs.follows = "nixpkgs";
+    inputs.home-manager.follows = "home-manager";
+  };
+}
+```
+
+```nix
+{ config, inputs, ... }:
+{
+  imports = [ inputs.pi-git.homeModules.default ];
+
+  programs.pi-git = {
+    enable = true;
+    model = "openai-codex/gpt-6-luna";
+    thinking = "xhigh";
+    skill = "${config.programs.pi-skills.skillsPackage}/git";
+  };
+}
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `model`, `thinking` | `openai-codex/gpt-6-luna`, `xhigh` | The helper's model and thinking level |
+| `skill` | `null` | The git skill directory |
+| `attempts` | `3` | Fix attempts per failing step |
+| `checkTimeout`, `helperTimeout` | `1800`, `900` | Seconds for one hook run and one helper run |
+| `pi` | `"pi"` | The pi command for the helper |
+| `package`, `agentDir` | this flake, `.pi/agent` | The extension, and pi's agent directory |
+
+## Layout
+
+| Path | Contains |
+|---|---|
+| `extensions/pi-git/` | The extension, with unit tests; `pr.test.ts` runs the whole flow with real git and a fake helper |
+| `nix/package.nix` | The package `pi-git` |
+| `nix/home-manager.nix` | The Home Manager module |
+| `nix/checks.nix`, `test/nix/` | Flake checks: the package, the module, and the generated config with node |
 
 ## Development
 
