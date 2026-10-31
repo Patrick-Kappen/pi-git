@@ -13,7 +13,17 @@ import { type Runner, run } from "./exec.ts";
 import { repoSlug } from "./git.ts";
 import { blockedForHelper, gitChanges } from "./guard.ts";
 import { HELPER_ENV } from "./helper.ts";
-import { gitPr, type PrResult } from "./pr.ts";
+import {
+  describeLock,
+  type GitCommand,
+  gitCompletions,
+  lockedReason,
+  lockPrompt,
+  parseGitCommand,
+  statesOf,
+  statusText,
+} from "./lock.ts";
+import { gitCommit, gitPr, type PrResult } from "./pr.ts";
 import {
   claimSummary,
   type Entry,
@@ -26,7 +36,7 @@ import {
   saveEntry,
   sessionAlive,
 } from "./state.ts";
-import { effective, type Lock, loadSwitch, setGlobal, setRepo, switchPath } from "./switch.ts";
+import { effective, type Lock, loadSwitch, type Step, setGlobal, setRepo, switchPath } from "./switch.ts";
 
 export interface Options {
   env?: NodeJS.ProcessEnv;
@@ -37,51 +47,11 @@ export interface Options {
 /** The pi methods this extension uses; a subset of ExtensionAPI, so tests can pass a fake. */
 export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool" | "sendMessage" | "registerCommand">;
 
-/** Why a git change is blocked; the model cannot unlock, only the user can. */
-export function lockedReason(what: string, slug: string | undefined): string {
-  const where = slug ? `in ${slug}` : "outside a repository with an origin";
-  return `pi-git: git changes are locked ${where} (${what}). Only the user can unlock them, with /git unlock.`;
-}
-
-/** The text of /git. */
-export function describeLock(stateDir: string, slug: string | undefined, fallback: Lock): string {
-  const value = loadSwitch(stateDir);
-  const here = effective(value, slug, fallback);
-  const source = { repo: "override of this repository", global: "global setting", default: "default of the settings" }[
-    here.source
-  ];
-  const lines = [
-    `git changes ${slug ? `in ${slug}` : "here"}: ${here.lock} (${source})`,
-    `global: ${value.global ?? `not set, so the default: ${fallback}`}`,
-  ];
-  const overrides = Object.entries(value.repos);
-  if (overrides.length > 0) lines.push("overrides:", ...overrides.map(([repo, lock]) => `  ${repo}: ${lock}`));
-  lines.push("/git unlock | lock | reset: this repository. /git global unlock | lock | reset: everywhere else.");
-  return lines.join("\n");
-}
-
 /** The name of the system prompt section with the state of the lock. */
 export const PROMPT_SECTION = "pi_git";
 
-/** What the agent is told about the lock, before every prompt. */
-export function lockPrompt(lock: Lock, slug: string | undefined): string {
-  const where = slug ? `in ${slug}` : "here (not in a repository with an origin)";
-  if (lock === "unlocked") {
-    return [
-      `git: unlocked ${where}. You may change the repository; use git_pr to commit, push and open or update PRs.`,
-      "Other repositories can be locked; a blocked command says so.",
-    ].join("\n");
-  }
-  return [
-    `git: locked ${where}. Git changes are blocked for you: commit, push, add, checkout, branches, rebase,`,
-    "worktrees, and gh commands that change GitHub (pr create, pr merge, ...). Reading is allowed: status, diff, log,",
-    "fetch, gh pr view, gh pr checks, and the like.",
-    "Do not try to work around the lock. When the task needs a git change, finish the work in the files and ask the",
-    "user to run /git unlock; only the user can unlock.",
-  ].join("\n");
-}
-
-const GIT_COMMANDS = ["unlock", "lock", "reset", "global unlock", "global lock", "global reset"];
+const GIT_USAGE =
+  "pi-git: /git, /git unlock|lock|reset [worktree commit push pr], /git global unlock|lock|reset [steps], /git commit [intent]";
 
 /** How often a session sends its heartbeat and looks for summaries. */
 export const POLL_MS = 20_000;
@@ -153,6 +123,11 @@ const prParameters = Type.Object({
   draft: Type.Optional(Type.Boolean({ description: "Open the PR as a draft." })),
 });
 
+const commitParameters = Type.Object({
+  intent: Type.String({ description: "What the change is for and why: the basis of the commit message." }),
+  path: Type.Optional(Type.String({ description: "A directory in the worktree; default: the working directory." })),
+});
+
 const checkParameters = Type.Object({
   path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
   command: Type.Optional(
@@ -199,9 +174,22 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     }
     return slugs.get(dir);
   };
-  const lockOf = (target: string | undefined): Lock => effective(loadSwitch(config.stateDir), target, fallback()).lock;
+  const lockOf = (target: string | undefined, step: Step): Lock =>
+    effective(loadSwitch(config.stateDir), target, step, fallback()).lock;
   const showStatus = (ctx: ExtensionContext, target: string | undefined): void => {
-    if (ctx.hasUI) ctx.ui.setStatus("pi-git", `git: ${lockOf(target)}`);
+    if (ctx.hasUI) ctx.ui.setStatus("pi-git", statusText(statesOf(config.stateDir, target, fallback())));
+  };
+  const progressOf = (
+    onUpdate: ((update: { content: Array<{ type: "text"; text: string }>; details: undefined }) => void) | undefined,
+  ) => {
+    const steps: string[] = [];
+    return (text: string) => {
+      steps.push(text);
+      onUpdate?.({
+        content: [{ type: "text", text: steps.map((step) => `- ${step}`).join("\n") }],
+        details: undefined,
+      });
+    };
   };
   let timer: ReturnType<typeof setInterval> | undefined;
   let sessionId = "";
@@ -261,44 +249,78 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
   });
 
   pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-    event.systemPromptOptions.sections[PROMPT_SECTION] = lockPrompt(lockOf(slug), slug);
+    event.systemPromptOptions.sections[PROMPT_SECTION] = lockPrompt(statesOf(config.stateDir, slug, fallback()), slug);
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx): Promise<ToolCallEventResult | undefined> => {
     if (event.toolName !== "bash" || typeof event.input.command !== "string") return undefined;
     for (const change of gitChanges(event.input.command, ctx.cwd, home)) {
       const target = change.slug ?? (await slugOf(change.dir));
-      if (lockOf(target) === "locked") return { block: true, reason: lockedReason(change.what, target) };
+      if (lockOf(target, change.step) === "locked") {
+        return { block: true, reason: lockedReason(change.step, change.what, target) };
+      }
     }
     return undefined;
   });
 
+  /** /git commit: the user's own action, allowed once whatever the lock says. */
+  const commitOnce = async (intent: string, ctx: ExtensionContext): Promise<void> => {
+    const result = await gitCommit(
+      { path: ctx.cwd, intent: intent || "(no intent given: describe the change from the diff)" },
+      { run: runner, config, progress: () => {} },
+    );
+    ctx.ui.notify(result.summary, result.ok ? "info" : "error");
+  };
+
+  const applySet = (command: Extract<GitCommand, { kind: "set" }>, here: string | undefined): void => {
+    if (command.scope === "global") setGlobal(config.stateDir, command.steps, command.lock);
+    else setRepo(config.stateDir, here as string, command.steps, command.lock);
+  };
+
   pi.registerCommand("git", {
-    description: "Lock or unlock git changes by agents: /git [unlock|lock|reset] or /git global [unlock|lock|reset]",
-    getArgumentCompletions: (prefix) =>
-      GIT_COMMANDS.filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item })),
+    description:
+      "Lock or unlock what agents may do with git (/git unlock|lock|reset [steps], /git global ...), or /git commit once",
+    getArgumentCompletions: (prefix) => gitCompletions(prefix),
     handler: async (args, ctx) => {
-      const words = args
-        .trim()
-        .split(/\s+/)
-        .filter((word) => word !== "");
+      const command = parseGitCommand(args);
       const here = await slugOf(ctx.cwd);
-      const action = (word: string | undefined): Lock | undefined | "bad" =>
-        word === "lock" ? "locked" : word === "unlock" ? "unlocked" : word === "reset" ? undefined : "bad";
-      if (words[0] === "global" && words.length === 2 && action(words[1]) !== "bad") {
-        setGlobal(config.stateDir, action(words[1]) as Lock | undefined);
-      } else if (words.length === 1 && action(words[0]) !== "bad") {
-        if (!here) {
-          ctx.ui.notify("pi-git: not in a repository with an origin; use /git global unlock|lock|reset", "warning");
-          return;
-        }
-        setRepo(config.stateDir, here, action(words[0]) as Lock | undefined);
-      } else if (words.length > 0) {
-        ctx.ui.notify("pi-git: /git [unlock|lock|reset] or /git global [unlock|lock|reset]", "warning");
-        return;
+      if (command.kind === "bad") {
+        ctx.ui.notify(GIT_USAGE, "warning");
+      } else if (command.kind === "run") {
+        await commitOnce(command.intent, ctx);
+      } else if (command.kind === "set" && command.scope === "repo" && !here) {
+        ctx.ui.notify("pi-git: not in a repository with an origin; use /git global unlock|lock|reset", "warning");
+      } else {
+        if (command.kind === "set") applySet(command, here);
+        showStatus(ctx, here);
+        ctx.ui.notify(describeLock(config.stateDir, here, fallback()), "info");
       }
-      showStatus(ctx, here);
-      ctx.ui.notify(describeLock(config.stateDir, here, fallback()), "info");
+    },
+  });
+
+  pi.registerTool({
+    name: "git_commit",
+    label: "Git commit",
+    description: [
+      "Commit all changes of a worktree. pi-git stages everything and runs the pre-commit checks; a helper agent fixes",
+      "failures and writes the commit message. Pass what the change is for.",
+    ].join(" "),
+    promptSnippet: "Commit all changes of a worktree; a helper writes the message",
+    promptGuidelines: ["Use git_commit to commit; do not run git commit yourself."],
+    parameters: commitParameters,
+    async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
+      const path = params.path ?? ctx.cwd;
+      const target = await slugOf(path);
+      if (lockOf(target, "commit") === "locked") throw new Error(lockedReason("commit", "git_commit", target));
+      const result = await gitCommit(
+        { path, intent: params.intent },
+        { run: runner, config, progress: progressOf(onUpdate), signal },
+      );
+      if (!result.ok) throw new Error(result.summary);
+      return {
+        content: [{ type: "text", text: result.summary }],
+        details: { commit: result.commit, notes: result.notes },
+      };
     },
   });
 
@@ -313,15 +335,8 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     parameters: prParameters,
     async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
       const target = await slugOf(params.path ?? ctx.cwd);
-      if (lockOf(target) === "locked") throw new Error(lockedReason("git_pr", target));
-      const steps: string[] = [];
-      const progress = (text: string) => {
-        steps.push(text);
-        onUpdate?.({
-          content: [{ type: "text", text: steps.map((step) => `- ${step}`).join("\n") }],
-          details: undefined,
-        });
-      };
+      const allowed = (step: Step) => lockOf(target, step) === "unlocked";
+      const progress = progressOf(onUpdate);
       const result: PrResult = await gitPr(
         {
           path: params.path ?? ctx.cwd,
@@ -329,7 +344,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
           ...(params.base === undefined ? {} : { base: params.base }),
           ...(params.draft === undefined ? {} : { draft: params.draft }),
         },
-        { run: runner, config, progress, signal },
+        { run: runner, config, progress, signal, allowed },
       );
       if (!result.ok) throw new Error(result.summary);
       let text = result.summary;

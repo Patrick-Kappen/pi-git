@@ -110,22 +110,30 @@ describe("ghWrites", () => {
 });
 
 describe("gitChanges", () => {
-  test("directories from cd and -C, the repository from gh -R", () => {
-    expect(gitChanges("git status && git commit -m x", "/w", "/home/u")).toEqual([{ what: "git commit", dir: "/w" }]);
+  test("directories from cd and -C, the repository from gh -R, and the step", () => {
+    expect(gitChanges("git status && git commit -m x", "/w", "/home/u")).toEqual([
+      { what: "git commit", step: "commit", dir: "/w" },
+    ]);
     expect(gitChanges("cd ../other && git push; cd ~/x && git -C sub add .", "/w", "/home/u")).toEqual([
-      { what: "git push", dir: "/w/../other" },
-      { what: "git add", dir: "/home/u/x/sub" },
+      { what: "git push", step: "push", dir: "/w/../other" },
+      { what: "git add", step: "commit", dir: "/home/u/x/sub" },
     ]);
     expect(gitChanges("cd /abs && cd && git -c a=b commit", "/w", "/home/u")).toEqual([
-      { what: "git commit", dir: "/home/u" },
+      { what: "git commit", step: "commit", dir: "/home/u" },
+    ]);
+    expect(gitChanges("git worktree add x && git branch -D y", "/w", "/h").map((change) => change.step)).toEqual([
+      "worktree",
+      "worktree",
     ]);
     expect(gitChanges("gh pr create -R o/r --title x", "/w", "/h")).toEqual([
-      { what: "gh pr create", dir: "/w", slug: "o/r" },
+      { what: "gh pr create", step: "pr", dir: "/w", slug: "o/r" },
     ]);
     expect(gitChanges("gh --repo=o/r pr merge 1", "/w", "/h")).toEqual([
-      { what: "gh pr merge", dir: "/w", slug: "o/r" },
+      { what: "gh pr merge", step: "pr", dir: "/w", slug: "o/r" },
     ]);
     expect(gitChanges("gh pr list; git log; git; ls", "/w", "/h")).toEqual([]);
-    expect(gitChanges("git -C ~ commit && git -C", "/w", "/h")).toEqual([{ what: "git commit", dir: "/h" }]);
+    expect(gitChanges("git -C ~ commit && git -C", "/w", "/h")).toEqual([
+      { what: "git commit", step: "commit", dir: "/h" },
+    ]);
   });
 });

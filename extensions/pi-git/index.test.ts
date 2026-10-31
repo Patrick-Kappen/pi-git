@@ -18,6 +18,12 @@ vi.mock("./check.ts", () => ({
 }));
 
 vi.mock("./pr.ts", () => ({
+  gitCommit: vi.fn(async () => ({
+    ok: true,
+    summary: 'Committed abc "feat: x"',
+    commit: { sha: "abc", subject: "feat: x" },
+    notes: [],
+  })),
   gitPr: vi.fn(async (input: { intent: string }, deps: { progress: (s: string) => void }) => {
     deps.progress("step one");
     if (input.intent === "fail") return { ok: false, summary: "git_pr stopped: no", notes: [] };
@@ -33,8 +39,8 @@ vi.mock("./pr.ts", () => ({
   }),
 }));
 
-const { createPiGit, default: piGit, enqueue, guardHelper, lockPrompt, POLL_MS, takes } = await import("./index.ts");
-const { gitPr } = await import("./pr.ts");
+const { createPiGit, default: piGit, enqueue, guardHelper, POLL_MS, takes } = await import("./index.ts");
+const { gitCommit, gitPr } = await import("./pr.ts");
 const { gitCheck } = await import("./check.ts");
 const state = await import("./state.ts");
 
@@ -96,9 +102,11 @@ afterEach(() => {
 describe("git_pr", () => {
   test("runs the flow, reports progress, and queues the PR", async () => {
     const { tools, ctx, stateDir } = load();
-    expect(tools.map((tool) => tool.name)).toEqual(["git_pr", "git_check"]);
+    expect(tools.map((tool) => tool.name)).toEqual(["git_commit", "git_pr", "git_check"]);
     const onUpdate = vi.fn();
-    const result = await tools[0]?.execute("id", { intent: "x", base: "dev", draft: true }, undefined, onUpdate, ctx());
+    const result = await tools
+      .find((tool) => tool.name === "git_pr")
+      ?.execute("id", { intent: "x", base: "dev", draft: true }, undefined, onUpdate, ctx());
     expect(result?.content[0]?.text).toBe(
       "Opened PR #1\nThe watcher follows CI and conflicts, and reports back when the PR is green, merged or needs you.",
     );
@@ -120,7 +128,9 @@ describe("git_pr", () => {
 
   test("without a PR nothing is queued; a path is passed on", async () => {
     const { tools, ctx, stateDir } = load();
-    const result = await tools[0]?.execute("id", { intent: "nopr", path: "/p" }, undefined, undefined, ctx());
+    const result = await tools
+      .find((tool) => tool.name === "git_pr")
+      ?.execute("id", { intent: "nopr", path: "/p" }, undefined, undefined, ctx());
     expect(result?.content[0]?.text).toBe("Opened PR #1");
     expect(vi.mocked(gitPr).mock.calls.at(-1)?.[0]).toEqual({ path: "/p", intent: "nopr" });
     expect(state.loadEntries(stateDir)).toEqual([]);
@@ -128,15 +138,17 @@ describe("git_pr", () => {
 
   test("a queue that cannot be written is reported, not fatal", async () => {
     const { tools, ctx } = load({ stateDir: unwritable() });
-    const result = await tools[0]?.execute("id", { intent: "x" }, undefined, undefined, ctx());
+    const result = await tools
+      .find((tool) => tool.name === "git_pr")
+      ?.execute("id", { intent: "x" }, undefined, undefined, ctx());
     expect(result?.content[0]?.text).toContain("The watcher could not queue the PR:");
   });
 
   test("a failed run is an error result", async () => {
     const { tools, ctx } = load();
-    await expect(tools[0]?.execute("id", { intent: "fail" }, undefined, undefined, ctx())).rejects.toThrow(
-      "git_pr stopped: no",
-    );
+    await expect(
+      tools.find((tool) => tool.name === "git_pr")?.execute("id", { intent: "fail" }, undefined, undefined, ctx()),
+    ).rejects.toThrow("git_pr stopped: no");
   });
 });
 
@@ -144,15 +156,17 @@ describe("git_check", () => {
   test("runs the checks and reports progress; a red result is an error", async () => {
     const { tools, ctx } = load();
     const onUpdate = vi.fn();
-    const result = await tools[1]?.execute("id", { command: "npm test", fix: false }, undefined, onUpdate, ctx());
+    const result = await tools
+      .find((tool) => tool.name === "git_check")
+      ?.execute("id", { command: "npm test", fix: false }, undefined, onUpdate, ctx());
     expect(result?.content[0]?.text).toBe("Checks passed");
     expect(onUpdate).toHaveBeenCalledWith({ content: [{ type: "text", text: "- running it" }], details: undefined });
     expect(vi.mocked(gitCheck).mock.calls.at(-1)?.[0]).toEqual({ path: "/w", command: "npm test", fix: false });
-    await tools[1]?.execute("id", { path: "/p" }, undefined, undefined, ctx());
+    await tools.find((tool) => tool.name === "git_check")?.execute("id", { path: "/p" }, undefined, undefined, ctx());
     expect(vi.mocked(gitCheck).mock.calls.at(-1)?.[0]).toEqual({ path: "/p" });
-    await expect(tools[1]?.execute("id", { command: "fail" }, undefined, undefined, ctx())).rejects.toThrow(
-      "Checks fail: x",
-    );
+    await expect(
+      tools.find((tool) => tool.name === "git_check")?.execute("id", { command: "fail" }, undefined, undefined, ctx()),
+    ).rejects.toThrow("Checks fail: x");
   });
 });
 
@@ -310,61 +324,112 @@ describe("default export", () => {
     delete process.env.PI_GIT_HELPER;
     piGit({ on: vi.fn(), registerTool, registerCommand: vi.fn(), sendMessage: vi.fn() } as unknown as ExtensionAPI);
     if (saved !== undefined) process.env.PI_GIT_HELPER = saved;
-    expect(registerTool).toHaveBeenCalledTimes(2);
+    expect(registerTool).toHaveBeenCalledTimes(3);
   });
 });
 
 describe("the lock", () => {
-  test("locked by default: git changes and git_pr are blocked, reading is not", async () => {
+  const prompt = (handlers: Map<string, (event: unknown, ctx: unknown) => unknown>, ctx: unknown) => {
+    const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    handlers.get("before_agent_start")?.(event, ctx);
+    return event.systemPromptOptions.sections.pi_git ?? "";
+  };
+
+  test("locked by default: git changes and the tools are blocked, reading is not", async () => {
     const { handlers, tools, ctx, setStatus } = load({ locked: true });
     await handlers.get("session_start")?.({}, ctx());
     expect(setStatus).toHaveBeenCalledWith("pi-git", "git: locked");
+    expect(prompt(handlers, ctx())).toMatch(/^git: locked in o\/r\.\nBlocked for you:/);
     const call = (command: string) => handlers.get("tool_call")?.({ toolName: "bash", input: { command } }, ctx());
     expect(await call("git status && git log")).toBeUndefined();
     expect(await call("npm test && git commit -m x")).toEqual({
       block: true,
-      reason: "pi-git: git changes are locked in o/r (git commit). Only the user can unlock them, with /git unlock.",
+      reason:
+        "pi-git: commit is locked in o/r (git commit). Only the user can allow it: /git unlock commit, or /git commit for one time.",
     });
     expect(await call("gh pr create -R a/b")).toMatchObject({
-      reason: expect.stringContaining("locked in a/b (gh pr create)"),
+      reason: expect.stringContaining("pr is locked in a/b (gh pr create)"),
     });
     expect(await handlers.get("tool_call")?.({ toolName: "read", input: { path: "x" } }, ctx())).toBeUndefined();
-    await expect(tools[0]?.execute("id", { intent: "x" }, undefined, undefined, ctx())).rejects.toThrow(
-      "locked in o/r (git_pr)",
+    const commit = tools.find((tool) => tool.name === "git_commit");
+    await expect(commit?.execute("id", { intent: "x" }, undefined, undefined, ctx())).rejects.toThrow(
+      "commit is locked in o/r (git_commit)",
     );
+    vi.mocked(gitPr).mockClear();
+    await tools.find((tool) => tool.name === "git_pr")?.execute("id", { intent: "x" }, undefined, undefined, ctx());
+    const allowed = vi.mocked(gitPr).mock.calls[0]?.[1].allowed;
+    expect(["worktree", "commit", "push", "pr"].map((step) => allowed?.(step as never))).toEqual([
+      false,
+      false,
+      false,
+      false,
+    ]);
     handlers.get("session_shutdown")?.({}, ctx());
   });
 
-  test("/git unlock remembers the repository; global and reset", async () => {
-    const { handlers, commands, ctx, notify, setStatus, stateDir } = load({ locked: true });
+  test("per step: unlock commit only; the prompt, the status and git_pr follow", async () => {
+    const { handlers, commands, tools, ctx, setStatus, notify } = load({ locked: true });
     await handlers.get("session_start")?.({}, ctx());
-    const git = commands.get("git");
-    await git?.handler("unlock", ctx());
-    expect(setStatus).toHaveBeenLastCalledWith("pi-git", "git: unlocked");
-    expect(notify.mock.lastCall?.[0]).toContain("git changes in o/r: unlocked (override of this repository)");
+    await commands.get("git")?.handler("unlock commit", ctx());
+    expect(setStatus).toHaveBeenLastCalledWith("pi-git", "git: commit unlocked");
+    expect(notify.mock.lastCall?.[0]).toContain("  commit   unlocked (this repository)");
+    expect(prompt(handlers, ctx())).toMatch(/^git: commit unlocked in o\/r\.\nAllowed: commit\./);
     expect(
       await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git commit -m x" } }, ctx()),
     ).toBeUndefined();
     expect(
-      await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "gh pr merge 1 -R x/y" } }, ctx()),
+      await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git push" } }, ctx()),
     ).toMatchObject({ block: true });
-    await git?.handler("global unlock", ctx());
-    await git?.handler("lock", ctx());
-    expect(notify.mock.lastCall?.[0]).toContain("global: unlocked\noverrides:\n  o/r: locked");
-    await git?.handler("reset", ctx());
-    await git?.handler("global reset", ctx());
-    await git?.handler("", ctx());
-    expect(notify.mock.lastCall?.[0]).toContain(
-      "git changes in o/r: locked (default of the settings)\nglobal: not set, so the default: locked",
+    const result = await tools
+      .find((tool) => tool.name === "git_commit")
+      ?.execute("id", { intent: "x" }, undefined, undefined, ctx());
+    expect(result?.content[0]?.text).toBe('Committed abc "feat: x"');
+    vi.mocked(gitPr).mockClear();
+    await tools.find((tool) => tool.name === "git_pr")?.execute("id", { intent: "x" }, undefined, undefined, ctx());
+    const allowed = vi.mocked(gitPr).mock.calls[0]?.[1].allowed;
+    expect(["commit", "push"].map((step) => allowed?.(step as never))).toEqual([true, false]);
+    await commands.get("git")?.handler("global unlock", ctx());
+    await commands.get("git")?.handler("lock", ctx());
+    await commands.get("git")?.handler("reset", ctx());
+    await commands.get("git")?.handler("global reset", ctx());
+    await commands.get("git")?.handler("", ctx());
+    expect(notify.mock.lastCall?.[0]).toMatch(/^git in o\/r:\n {2}worktree locked {3}\(default\)/);
+    await commands.get("git")?.handler("maybe", ctx());
+    expect(notify).toHaveBeenLastCalledWith(
+      expect.stringContaining("/git unlock|lock|reset [worktree commit push pr]"),
+      "warning",
     );
-    await git?.handler("maybe", ctx());
-    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("/git [unlock|lock|reset]"), "warning");
-    expect(git?.getArgumentCompletions("glo")).toEqual([
-      { value: "global unlock", label: "global unlock" },
-      { value: "global lock", label: "global lock" },
-      { value: "global reset", label: "global reset" },
+    expect(commands.get("git")?.getArgumentCompletions("unlock c")).toEqual([
+      { value: "unlock commit", label: "unlock commit" },
     ]);
-    expect(stateDir).toBeDefined();
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("/git commit: the user's own action, also when commit is locked", async () => {
+    const { handlers, commands, ctx, notify } = load({ locked: true });
+    await handlers.get("session_start")?.({}, ctx());
+    vi.mocked(gitCommit).mockClear();
+    await commands.get("git")?.handler("commit fix the docs", ctx());
+    expect(vi.mocked(gitCommit).mock.calls[0]?.[0]).toEqual({ path: "/w", intent: "fix the docs" });
+    expect(notify).toHaveBeenLastCalledWith('Committed abc "feat: x"', "info");
+    await commands.get("git")?.handler("commit", ctx());
+    expect(vi.mocked(gitCommit).mock.calls[1]?.[0].intent).toContain("no intent given");
+    vi.mocked(gitCommit).mockResolvedValueOnce({ ok: false, summary: "nothing to commit", notes: [] });
+    await commands.get("git")?.handler("commit", ctx());
+    expect(notify).toHaveBeenLastCalledWith("nothing to commit", "error");
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("git_commit failures are errors", async () => {
+    const { handlers, tools, ctx } = load({ locked: false });
+    await handlers.get("session_start")?.({}, ctx());
+    vi.mocked(gitCommit).mockResolvedValueOnce({ ok: false, summary: "nothing to commit", notes: [] });
+    await expect(
+      tools
+        .find((tool) => tool.name === "git_commit")
+        ?.execute("id", { intent: "x", path: "/p" }, undefined, undefined, ctx()),
+    ).rejects.toThrow("nothing to commit");
+    expect(vi.mocked(gitCommit).mock.calls.at(-1)?.[0]).toEqual({ path: "/p", intent: "x" });
     handlers.get("session_shutdown")?.({}, ctx());
   });
 
@@ -397,34 +462,10 @@ describe("the lock", () => {
     await commands.get("git")?.handler("unlock", ctx);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("not in a repository with an origin"), "warning");
     await commands.get("git")?.handler("global lock", ctx);
-    expect(notify.mock.lastCall?.[0]).toContain("git changes here: locked (global setting)");
+    expect(notify.mock.lastCall?.[0]).toContain("  commit   locked   (global)");
     expect(await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git init" } }, ctx)).toMatchObject({
-      reason: expect.stringContaining("locked outside a repository with an origin (git init)"),
+      reason: expect.stringContaining("commit is locked outside a repository with an origin (git init)"),
     });
     handlers.get("session_shutdown")?.({}, ctx);
-  });
-
-  test("the agent is told the state before every prompt", async () => {
-    const { handlers, commands, ctx } = load({ locked: true });
-    await handlers.get("session_start")?.({}, ctx());
-    const prompt = () => {
-      const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
-      handlers.get("before_agent_start")?.(event, ctx());
-      return event.systemPromptOptions.sections.pi_git ?? "";
-    };
-    expect(prompt()).toMatch(/^git: locked in o\/r\. Git changes are blocked for you/);
-    expect(prompt()).toContain("ask the\nuser to run /git unlock; only the user can unlock.");
-    await commands.get("git")?.handler("unlock", ctx());
-    expect(prompt()).toBe(
-      "git: unlocked in o/r. You may change the repository; use git_pr to commit, push and open or update PRs.\nOther repositories can be locked; a blocked command says so.",
-    );
-    handlers.get("session_shutdown")?.({}, ctx());
-  });
-});
-
-describe("lockPrompt", () => {
-  test("outside a repository", () => {
-    expect(lockPrompt("locked", undefined)).toMatch(/^git: locked here \(not in a repository with an origin\)\./);
-    expect(lockPrompt("unlocked", undefined)).toMatch(/^git: unlocked here \(not in a repository with an origin\)\./);
   });
 });

@@ -1,13 +1,20 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** Whether agents may change git repositories. */
+/** Whether agents may take a step. */
 export type Lock = "locked" | "unlocked";
 
-/** The switch: a global state and overrides per repository (owner/name). */
+/** The steps that change a repository, each locked on its own. */
+export const STEPS = ["worktree", "commit", "push", "pr"] as const;
+export type Step = (typeof STEPS)[number];
+
+/** The state per step; a step that is missing follows the next level (global, then the default). */
+export type Setting = Partial<Record<Step, Lock>>;
+
+/** The switch: global settings and overrides per repository (owner/name). */
 export interface Switch {
-  global?: Lock;
-  repos: Record<string, Lock>;
+  global: Setting;
+  repos: Record<string, Setting>;
 }
 
 export const SWITCH_FILE = "switch.json";
@@ -20,20 +27,37 @@ function isLock(value: unknown): value is Lock {
   return value === "locked" || value === "unlocked";
 }
 
+export function isStep(value: unknown): value is Step {
+  return (STEPS as readonly unknown[]).includes(value);
+}
+
+/** A setting from the file: `"unlocked"` means every step, an object sets single steps. */
+function toSetting(raw: unknown): Setting {
+  if (isLock(raw)) return Object.fromEntries(STEPS.map((step) => [step, raw])) as Setting;
+  const setting: Setting = {};
+  if (typeof raw === "object" && raw !== null) {
+    for (const [step, lock] of Object.entries(raw)) if (isStep(step) && isLock(lock)) setting[step] = lock;
+  }
+  return setting;
+}
+
 /** Read the switch; a missing or broken file has no settings, so the default applies. */
 export function loadSwitch(stateDir: string): Switch {
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(switchPath(stateDir), "utf8"));
   } catch {
-    return { repos: {} };
+    return { global: {}, repos: {} };
   }
   const record = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-  const repos: Record<string, Lock> = {};
+  const repos: Record<string, Setting> = {};
   if (typeof record.repos === "object" && record.repos !== null) {
-    for (const [slug, lock] of Object.entries(record.repos)) if (isLock(lock)) repos[slug] = lock;
+    for (const [slug, setting] of Object.entries(record.repos)) {
+      const parsed = toSetting(setting);
+      if (Object.keys(parsed).length > 0) repos[slug] = parsed;
+    }
   }
-  return isLock(record.global) ? { global: record.global, repos } : { repos };
+  return { global: toSetting(record.global), repos };
 }
 
 function saveSwitch(stateDir: string, value: Switch): void {
@@ -54,25 +78,38 @@ export interface Effective {
   source: "repo" | "global" | "default";
 }
 
-/** The state for a repository: its override, else the global state, else the default. */
-export function effective(value: Switch, slug: string | undefined, fallback: Lock): Effective {
+/** The state of a step in a repository: its override, else the global setting, else the default. */
+export function effective(value: Switch, slug: string | undefined, step: Step, fallback: Lock): Effective {
   const key = slug === undefined ? undefined : repoKey(value, slug);
-  if (key !== undefined) return { lock: value.repos[key] as Lock, source: "repo" };
-  if (value.global !== undefined) return { lock: value.global, source: "global" };
+  const repo = key === undefined ? undefined : value.repos[key]?.[step];
+  if (repo !== undefined) return { lock: repo, source: "repo" };
+  const global = value.global[step];
+  if (global !== undefined) return { lock: global, source: "global" };
   return { lock: fallback, source: "default" };
 }
 
-/** Set (or with undefined: remove) the override of a repository. */
-export function setRepo(stateDir: string, slug: string, lock: Lock | undefined): void {
+/** Change steps (all when empty) of a setting; undefined removes them, so they follow the next level. */
+function change(setting: Setting, steps: readonly Step[], lock: Lock | undefined): Setting {
+  const next: Setting = { ...setting };
+  for (const step of steps.length > 0 ? steps : STEPS) {
+    if (lock === undefined) delete next[step];
+    else next[step] = lock;
+  }
+  return next;
+}
+
+/** Set steps of a repository; with undefined they follow the global setting again. */
+export function setRepo(stateDir: string, slug: string, steps: readonly Step[], lock: Lock | undefined): void {
   const value = loadSwitch(stateDir);
   const key = repoKey(value, slug);
+  const setting = change(key === undefined ? {} : (value.repos[key] as Setting), steps, lock);
   if (key !== undefined) delete value.repos[key];
-  if (lock !== undefined) value.repos[slug] = lock;
+  if (Object.keys(setting).length > 0) value.repos[slug] = setting;
   saveSwitch(stateDir, value);
 }
 
-/** Set (or with undefined: remove) the global state. */
-export function setGlobal(stateDir: string, lock: Lock | undefined): void {
-  const { repos } = loadSwitch(stateDir);
-  saveSwitch(stateDir, lock === undefined ? { repos } : { global: lock, repos });
+/** Set global steps; with undefined they follow the default again. */
+export function setGlobal(stateDir: string, steps: readonly Step[], lock: Lock | undefined): void {
+  const value = loadSwitch(stateDir);
+  saveSwitch(stateDir, { ...value, global: change(value.global, steps, lock) });
 }

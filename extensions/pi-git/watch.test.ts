@@ -371,7 +371,7 @@ describe("tick", () => {
     await once();
     expect(gitPr).not.toHaveBeenCalled();
     expect(texts()).toEqual([
-      `pi-git: PR #${n} (o/r): CI fails, but git changes are locked in o/r. Unlock with /git unlock to let the helper fix it. ${entry.url}`,
+      `pi-git: PR #${n} (o/r): CI fails, but git changes are locked in o/r. Unlock commit and push (/git unlock commit push) to let the helper fix it. ${entry.url}`,
     ]);
     view({ mergeable: "CONFLICTING" });
     saveEntry(config.stateDir, entry);
@@ -380,6 +380,6 @@ describe("tick", () => {
     view({ state: "MERGED" });
     await once();
     expect(existsSync(entry.worktree)).toBe(true);
-    expect(texts().join("\n")).toContain("are kept: git changes are locked in o/r.");
+    expect(texts().join("\n")).toContain("are kept: worktree is locked in o/r.");
   });
 });

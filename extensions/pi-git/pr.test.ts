@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { type Config, defaults } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
-import { gitPr, type PrInput } from "./pr.ts";
+import { gitCommit, gitPr, type PrInput } from "./pr.ts";
+import type { Step } from "./switch.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-git-pr-")));
 const origin = join(root, "origin.git");
@@ -37,7 +38,7 @@ beforeAll(() => {
   mkdirSync(bin);
   script(
     join(hooks, "pre-commit"),
-    'if git diff --cached | grep -q BAD; then echo "lint: BAD found" >&2; exit 1; fi\n',
+    'if [ -n "$PI_GIT_SWITCH" ]; then echo "the hard stop sees PI_GIT_SWITCH" >&2; exit 1; fi\nif git diff --cached | grep -q BAD; then echo "lint: BAD found" >&2; exit 1; fi\n',
   );
   script(
     join(hooks, "commit-msg"),
@@ -309,5 +310,98 @@ describe("gitPr", () => {
       'Start the body with: "Stacked on #5; merge that first."',
     );
     expect(readFileSync(ghLog, "utf8")).toContain(`pr create --base ${base}`);
+  });
+  test("pi-git's own git commands do not see the switch of the hard stop", async () => {
+    process.env.PI_GIT_SWITCH = "/some/switch.json";
+    try {
+      writeFileSync(join(worktree, "a.txt"), "a\n");
+      expect((await pr()).ok).toBe(true);
+    } finally {
+      delete process.env.PI_GIT_SWITCH;
+    }
+  });
+});
+
+describe("gitCommit", () => {
+  test("commits all changes: checks fixed by the helper, message by the helper, nothing pushed", async () => {
+    writeFileSync(join(worktree, "bad.txt"), "BAD\n");
+    const result = await gitCommit(
+      { path: worktree, intent: "Add the thing." },
+      { run: runner, config, progress: () => {} },
+    );
+    expect(result.ok).toBe(true);
+    expect(result.summary).toMatch(
+      /^Committed [0-9a-f]+ "feat: add the thing" on feat\/topic-\d+; the pre-commit checks passed\./,
+    );
+    expect(result.summary).toContain("The helper fixed on the way:\n- pre-commit: Replaced BAD with GOOD in bad.txt.");
+    expect(sh(worktree, "log", "-1", "--format=%s")).toBe("feat: add the thing");
+    expect(sh(origin, "branch", "--list", `feat/topic-${counter}`)).toBe("");
+  });
+
+  test("nothing to commit, a refused worktree, a failing check", async () => {
+    const deps = { run: runner, config, progress: () => {} };
+    expect((await gitCommit({ path: worktree, intent: "x" }, deps)).summary).toContain("nothing to commit");
+    expect((await gitCommit({ path: main, intent: "x" }, deps)).summary).toContain("is the main checkout");
+    writeFileSync(join(worktree, "bad.txt"), "BAD\n");
+    const stuck = await gitCommit({ path: worktree, intent: "CANTFIX" }, deps);
+    expect(stuck.summary).toContain("The pre-commit checks still fail");
+    expect(stuck.summary).toContain("The changes are staged in");
+    expect((await gitCommit({ path: worktree, intent: "x", base: "nope" }, deps)).summary).toContain(
+      "git fetch origin nope failed",
+    );
+  });
+});
+
+describe("gitPr with locked steps", () => {
+  const allow =
+    (...steps: Step[]) =>
+    (step: Step) =>
+      steps.includes(step);
+  const run = (allowed: (step: Step) => boolean) =>
+    gitPr({ path: worktree, intent: "Add the thing." }, { run: runner, config, progress: () => {}, allowed });
+
+  test("commit locked: nothing happens, an error", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await run(allow());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(
+      "Stopped before commit: commit is locked here. Ask the user to run /git unlock commit, or /git commit for one time.",
+    );
+    expect(sh(worktree, "status", "--porcelain")).toBe("?? a.txt");
+  });
+
+  test("push locked: committed, then stopped", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await run(allow("commit"));
+    expect(result.ok).toBe(true);
+    expect(result.summary).toMatch(
+      /^Committed [0-9a-f]+ "feat: add the thing" on feat\/topic-\d+\. Stopped before push: push is locked here\./,
+    );
+    expect(sh(origin, "branch", "--list", `feat/topic-${counter}`)).toBe("");
+  });
+
+  test("push locked with nothing to commit: an error", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: by hand");
+    expect((await run(allow("commit"))).summary).toContain("git_pr stopped: Stopped before push");
+  });
+
+  test("pr locked: committed and pushed, no PR", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await run(allow("commit", "push"));
+    expect(result.ok).toBe(true);
+    expect(result.summary).toMatch(
+      /^Committed [0-9a-f]+ "feat: add the thing"; pushed feat\/topic-\d+\. Stopped before pr:/,
+    );
+    expect(sh(origin, "branch", "--list", `feat/topic-${counter}`)).toContain(`feat/topic-${counter}`);
+    expect(readFileSync(ghLog, "utf8")).not.toContain("pr create");
+  });
+
+  test("pr locked without a new commit", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: by hand");
+    expect((await run(allow("push"))).summary).toMatch(/^Pushed|^pushed/);
   });
 });
