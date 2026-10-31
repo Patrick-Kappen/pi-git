@@ -25,6 +25,7 @@ import {
   statusText,
 } from "./lock.ts";
 import { gitCommit, gitPr, gitPush, type PrResult } from "./pr.ts";
+import { findMainCheckout, gitStart, TYPES } from "./start.ts";
 import {
   claimSummary,
   type Entry,
@@ -39,7 +40,6 @@ import {
 } from "./state.ts";
 import { gitStatus, gitWatch } from "./status.ts";
 import { effective, type Lock, loadSwitch, STEPS, type Step, setGlobal, setRepo, switchPath } from "./switch.ts";
-import { gitWorktree } from "./worktree.ts";
 
 export interface Options {
   env?: NodeJS.ProcessEnv;
@@ -138,13 +138,27 @@ const watchParameters = Type.Object({
   path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
 });
 
-const worktreeParameters = Type.Object({
+const startParameters = Type.Object({
   topic: Type.String({ description: "Short, lower case, with -: what the change is about, e.g. login-timeout." }),
   type: Type.Optional(
-    Type.String({ description: "Branch type: feat (default), fix, docs, refactor, test, build, ci, chore, perf." }),
+    Type.Union(
+      TYPES.map((type) => Type.Literal(type)),
+      { description: "The kind of change; default feat. The branch is <type>/<topic>." },
+    ),
   ),
-  base: Type.Optional(Type.String({ description: "The branch to start from; default: the default branch." })),
-  path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
+  base: Type.Optional(
+    Type.String({
+      description: "Base branch; default: the default branch. For a stacked change, the branch it needs.",
+    }),
+  ),
+  repo: Type.Optional(
+    Type.String({
+      description: "The repository: a directory in it, owner/name, or name; default: the working directory.",
+    }),
+  ),
+  setup: Type.Optional(
+    Type.Boolean({ description: "Run the repository's setup (devenv, npm ci, uv sync); default: true." }),
+  ),
 });
 
 const pushParameters = Type.Object({
@@ -344,7 +358,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     const steps: Record<Step, () => Promise<{ ok: boolean; summary: string }>> = {
       worktree: () => {
         const [topic = "", type] = args.split(/\s+/);
-        return gitWorktree({ path: ctx.cwd, topic, ...(type ? { type } : {}) }, deps);
+        return gitStart({ repo: ctx.cwd, topic, ...(type ? { type } : {}) }, { ...deps, home });
       },
       commit: () => gitCommit({ path: ctx.cwd, intent }, deps),
       push: () => gitPush({ path: ctx.cwd, intent }, deps),
@@ -469,31 +483,38 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
   });
 
   pi.registerTool({
-    name: "git_worktree",
-    label: "Git worktree",
+    name: "git_start",
+    label: "Git start",
     description: [
-      "Start a change: create <worktrees>/<repo>/<topic> on a new branch <type>/<topic> from the fresh default branch",
-      "(or base), and run its setup (devenv shell, npm ci, uv sync). Returns the path; work there.",
+      "Start a change: fetch, create the worktree <worktrees>/<repo>/<topic> on <type>/<topic> from the fresh base",
+      "branch, and run the repository's setup. Returns the path and what to know about the repository (default branch,",
+      "commit style, checks, other worktrees). Make the change in that path, then call git_pr.",
     ].join(" "),
-    promptSnippet: "Create a worktree for a change, on a new branch from the fresh default branch",
+    promptSnippet: "Create the worktree and branch of a new change, with its setup",
     promptGuidelines: [
-      "Use git_worktree to start every change; never edit in the main checkout or on the default branch.",
+      "Use git_start to start every change; never edit in the main checkout or on the default branch.",
     ],
-    parameters: worktreeParameters,
+    parameters: startParameters,
     async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
-      const path = params.path ?? ctx.cwd;
-      const target = await slugOf(path);
+      const deps = { run: runner, config, home, progress: progressOf(onUpdate), signal };
+      const repo = params.repo ?? ctx.cwd;
+      const main = await findMainCheckout(deps, repo);
+      if (typeof main !== "string") throw new Error(main.error);
+      const target = await slugOf(main);
       if (lockOf(target, "worktree") === "locked") {
-        blocked(ctx, "worktree", "git_worktree", target);
-        throw new Error(lockedReason("worktree", "git_worktree", target));
+        blocked(ctx, "worktree", "git_start", target);
+        throw new Error(lockedReason("worktree", "git_start", target));
       }
-      const input = {
-        path,
-        topic: params.topic,
-        ...(params.type ? { type: params.type } : {}),
-        ...(params.base ? { base: params.base } : {}),
-      };
-      const result = await gitWorktree(input, { run: runner, config, progress: progressOf(onUpdate), signal });
+      const result = await gitStart(
+        {
+          repo,
+          topic: params.topic,
+          ...(params.type === undefined ? {} : { type: params.type }),
+          ...(params.base === undefined ? {} : { base: params.base }),
+          ...(params.setup === undefined ? {} : { setup: params.setup }),
+        },
+        deps,
+      );
       if (!result.ok) throw new Error(result.summary);
       return {
         content: [{ type: "text", text: result.summary }],

@@ -17,8 +17,12 @@ vi.mock("./check.ts", () => ({
   }),
 }));
 
-vi.mock("./worktree.ts", () => ({
-  gitWorktree: vi.fn(async (input: { topic: string }) => ({
+vi.mock("./start.ts", async (original) => ({
+  ...(await original<typeof import("./start.ts")>()),
+  findMainCheckout: vi.fn(async (_deps: unknown, repo: string) =>
+    repo === "missing" ? { error: "no main checkout of missing" } : repo,
+  ),
+  gitStart: vi.fn(async (input: { topic: string }) => ({
     ok: true,
     summary: `Created ${input.topic}`,
     path: `/wt/${input.topic}`,
@@ -51,7 +55,7 @@ vi.mock("./pr.ts", () => ({
 
 const { createPiGit, default: piGit, enqueue, guardHelper, POLL_MS, takes } = await import("./index.ts");
 const { gitCommit, gitPr, gitPush } = await import("./pr.ts");
-const { gitWorktree } = await import("./worktree.ts");
+const { gitStart } = await import("./start.ts");
 const { gitCheck } = await import("./check.ts");
 const state = await import("./state.ts");
 const { addAttention, listAttention } = await import("./attention.ts");
@@ -118,7 +122,7 @@ describe("git_pr", () => {
       "git_request",
       "git_status",
       "git_watch",
-      "git_worktree",
+      "git_start",
       "git_push",
       "git_commit",
       "git_pr",
@@ -594,8 +598,8 @@ describe("the lock", () => {
     const { handlers, commands, tools, ctx, stateDir } = load({ locked: true });
     await handlers.get("session_start")?.({}, ctx());
     const tool = (name: string) => tools.find((item) => item.name === name);
-    await expect(tool("git_worktree")?.execute("id", { topic: "x" }, undefined, undefined, ctx())).rejects.toThrow(
-      "worktree is locked in o/r (git_worktree)",
+    await expect(tool("git_start")?.execute("id", { topic: "x" }, undefined, undefined, ctx())).rejects.toThrow(
+      "worktree is locked in o/r (git_start)",
     );
     await expect(tool("git_push")?.execute("id", {}, undefined, undefined, ctx())).rejects.toThrow(
       "push is locked in o/r (git_push)",
@@ -606,17 +610,17 @@ describe("the lock", () => {
         .sort(),
     ).toEqual(["push", "worktree"]);
     await commands.get("git")?.handler("unlock worktree push", ctx());
-    const created = await tool("git_worktree")?.execute(
+    const created = await tool("git_start")?.execute(
       "id",
-      { topic: "x", type: "fix", base: "dev", path: "/p" },
+      { topic: "x", type: "fix", base: "dev", repo: "/p" },
       undefined,
       undefined,
       ctx(),
     );
     expect(created?.content[0]?.text).toBe("Created x");
-    expect(vi.mocked(gitWorktree).mock.calls.at(-1)?.[0]).toEqual({ path: "/p", topic: "x", type: "fix", base: "dev" });
-    await tool("git_worktree")?.execute("id", { topic: "y" }, undefined, undefined, ctx());
-    expect(vi.mocked(gitWorktree).mock.calls.at(-1)?.[0]).toEqual({ path: "/w", topic: "y" });
+    expect(vi.mocked(gitStart).mock.calls.at(-1)?.[0]).toEqual({ repo: "/p", topic: "x", type: "fix", base: "dev" });
+    await tool("git_start")?.execute("id", { topic: "y" }, undefined, undefined, ctx());
+    expect(vi.mocked(gitStart).mock.calls.at(-1)?.[0]).toEqual({ repo: "/w", topic: "y" });
     const pushed = await tool("git_push")?.execute("id", { intent: "Ship it." }, undefined, undefined, ctx());
     expect(pushed?.content[0]?.text).toBe("Pushed feat/x");
     const deps = vi.mocked(gitPush).mock.calls.at(-1)?.[1];
@@ -624,10 +628,13 @@ describe("the lock", () => {
     expect([deps?.allowed?.("push"), deps?.allowed?.("commit")]).toEqual([true, false]);
     await tool("git_push")?.execute("id", {}, undefined, undefined, ctx());
     expect(vi.mocked(gitPush).mock.calls.at(-1)?.[0].intent).toBe("Fix the failing pre-push checks.");
-    vi.mocked(gitWorktree).mockResolvedValueOnce({ ok: false, summary: "git_worktree: exists" });
-    await expect(tool("git_worktree")?.execute("id", { topic: "z" }, undefined, undefined, ctx())).rejects.toThrow(
+    vi.mocked(gitStart).mockResolvedValueOnce({ ok: false, summary: "exists" });
+    await expect(tool("git_start")?.execute("id", { topic: "z" }, undefined, undefined, ctx())).rejects.toThrow(
       "exists",
     );
+    await expect(
+      tool("git_start")?.execute("id", { topic: "z", repo: "missing" }, undefined, undefined, ctx()),
+    ).rejects.toThrow("no main checkout of missing");
     vi.mocked(gitPush).mockResolvedValueOnce({ ok: false, summary: "The push failed", notes: [] });
     await expect(tool("git_push")?.execute("id", {}, undefined, undefined, ctx())).rejects.toThrow("The push failed");
     handlers.get("session_shutdown")?.({}, ctx());
@@ -637,10 +644,10 @@ describe("the lock", () => {
     const { handlers, commands, ctx, notify, stateDir } = load({ locked: true });
     await handlers.get("session_start")?.({}, ctx());
     await commands.get("git")?.handler("worktree login-timeout fix", ctx());
-    expect(vi.mocked(gitWorktree).mock.calls.at(-1)?.[0]).toEqual({ path: "/w", topic: "login-timeout", type: "fix" });
+    expect(vi.mocked(gitStart).mock.calls.at(-1)?.[0]).toEqual({ repo: "/w", topic: "login-timeout", type: "fix" });
     expect(notify).toHaveBeenLastCalledWith("Created login-timeout", "info");
     await commands.get("git")?.handler("worktree", ctx());
-    expect(vi.mocked(gitWorktree).mock.calls.at(-1)?.[0]).toEqual({ path: "/w", topic: "" });
+    expect(vi.mocked(gitStart).mock.calls.at(-1)?.[0]).toEqual({ repo: "/w", topic: "" });
     await commands.get("git")?.handler("push", ctx());
     expect(vi.mocked(gitPush).mock.calls.at(-1)?.[1].allowed).toBeUndefined();
     vi.mocked(gitPr).mockClear();

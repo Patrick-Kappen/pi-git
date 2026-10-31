@@ -105,19 +105,24 @@ and looks for summaries every 20 seconds:
 `delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
 adds it to the context for your next prompt, `notify` only shows it to you.
 
-## `git_worktree`
+## `git_start`
 
 | Parameter | Meaning |
 |---|---|
-| `topic` | Short, lower case, with `-`: what the change is about. |
-| `type` | The branch type; default `feat` (`fix`, `docs`, `refactor`, ...). |
-| `base` | The branch to start from; default: the default branch. |
-| `path` | A directory in the repository (main checkout or a worktree); default: the working directory. |
+| `topic` | Short, lower case with hyphens: the worktree directory and the branch name. |
+| `type` | `feat` (default), `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore` or `perf`. |
+| `base` | The base branch; default: the default branch. For a stacked change, the branch it builds on. |
+| `repo` | The repository: a directory in it, `owner/name`, or `name` (found in `~/private`, `~/work`, `~/src`, `~/code` or `~`); default: the working directory. |
+| `setup` | Run the setup; default: `true`. |
 
-Fetches `origin/<base>`, creates `<worktrees>/<repo>/<topic>` (default `~/.worktrees/<repo>/<topic>`)
-on a new branch `<type>/<topic>`, and runs the setup it finds: `devenv shell` for a `devenv.nix`,
-`npm ci` for a `package-lock.json`, `uv sync` for a `uv.lock`. It returns the path; the agent works
-there. It refuses a topic or branch that exists already.
+It fetches, then adds the worktree `<worktrees>/<repo>/<topic>` on `<type>/<topic>` from the fresh
+`origin/<base>` (or continues `origin/<type>/<topic>` when that branch exists on GitHub only), and
+runs the setup: `devenv shell -- true` with a `devenv.nix`, else `npm ci --ignore-scripts` or
+`uv sync`. It returns the path and what to know before the change: the default branch, the commit
+style with recent subjects, the check command, a PR template or CONTRIBUTING.md to read, and the
+other worktrees of the repository. A failing setup is reported, not fatal. It follows the
+`worktree` step of the lock of that repository; `/git worktree <topic> [type]` does it once as your
+own action.
 
 ## `git_push`
 
@@ -166,7 +171,7 @@ You switch it in pi; the model cannot:
 | `/git unlock [steps]`, `/git lock [steps]` | This repository (owner/name of `origin`); without steps: all of them. Remembered. |
 | `/git reset [steps]` | Removes this repository's override, so the global state applies |
 | `/git global unlock\|lock\|reset [steps]` | The global state; `reset` goes back to the default of the settings (`locked`) |
-| `/git worktree <topic> [type]` | Creates a worktree once, as `git_worktree` does |
+| `/git worktree <topic> [type]` | Starts a change once, as `git_start` does |
 | `/git commit [intent]` | Commits once, as `git_commit` does |
 | `/git push` | Pushes once, as `git_push` does |
 | `/git pr [intent]` | Runs `git_pr` once: commit, push and PR, and queues the PR for the watcher |

@@ -47,7 +47,7 @@ export function lockPrompt(states: States, slug: string | undefined): string {
   const lines = [`${statusText(states)} ${slug ? `in ${slug}` : "here (not in a repository with an origin)"}.`];
   if (open.length > 0)
     lines.push(
-      `Allowed: ${open.join(", ")}. Use the pi-git tools: git_worktree, git_commit, git_push, and git_pr (commit, push and PR in one run).`,
+      `Allowed: ${open.join(", ")}. Use the pi-git tools: git_start, git_commit, git_push, and git_pr (commit, push and PR in one run).`,
     );
   if (closed.length > 0) {
     lines.push("Blocked for you:", ...closed.map((step) => `- ${STEP_TEXT[step]}`));
