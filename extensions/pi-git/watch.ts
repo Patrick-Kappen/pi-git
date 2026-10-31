@@ -159,10 +159,14 @@ class Watch {
   }
 
   /** Report a final state and stop watching. A failure needs the user; anything else answers it. */
-  private async finish(status: FinalStatus, text: string): Promise<void> {
+  /**
+   * The PR is finished. `routine` is the normal end (merged and cleaned up, or closed by someone):
+   * nobody needs to hear of it, so no summary. Anything left behind or failed is reported.
+   */
+  private async finish(status: FinalStatus, text: string, routine = false): Promise<void> {
     this.entry.status = status;
     const full = `pi-git: PR #${this.entry.number} (${this.entry.repo}) ${text}${this.notesText()}`;
-    this.report(full);
+    if (!routine) this.report(full);
     removeEntry(this.config.stateDir, this.entry.id);
     if (status === "failed") await this.needYou(full);
     else this.answered();
@@ -211,7 +215,7 @@ class Watch {
     this.entry.errors = 0;
     if (pr.state === "MERGED") return this.merged(pr.headRefOid);
     if (pr.state === "CLOSED")
-      return this.finish("closed", "was closed without merging; the worktree and the branch are kept.");
+      return this.finish("closed", "was closed without merging; the worktree and the branch are kept.", true);
     if (!existsSync(this.entry.worktree))
       return this.finish("failed", `has no worktree any more (${this.entry.worktree}); stopped watching.`);
     return this.open(pr);
@@ -292,7 +296,7 @@ class Watch {
 
   private async merged(head: string): Promise<void> {
     const { worktree, mainRoot, branch } = this.entry;
-    if (!existsSync(worktree)) return this.finish("merged", `is merged. The worktree was already gone.`);
+    if (!existsSync(worktree)) return this.finish("merged", `is merged. The worktree was already gone.`, true);
     if (this.locked("worktree")) {
       return this.finish(
         "merged",
@@ -313,7 +317,12 @@ class Watch {
     await this.deps.run("git", ["fetch", "origin", "--prune"], { cwd: mainRoot });
     if (failure !== undefined)
       return this.finish("merged", `is merged, but the cleanup failed:\n${clipEnd(failure, 2000)}`);
-    return this.finish("merged", `is merged; removed the worktree ${worktree} and the branch ${branch}${remote}.`);
+    // Routine unless the branch on GitHub could not be deleted: that is left for the owner.
+    return this.finish(
+      "merged",
+      `is merged; removed the worktree ${worktree} and the branch ${branch}${remote}.`,
+      !remote.includes("could not"),
+    );
   }
 
   /** Delete the branch on GitHub when GitHub did not (no "delete branch on merge"); the text for the report. */

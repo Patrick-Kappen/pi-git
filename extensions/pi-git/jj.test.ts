@@ -627,7 +627,7 @@ describe("the watcher with a jj workspace", () => {
       `topic-${counter}`,
     );
     expect(git(main, "branch", "--list", branch)).toBe("");
-    expect(texts()[0]).toContain(`is merged; removed the worktree ${path} and the branch ${branch}`);
+    expect(texts()).toEqual([]);
   });
 
   test("merged, but the branch has a logical commit that is not in the PR: kept", async () => {

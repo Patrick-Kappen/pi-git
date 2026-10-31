@@ -116,10 +116,12 @@ and looks for summaries every 20 seconds:
 
 Delivered summaries stay in `<stateDir>/delivered` for seven days, then the watcher deletes them.
 
-Green is only shown to you; it is not done yet. Merged and closed PRs go into the history once,
-quietly, for the next prompt. A PR that needs the agent (the watcher gave up) goes into the history
-and, with `delivery: turn` (default), starts a turn. `message` never starts a turn, `notify` only
-shows everything to you.
+Green is only shown to you; it is not done yet. A PR that merged and was cleaned up, or that someone
+closed, needs nobody: no summary at all. A PR that needs the agent (the watcher gave up), or a merge
+that left something behind (commits outside the PR, uncommitted changes, a branch on GitHub that
+could not be deleted, a failed cleanup) goes into the history; with `delivery: turn` (default) a PR
+that needs the agent starts a turn. `message` never starts a turn, `notify` only shows everything to
+you.
 
 ## `git_start`
 

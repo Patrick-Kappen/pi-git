@@ -187,9 +187,8 @@ describe("tick", () => {
     await once();
     expect(existsSync(entry.worktree)).toBe(false);
     expect(sh(main, "branch", "--list", entry.branch)).toBe("");
-    expect(texts()[0]).toBe(
-      `pi-git: PR #${n} (o/r) is merged; removed the worktree ${entry.worktree} and the branch ${entry.branch}, also on GitHub.`,
-    );
+    // The normal end: nobody needs to hear of it.
+    expect(texts()).toEqual([]);
     expect(readFileSync(ghLog, "utf8")).toContain(`api -X DELETE repos/o/r/git/refs/heads/${entry.branch}`);
     expect(saved()).toBeUndefined();
   });
@@ -245,7 +244,7 @@ describe("tick", () => {
     view({ state: "MERGED" });
     saveEntry(config.stateDir, { ...entry, worktree: join(root, "gone") });
     await once();
-    expect(texts()[0]).toContain("is merged. The worktree was already gone.");
+    expect(texts()).toEqual([]);
     saveEntry(config.stateDir, { ...entry, branch: "no-such-branch", id: "other" });
     await once();
     expect(texts().join("\n")).toContain("is merged, but the cleanup failed");
@@ -254,7 +253,8 @@ describe("tick", () => {
   test("closed, and a missing worktree", async () => {
     view({ state: "CLOSED" });
     await once();
-    expect(texts()[0]).toContain("was closed without merging");
+    // Closed by someone: nobody needs to hear of it.
+    expect(texts()).toEqual([]);
     view({});
     saveEntry(config.stateDir, { ...entry, worktree: join(root, "gone") });
     await once();
@@ -510,7 +510,7 @@ describe("tick", () => {
     sh(main, "push", "-q", "origin", "--delete", entry.branch);
     view({ state: "MERGED" });
     await once();
-    expect(texts()[0]).toMatch(/and the branch feat\/t\d+\.$/);
+    expect(texts()).toEqual([]);
     expect(readFileSync(ghLog, "utf8")).not.toContain("api -X DELETE");
   });
 
