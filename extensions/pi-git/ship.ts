@@ -136,7 +136,7 @@ export interface ShipDeps {
   /** Hands a PR to the watcher (quietly); a string is why not. Default: a worktree on its branch, then git_watch. */
   watchPr?: (repo: string, number: number) => Promise<string | undefined>;
   /** The preflight of one repository: the PRs to skip, with the reason. Default: simulate, then the agent. */
-  preflight?: (repo: string, prs: ShipPr[]) => Promise<{ pr: number; reason: string }[]>;
+  preflight?: (repo: string, prs: ShipPr[]) => Promise<Preflight>;
   /** Starts the watcher's fix of a queued PR at once, in the background. Default: stepEntry. */
   fixNow?: (repo: string, number: number) => void;
   now?: () => Date;
@@ -510,6 +510,13 @@ export const RELEASE_PROMPT = [
   '"reason": "<one sentence>"} or {"release": false, "reason": "<one sentence>"}.',
 ].join("\n");
 
+/** The preflight of one repository: the PRs to leave out, and the order in which the rest lands. */
+export interface Preflight {
+  skips: { pr: number; reason: string }[];
+  /** PR numbers in the order they land: clean ones first, conflicting ones last. */
+  order?: number[] | undefined;
+}
+
 /** PRs whose fix runs now, so a ship round does not start a second one. */
 const FIXING = new Set<string>();
 
@@ -770,8 +777,13 @@ class Shipping {
     for (let round = orphans(); round.length > 0; round = orphans()) {
       for (const pr of round) drop(pr.number, `stacked on ${pr.stackedOn}, whose PR is not shipped`);
     }
-    const skips = await (this.deps.preflight ?? ((r, p) => this.preflight(r, p, agent)))(repo, prs);
+    const { skips, order } = await (this.deps.preflight ?? ((r, p) => this.preflight(r, p, agent)))(repo, prs);
     for (const skip of skips) drop(skip.pr, skip.reason);
+    // Merge in the order the simulation found; PRs it did not see keep their place at the end.
+    if (order) {
+      const rank = (pr: ShipPr) => (order.includes(pr.number) ? order.indexOf(pr.number) : order.length);
+      prs.sort((a, b) => rank(a) - rank(b));
+    }
     for (let round = orphans(); round.length > 0; round = orphans()) {
       for (const pr of round) drop(pr.number, `stacked on ${pr.stackedOn}, whose PR is not shipped`);
     }
@@ -796,15 +808,24 @@ class Shipping {
     }
   }
 
-  private async preflight(repo: string, prs: ShipPr[], agent: Config): Promise<{ pr: number; reason: string }[]> {
+  private async preflight(repo: string, prs: ShipPr[], agent: Config): Promise<Preflight> {
     const tools = { run: this.deps.run, config: this.deps.config, home: homedir(), progress: () => {} };
     const main = await findMainCheckout(tools, repo);
     const base = await this.defaultBranch(repo);
-    const order = stackOrder(prs).order.map((pr) => ({ number: pr.number, onto: stackBase(prs, pr)?.number }));
-    const simulated =
-      typeof main === "string" ? await simulate(this.deps.run, main, base, order) : `no local checkout (${main.error})`;
+    const items = (after: Record<number, number[]> = {}) =>
+      stackOrder(prs).order.map((pr) => ({
+        number: pr.number,
+        onto: stackBase(prs, pr)?.number,
+        after: after[pr.number],
+      }));
+    const run = (after?: Record<number, number[]>) =>
+      typeof main === "string"
+        ? simulate(this.deps.run, main, base, items(after))
+        : Promise.resolve(`no local checkout (${main.error})`);
+    let simulated = await run();
+    const order = () => (typeof simulated === "string" ? undefined : simulated.map((item) => item.number));
     const plain = typeof simulated !== "string" && simulated.every((item) => item.clean) && prs.every((pr) => !pr.note);
-    if (plain) return [];
+    if (plain) return { skips: [], order: order() };
     const withBodies = await Promise.all(
       prs.map(async (pr) => ({
         ...pr,
@@ -818,10 +839,18 @@ class Shipping {
       parseVerdicts(prs.map((pr) => pr.number)),
     );
     if (verdicts instanceof Error) {
-      this.deps.log?.(`pi-git ship: ${repo}: no preflight verdicts (${verdicts.message}); trying every PR`);
-      return [];
+      this.deps.log?.(
+        `pi-git ship: ${repo}: no preflight verdicts (${verdicts.message}); merging in the simulated order`,
+      );
+      return { skips: [], order: order() };
     }
-    return verdicts.filter((item) => item.action === "skip").map((item) => ({ pr: item.pr, reason: item.reason }));
+    // PRs that use what another adds land after it: find the order again with those needs.
+    const after = Object.fromEntries(verdicts.filter((v) => v.after).map((v) => [v.pr, v.after as number[]]));
+    if (Object.keys(after).length > 0) simulated = await run(after);
+    return {
+      skips: verdicts.filter((item) => item.action === "skip").map((item) => ({ pr: item.pr, reason: item.reason })),
+      order: order(),
+    };
   }
 
   private async reviewLibrary(

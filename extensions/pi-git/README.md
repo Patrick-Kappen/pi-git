@@ -179,9 +179,12 @@ from open PRs to a deployed host:
    releases. For a library whose PRs have no feat or fix, an agent (`shipModel`, default
    `openai-codex/gpt-6-luna` at `medium`) reads the PRs and decides whether users get something new;
    then /ship gives one PR a feat or fix title before the merge, and it releases.
-3. **Preflight**, before the first merge: per repository, every PR is merged locally in order (oldest
-   first, a stacked PR right after its base with only its own commits) with `git merge-tree`, onto
-   the fresh default branch and onto each other. Where anything is not clean and green, the agent
+3. **Preflight**, before the first merge: per repository, the merge order is found the way one merges
+   by hand, with `git merge-tree` on the fresh default branch: again and again the oldest PR that
+   lands cleanly on what landed so far (a stacked PR only after its base, with only its own commits;
+   a PR that uses what another adds only after that one). Conflicting PRs move back; when nothing
+   lands cleanly any more, they come last and are fixed once, on the final state. The ship merges in
+   exactly that order. PRs opened after `/ship` started are not taken. Where anything is not clean and green, the agent
    (`shipModel`) reads the PRs, the conflicts and their markers, and decides per PR: ship, fix (a
    helper can resolve it without changing behavior) or skip (a behavior decision, superseded,
    depends on a PR that is not shipped, unfinished). A stacked PR whose base is skipped is skipped

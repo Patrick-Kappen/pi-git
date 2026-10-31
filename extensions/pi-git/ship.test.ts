@@ -168,7 +168,8 @@ const fixNow = (repo: string, number: number) => {
   fixes.push(`${repo}#${number}`);
 };
 let skips: Record<string, { pr: number; reason: string }[]> = {};
-const preflight = async (repo: string) => skips[repo] ?? [];
+let orders: Record<string, number[]> = {};
+const preflight = async (repo: string) => ({ skips: skips[repo] ?? [], order: orders[repo] });
 const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr, fixNow, preflight }, 1);
 
 beforeEach(() => {
@@ -203,6 +204,7 @@ beforeEach(() => {
   watched.length = 0;
   fixes.length = 0;
   skips = {};
+  orders = {};
   gitPr.mockReset();
   gitPr.mockResolvedValue({ ok: true, summary: "PR opened", notes: [], pr: { number: 77, url: "u77" } } as never);
 });
@@ -687,6 +689,18 @@ describe("shipTick", () => {
     const ship = await tick();
     expect(ship?.skipped).toEqual(["o/pi-git#5 feat: lone: stacked on feat/gone, whose PR is not shipped"]);
     expect(watched).toEqual(["o/pi-git#6", "o/pi-git#9"]);
+  });
+
+  test("the PRs merge in the order the preflight found, not by number", async () => {
+    world.prs["o/pi-git"] = [pr(1, "feat: a"), pr(2, "feat: b"), pr(3, "feat: c")];
+    orders = { "o/pi-git": [2, 3, 1] };
+    await plan([]);
+    await tick();
+    expect(world.merged.filter((item) => item.startsWith("o/pi-git"))).toEqual([
+      "o/pi-git#2",
+      "o/pi-git#3",
+      "o/pi-git#1",
+    ]);
   });
 
   test("a skipped base takes its stack with it", async () => {

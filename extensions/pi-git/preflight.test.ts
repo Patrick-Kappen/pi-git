@@ -53,21 +53,43 @@ describe("simulate", () => {
       { number: 4, onto: 3 },
     ]);
     if (typeof result === "string") throw new Error(result);
+    // Clean ones land first; #2 conflicts with #1 and moves to the end.
     expect(result.map((item) => [item.number, item.clean])).toEqual([
       [1, true],
-      [2, false],
       [3, true],
       [4, true],
+      [2, false],
     ]);
-    const second = result[1];
+    const second = result.find((item) => item.number === 2);
     expect(second).toMatchObject({ conflicts: ["a.txt"], against: [1] });
     expect(second?.markers).toContain("<<<<<<<");
     expect(second?.markers).toContain("TWO by 1");
     expect(second?.markers).toContain("TWO by 2");
     // The stacked PR changes only what it adds on top of #3.
-    expect(result[3]?.files).toEqual(["b.txt"]);
+    expect(result.find((item) => item.number === 4)?.files).toEqual(["b.txt"]);
     // Nothing was written to a branch.
     expect(g(main, "branch", "--list")).toBe("* main");
+  });
+
+  test("the order lands as much as possible cleanly: a conflicting PR moves back, a needed PR goes first", async () => {
+    // #2 conflicts with #1; #3 is clean. Greedy: #1, #3 land; #2 conflicts with #1 at the end.
+    const order = await simulate(run, main, "main", [{ number: 1 }, { number: 2 }, { number: 3 }]);
+    if (typeof order === "string") throw new Error(order);
+    expect(order.map((item) => [item.number, item.clean])).toEqual([
+      [1, true],
+      [3, true],
+      [2, false],
+    ]);
+    // #1 needs #3 (it uses what #3 adds): #3 lands first.
+    const needs = await simulate(run, main, "main", [{ number: 1, after: [3] }, { number: 2 }, { number: 3 }]);
+    if (typeof needs === "string") throw new Error(needs);
+    expect(needs.findIndex((item) => item.number === 3)).toBeLessThan(needs.findIndex((item) => item.number === 1));
+  });
+
+  test("a stacked PR waits for its base, even when it would land cleanly itself", async () => {
+    const order = await simulate(run, main, "main", [{ number: 4, onto: 3 }, { number: 3 }]);
+    if (typeof order === "string") throw new Error(order);
+    expect(order.map((item) => item.number)).toEqual([3, 4]);
   });
 
   test("a PR that does not exist: an error, not a crash", async () => {

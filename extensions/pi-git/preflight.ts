@@ -1,4 +1,4 @@
-import type { Runner } from "./exec.ts";
+import type { Runner, RunResult } from "./exec.ts";
 import { clipEnd, outputOf } from "./exec.ts";
 
 // The preflight of a ship: before the first merge, every PR of a repository is merged locally, oldest
@@ -30,52 +30,149 @@ const IDENTITY = {
 
 const MARKERS_PER_FILE = 3000;
 
+export interface SimItem {
+  number: number;
+  /** A stacked PR: the PR it builds on. */
+  onto?: number | undefined;
+  /** PRs that must land before this one (it uses what they add). */
+  after?: number[] | undefined;
+}
+
 /**
- * Merge the PRs locally in order (oldest first). A clean PR becomes part of the base for the next
- * ones; a conflicting one does not (the ship fixes it on its own). A string is why it could not run.
+ * Find the order in which the PRs land, the way one merges by hand: again and again the oldest PR
+ * that merges cleanly onto what landed so far (a stacked PR only after its base, a PR only after the
+ * PRs it needs). PRs that conflict move back; when nothing lands cleanly any more, the rest
+ * conflicts, and each is fixed once, on the final state. Nothing is written to a branch.
+ * Returns the PRs in that order; a string is why it could not run.
  */
 export async function simulate(
   run: Runner,
   main: string,
   base: string,
-  items: readonly { number: number; onto?: number | undefined }[],
+  items: readonly SimItem[],
 ): Promise<Simulated[] | string> {
-  const git = (...args: string[]) => run("git", args, { cwd: main, env: IDENTITY });
-  const refs = items.map(({ number }) => `+pull/${number}/head:refs/pi-git/ship/${number}`);
+  const git: GitCommand = (...args) => run("git", args, { cwd: main, env: IDENTITY });
+  // The full source name: with the short "pull/N/head", a second fetch deletes the local ref.
+  const refs = items.map(({ number }) => `+refs/pull/${number}/head:refs/pi-git/ship/${number}`);
   const fetched = await git("fetch", "origin", base, ...refs);
   if (fetched.code !== 0) return `git fetch failed: ${clipEnd(outputOf(fetched), 300)}`;
-  let current = (await git("rev-parse", `origin/${base}`)).stdout.trim();
-  const start = current;
-  const touched = new Map<number, string[]>();
-  const result: Simulated[] = [];
+
+  const start = (await git("rev-parse", `origin/${base}`)).stdout.trim();
+  const files = await changedFiles(git, start, items);
+  const state = await landCleanItems(git, start, items, files);
+  await describePendingItems(git, state);
+  return state.result;
+}
+
+type GitCommand = (...args: string[]) => Promise<RunResult>;
+
+interface SimulationState {
+  current: string;
+  pending: SimItem[];
+  landed: number[];
+  result: Simulated[];
+  files: Map<number, string[]>;
+}
+
+async function changedFiles(git: GitCommand, start: string, items: readonly SimItem[]) {
+  const files = new Map<number, string[]>();
   for (const { number, onto } of items) {
-    const head = `refs/pi-git/ship/${number}`;
-    // A stacked PR: only its own commits, those after the head of the PR it builds on.
     const from = onto === undefined ? start : `refs/pi-git/ship/${onto}`;
-    const files = (await git("diff", "--name-only", `${from}...${head}`)).stdout.split("\n").filter(Boolean);
-    touched.set(number, files);
-    const mergeBase = onto === undefined ? [] : [`--merge-base=${from}`];
-    const merged = await git("merge-tree", "--write-tree", "--name-only", "--no-messages", ...mergeBase, current, head);
-    const [tree = "", ...rest] = merged.stdout.trim().split("\n");
-    if (merged.code === 0) {
-      const commit = await git("commit-tree", tree, "-p", current, "-p", head, "-m", `ship: #${number}`);
-      if (commit.code === 0) current = commit.stdout.trim();
-      result.push({ number, clean: true, files, conflicts: [], against: [], markers: "" });
-      continue;
-    }
-    const conflicts = rest.filter(Boolean);
-    const against = [...touched.entries()]
-      .filter(([other, changed]) => other !== number && changed.some((file) => conflicts.includes(file)))
-      .map(([other]) => other)
-      .filter((other) => result.find((item) => item.number === other)?.clean);
+    const changed = await git("diff", "--name-only", `${from}...refs/pi-git/ship/${number}`);
+    files.set(number, changed.stdout.split("\n").filter(Boolean));
+  }
+  return files;
+}
+
+async function tryMerge(git: GitCommand, current: string, { number, onto }: SimItem) {
+  const mergeBase = onto === undefined ? [] : [`--merge-base=refs/pi-git/ship/${onto}`];
+  const merged = await git(
+    "merge-tree",
+    "--write-tree",
+    "--name-only",
+    "--no-messages",
+    ...mergeBase,
+    current,
+    `refs/pi-git/ship/${number}`,
+  );
+  const [tree = "", ...rest] = merged.stdout.trim().split("\n");
+  return { clean: merged.code === 0, tree, conflicts: rest.filter(Boolean) };
+}
+
+function ready(item: SimItem, pending: SimItem[]) {
+  return [item.onto, ...(item.after ?? [])].every(
+    (need) => need === undefined || !pending.some((other) => other.number === need),
+  );
+}
+
+async function landCleanItems(
+  git: GitCommand,
+  start: string,
+  items: readonly SimItem[],
+  files: Map<number, string[]>,
+): Promise<SimulationState> {
+  const state: SimulationState = { current: start, pending: [...items], landed: [], result: [], files };
+  for (;;) {
+    const next = await nextCleanItem(git, state);
+    if (!next) break;
+    await landItem(git, state, next.item, next.tree);
+  }
+  return state;
+}
+
+async function nextCleanItem(git: GitCommand, state: SimulationState) {
+  for (const item of state.pending.filter((candidate) => ready(candidate, state.pending))) {
+    const merged = await tryMerge(git, state.current, item);
+    if (merged.clean) return { item, tree: merged.tree };
+  }
+  return undefined;
+}
+
+async function landItem(git: GitCommand, state: SimulationState, item: SimItem, tree: string) {
+  const commit = await git(
+    "commit-tree",
+    tree,
+    "-p",
+    state.current,
+    "-p",
+    `refs/pi-git/ship/${item.number}`,
+    "-m",
+    `ship: #${item.number}`,
+  );
+  if (commit.code === 0) state.current = commit.stdout.trim();
+  state.pending.splice(state.pending.indexOf(item), 1);
+  state.landed.push(item.number);
+  state.result.push({
+    number: item.number,
+    clean: true,
+    files: state.files.get(item.number) ?? [],
+    conflicts: [],
+    against: [],
+    markers: "",
+  });
+}
+
+async function describePendingItems(git: GitCommand, state: SimulationState) {
+  // Nothing lands cleanly any more: the rest conflicts with what landed, in their order.
+  for (const item of state.pending) {
+    const merged = await tryMerge(git, state.current, item);
+    const against = state.landed.filter((other) =>
+      (state.files.get(other) ?? []).some((file) => merged.conflicts.includes(file)),
+    );
     const parts: string[] = [];
-    for (const file of conflicts.slice(0, 5)) {
-      const shown = await git("show", `${tree}:${file}`);
+    for (const file of merged.conflicts.slice(0, 5)) {
+      const shown = await git("show", `${merged.tree}:${file}`);
       parts.push(`--- ${file}\n${clipEnd(conflictRegions(shown.stdout), MARKERS_PER_FILE)}`);
     }
-    result.push({ number, clean: false, files, conflicts, against, markers: parts.join("\n") });
+    state.result.push({
+      number: item.number,
+      clean: merged.clean,
+      files: state.files.get(item.number) ?? [],
+      conflicts: merged.conflicts,
+      against,
+      markers: parts.join("\n"),
+    });
   }
-  return result;
 }
 
 /** Only the parts of a file around conflict markers, with a little context. */
@@ -104,12 +201,14 @@ export interface Verdict {
   pr: number;
   action: Action;
   reason: string;
+  /** PRs that must land first, because this one uses what they add (not for plain file overlap). */
+  after?: number[];
 }
 
 export const PREFLIGHT_PROMPT = [
   "You check the open PRs of one repository before pi-git /ship merges them, oldest first. The input has",
-  "every PR (title, body, changed files, the state of its checks) and a local simulation: each PR merged in",
-  "order onto the default branch and onto the earlier clean PRs, with the conflicting files and markers.",
+  "every PR (title, body, changed files, the state of its checks) and a local simulation: the PRs merged in",
+  "the order they land cleanly, and the ones that still conflict, with the conflicting files and markers.",
   "",
   "Decide per PR:",
   '- "ship": it merges cleanly, or its checks only still run.',
@@ -120,8 +219,11 @@ export const PREFLIGHT_PROMPT = [
   "  or not in this ship, or it is clearly unfinished (WIP, TODO left, empty).",
   "Be strict with skip: a skipped PR waits for the owner. Do not skip for conflicts a helper can merge.",
   "",
-  'Answer with JSON only: {"verdicts": [{"pr": <number>, "action": "ship" | "fix" | "skip", "reason": "<one sentence>"}]}',
-  "with one verdict for every PR in the input.",
+  'When a PR uses what another PR here adds (a function, a file, a setting), give that PR in "after", so it',
+  "lands first. Not for PRs that only touch the same files: the order is found by merging.",
+  "",
+  'Answer with JSON only: {"verdicts": [{"pr": <number>, "action": "ship" | "fix" | "skip", "reason": "<one sentence>", "after": [<numbers>]}]}',
+  'with one verdict for every PR in the input; "after" may be left out.',
 ].join("\n");
 
 export function parseVerdicts(numbers: readonly number[]) {
