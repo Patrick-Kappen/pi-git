@@ -1,6 +1,6 @@
 {
   "name": "pi-git",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "pi extension that commits, pushes and opens PRs with a helper agent, and watches CI until the PR is green",
   "type": "module",

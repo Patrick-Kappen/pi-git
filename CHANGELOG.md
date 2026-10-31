@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.1.0...v0.2.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** add one-shot commits and stepwise git locks ([#6](https://github.com/Patrick-Kappen/pi-git/issues/6)) ([49a4b34](https://github.com/Patrick-Kappen/pi-git/commit/49a4b34d5e2a64cb888c9d69bbcc49c150649c1b))
+* **pi-git:** configure repository locks in settings ([#10](https://github.com/Patrick-Kappen/pi-git/issues/10)) ([78583b0](https://github.com/Patrick-Kappen/pi-git/commit/78583b0f9b36f5792c83664375700fe9a3eabe64))
+* **pi-git:** notify users when work needs attention ([#8](https://github.com/Patrick-Kappen/pi-git/issues/8)) ([a6477db](https://github.com/Patrick-Kappen/pi-git/commit/a6477db65ea9a2632b9c77ae985071d7482451b3))
+
+
+### Bug Fixes
+
+* **pi-git:** recover watcher work after reboot ([#7](https://github.com/Patrick-Kappen/pi-git/issues/7)) ([3e30365](https://github.com/Patrick-Kappen/pi-git/commit/3e3036554c8db428e7fa1e522c3db7c9ee8f525b))
+
 ## 0.1.0 (2026-10-31)
 
 
