@@ -136,7 +136,9 @@ class Watch {
 
   private report(text: string): void {
     const { entry } = this;
-    if (entry.quiet) return;
+    // A ship may have taken the PR over while this round ran: read the flag from disk.
+    const now = loadEntries(this.config.stateDir).find((item) => item.id === entry.id);
+    if (entry.quiet || now?.quiet) return;
     addSummary(this.config.stateDir, {
       entryId: entry.id,
       repo: entry.repo,

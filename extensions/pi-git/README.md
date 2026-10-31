@@ -81,7 +81,7 @@ pi-orchestrator uses it for the PRs of its tasks.
 
 ## The watcher
 
-`watcher.ts` runs one round over the queued PRs; a systemd user timer starts it every minute (see the
+`watcher.ts` runs one round over the queued PRs, side by side with a running ship; a systemd user timer starts it every minute. While a ship runs, the run stays alive until the ship is done: the ship looks every 10 seconds and the PRs every minute, and a slow fix by the helper never holds the ship up (see the
 [main README](../../README.md)). For each PR it reads the state, the checks and the merge state with
 `gh pr view`:
 

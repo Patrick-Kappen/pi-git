@@ -948,11 +948,6 @@ class Shipping {
   }
 }
 
-/** While a ship runs, the watcher looks this often within one run of its timer, */
-export const SHIP_POLL_MS = 10_000;
-/** for at most this long, so it ends before the timer starts it again. */
-export const SHIP_WINDOW_MS = 45_000;
-
 /**
  * The ship takes over the PRs it merges: the watcher keeps fixing them, but stops reporting them to
  * the sessions that made them. Only the ship's end (and its problems) is reported.
