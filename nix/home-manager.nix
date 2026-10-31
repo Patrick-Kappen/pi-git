@@ -222,6 +222,12 @@ in
         default = "openai-codex/gpt-6-luna";
         description = "The model of the agent that decides /ship's releases for changes without feat or fix.";
       };
+      repos = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ "*/pi-*" ];
+        example = [ "my-org/*" ];
+        description = "The repositories /ship ships, as owner/name globs; others are left alone.";
+      };
       thinking = lib.mkOption {
         type = lib.types.str;
         default = "medium";
@@ -314,6 +320,7 @@ in
         // {
           shipModel = cfg.ship.model;
           shipThinking = cfg.ship.thinking;
+          shipRepos = cfg.ship.repos;
         }
       );
     };

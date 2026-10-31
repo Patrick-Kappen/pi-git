@@ -28,7 +28,7 @@ export async function shipCommand(
     return;
   }
   ui.notify("pi-git ship: looking at every repository…", "info");
-  const index = await indexShip(deps.run, config.shipNixos);
+  const index = await indexShip(deps.run, config.shipNixos, config.shipRepos);
   // Every library with a feat or fix releases; for the others the reviewing agent decides. No questions:
   // only a fix that would change behavior comes back to the owner, as a notification.
   const releases = index.libs.filter((lib) => lib.releasable).map((lib) => lib.repo);

@@ -18,6 +18,7 @@ import {
   STAGE_TIMEOUT_MS,
   saveShip,
   shipLines,
+  shipped,
   shipTick,
 } from "./ship.ts";
 import { type Entry, entryId, loadEntries, loadSummaries, removeEntry, saveEntry } from "./state.ts";
@@ -211,6 +212,13 @@ beforeEach(() => {
 });
 
 describe("index", () => {
+  test("shipped: only the repositories that match the patterns", () => {
+    expect(shipped("Patrick-Kappen/pi-git", ["*/pi-*"])).toBe(true);
+    expect(shipped("Patrick-Kappen/graft", ["*/pi-*"])).toBe(false);
+    expect(shipped("Patrick-Kappen/graft", ["*/pi-*", "Patrick-Kappen/graft"])).toBe(true);
+    expect(shipped("other/pi-x.y", ["Patrick-Kappen/*"])).toBe(false);
+  });
+
   test("latestInputs takes the GitHub inputs on latest", () => {
     expect(latestInputs(JSON.stringify(LOCK))).toEqual([
       { input: "pi-git", repo: "o/pi-git", rev: "old-git" },
@@ -346,8 +354,10 @@ describe("shipTick", () => {
   });
 
   test("a repository with releases that NixOS does not use yet: shipped and released, not locked", async () => {
-    world.repos = ["o/pi-git", "o/pi-tweaks", "o/website", "o/Nixos"];
-    world.releasing = ["o/pi-git", "o/pi-tweaks"];
+    world.repos = ["o/pi-git", "o/pi-tweaks", "o/graft", "o/website", "o/Nixos"];
+    // graft has releases too, but it is not a pi-* repository: left alone.
+    world.releasing = ["o/pi-git", "o/pi-tweaks", "o/graft"];
+    world.prs["o/graft"] = [pr(378, "chore(deps): bump")];
     world.prs["o/pi-tweaks"] = [pr(2, "feat(prompt): replace it")];
     const index = await indexShip(fake, nixos);
     const tweaks = index.libs.find((lib) => lib.repo === "o/pi-tweaks");

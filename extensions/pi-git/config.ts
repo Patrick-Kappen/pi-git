@@ -48,6 +48,8 @@ export interface Config {
   /** /ship: the model and thinking level of the agent that decides the releases. */
   shipModel: string;
   shipThinking: string;
+  /** /ship: the repositories it ships, as owner/name globs; everything else is left alone. */
+  shipRepos: string[];
   errors: string[];
 }
 
@@ -94,6 +96,7 @@ export function defaults(path: string, env: NodeJS.ProcessEnv, home: string): Co
     shipHost: hostname(),
     shipModel: "openai-codex/gpt-6-luna",
     shipThinking: "medium",
+    shipRepos: ["*/pi-*"],
     errors: [],
   };
 }
@@ -147,10 +150,19 @@ function applyBackend(config: Config, key: string, value: unknown): string | und
   return undefined;
 }
 
+function applyShipRepos(config: Config, value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
+    return '"shipRepos" must be a list of owner/name patterns';
+  }
+  config.shipRepos = value as string[];
+  return undefined;
+}
+
 /** Apply `locked` or `delivery`; a string is the error. */
 function applyChoice(config: Config, key: string, value: unknown): string | undefined {
   const backend = applyBackend(config, key, value);
   if (backend !== false) return backend;
+  if (key === "shipRepos") return applyShipRepos(config, value);
   if (key === "repos") {
     const repos = toSettings(value);
     if (typeof value !== "object" || value === null || Array.isArray(value))

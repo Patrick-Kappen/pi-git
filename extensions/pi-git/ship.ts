@@ -274,14 +274,32 @@ async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIn
 }
 
 /** Everything /ship could do now, and what stands in the way. Reads only. */
-export async function indexShip(run: Runner, nixosRoot: string): Promise<ShipIndex> {
+/** Whether owner/name matches one of the patterns (`*` matches within a part). */
+export function shipped(repo: string, patterns: readonly string[]): boolean {
+  return patterns.some((pattern) =>
+    new RegExp(
+      `^${pattern
+        .split("*")
+        .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+        .join("[^/]*")}$`,
+      "i",
+    ).test(repo),
+  );
+}
+
+export async function indexShip(
+  run: Runner,
+  nixosRoot: string,
+  patterns: readonly string[] = ["*/pi-*"],
+): Promise<ShipIndex> {
   const origin = await run("git", ["remote", "get-url", "origin"], { cwd: nixosRoot });
   const nixosRepo = origin.code === 0 ? repoSlug(origin.stdout) : "";
   // The lock of GitHub's default branch, not of the checkout: that may be behind.
   await run("git", ["fetch", "origin", "--prune"], { cwd: nixosRoot });
   const shown = await run("git", ["show", "refs/remotes/origin/HEAD:flake.lock"], { cwd: nixosRoot });
   const lockText = shown.code === 0 ? shown.stdout : readFileSync(join(nixosRoot, "flake.lock"), "utf8");
-  const inputs = latestInputs(lockText);
+  // Only the repositories the owner ships (default: pi-*); others are left alone.
+  const inputs = latestInputs(lockText).filter((item) => shipped(item.repo, patterns));
   const libs = await Promise.all(
     inputs.map(async ({ input, repo, rev }) => {
       const index = await indexRepo(run, nixosRoot, repo);
@@ -289,7 +307,13 @@ export async function indexShip(run: Runner, nixosRoot: string): Promise<ShipInd
       return { ...index, input, behind: latest !== undefined && latest !== rev };
     }),
   );
-  const outside = await outsideRepos(run, nixosRoot, nixosRepo, new Set(inputs.map((item) => item.repo.toLowerCase())));
+  const outside = await outsideRepos(
+    run,
+    nixosRoot,
+    nixosRepo,
+    new Set(inputs.map((item) => item.repo.toLowerCase())),
+    patterns,
+  );
   const nixos = await indexRepo(run, nixosRoot, nixosRepo);
   // The NixOS configuration is not released; its merges are deployed.
   const { noRelease: _none, ...plain } = nixos;
@@ -301,7 +325,13 @@ export async function indexShip(run: Runner, nixosRoot: string): Promise<ShipInd
  * PRs and releases ship too, and the plan says they are not in NixOS (adding them changes the
  * configuration, so /ship does not).
  */
-async function outsideRepos(run: Runner, cwd: string, nixosRepo: string, known: Set<string>): Promise<RepoIndex[]> {
+async function outsideRepos(
+  run: Runner,
+  cwd: string,
+  nixosRepo: string,
+  known: Set<string>,
+  patterns: readonly string[],
+): Promise<RepoIndex[]> {
   const owner = nixosRepo.split("/")[0];
   if (!owner) return [];
   const list = await ghJson<{ nameWithOwner: string }[]>(run, cwd, [
@@ -317,7 +347,8 @@ async function outsideRepos(run: Runner, cwd: string, nixosRepo: string, known: 
   ]);
   const candidates = (list ?? [])
     .map((repo) => repo.nameWithOwner)
-    .filter((repo) => repo.toLowerCase() !== nixosRepo.toLowerCase() && !known.has(repo.toLowerCase()));
+    .filter((repo) => repo.toLowerCase() !== nixosRepo.toLowerCase() && !known.has(repo.toLowerCase()))
+    .filter((repo) => shipped(repo, patterns));
   const found = await Promise.all(
     candidates.map(async (repo) =>
       (await gh(run, cwd, ["api", `repos/${repo}/contents/release-please-config.json`, "--jq", ".name"]))
