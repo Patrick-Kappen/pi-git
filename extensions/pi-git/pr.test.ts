@@ -54,6 +54,7 @@ beforeAll(() => {
     `for last; do :; done
 input=$(cat)
 echo "$PI_GIT_HELPER|$last" | head -1 >> "${helperLog}"
+echo "$input" >> "${helperLog}.input"
 case "$PI_GIT_HELPER" in
   fix)
     case "$input" in
@@ -76,7 +77,8 @@ esac
     join(bin, "gh"),
     `echo "$*" >> "${ghLog}"
 case "$1 $2" in
-  "pr view") if [ -f "${root}/gh.pr" ]; then cat "${root}/gh.pr"; else exit 1; fi ;;
+  "pr view") view="${root}/gh.view.$(echo "$3" | tr / _)"
+    if [ -f "$view" ]; then cat "$view"; elif [ -f "${root}/gh.pr" ]; then cat "${root}/gh.pr"; else exit 1; fi ;;
   "pr create") if [ -f "${root}/gh.fail" ]; then echo "create refused" >&2; exit 1; fi; echo "https://github.com/owner/repo/pull/7" ;;
   "pr edit") if [ -f "${root}/gh.fail" ]; then echo "edit refused" >&2; exit 1; fi ;;
   *) exit 1 ;;
@@ -290,5 +292,22 @@ describe("gitPr", () => {
     expect((await pr({ updatePr: false, forceWithLease: "0000000000000000000000000000000000000000" })).ok).toBe(false);
     expect((await pr({ updatePr: false, forceWithLease: lease })).ok).toBe(true);
     expect(sh(origin, "log", "-1", "--format=%s", branch)).toBe("feat: rewritten");
+  });
+
+  test("a stacked PR names the PR of its base", async () => {
+    const base = `feat/base-${counter}`;
+    sh(main, "push", "-q", "origin", `origin/main:refs/heads/${base}`);
+    writeFileSync(
+      join(root, `gh.view.feat_base-${counter}`),
+      JSON.stringify({ number: 5, url: "u5", title: "t", body: "b", baseRefName: "main", state: "OPEN" }),
+    );
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    writeFileSync(`${helperLog}.input`, "");
+    const result = await pr({ base });
+    expect(result.ok).toBe(true);
+    expect(readFileSync(`${helperLog}.input`, "utf8")).toContain(
+      'Start the body with: "Stacked on #5; merge that first."',
+    );
+    expect(readFileSync(ghLog, "utf8")).toContain(`pr create --base ${base}`);
   });
 });

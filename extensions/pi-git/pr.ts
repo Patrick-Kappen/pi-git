@@ -272,7 +272,12 @@ class Flow {
     existing: PullRequest | undefined,
   ): Promise<{ number: number; url: string; created: boolean } | string> {
     const range = `origin/${this.base}...HEAD`;
+    const stacked =
+      this.base === this.wt.defaultBranch ? undefined : await findPullRequest(this.deps.run, this.wt.root, this.base);
     const input = [
+      stacked
+        ? `This PR is stacked on PR #${stacked.number} (${this.base}). Start the body with: "Stacked on #${stacked.number}; merge that first."`
+        : "",
       `What the change is for:\n${this.input.intent}`,
       `Branch: ${this.wt.branch} into ${this.base}`,
       `Recent subjects on ${this.base}:\n${this.recent.join("\n")}`,
