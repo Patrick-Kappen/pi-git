@@ -163,7 +163,11 @@ const watchPr = vi.fn(async (repo: string, number: number) => {
   return undefined;
 });
 // One pass per tick, so each test can look at every step; "a round keeps going" tests the default.
-const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr }, 1);
+const fixes: string[] = [];
+const fixNow = (repo: string, number: number) => {
+  fixes.push(`${repo}#${number}`);
+};
+const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr, fixNow }, 1);
 
 beforeEach(() => {
   n++;
@@ -195,6 +199,7 @@ beforeEach(() => {
     fail: [],
   };
   watched.length = 0;
+  fixes.length = 0;
   gitPr.mockReset();
   gitPr.mockResolvedValue({ ok: true, summary: "PR opened", notes: [], pr: { number: 77, url: "u77" } } as never);
 });
@@ -408,7 +413,9 @@ describe("shipTick", () => {
     world.fail = ["pr merge 1"];
     await plan(["o/pi-git"]);
     let ship = await tick();
-    expect(ship?.libs[0]?.error).toMatch(/^merging #1 failed: failed: gh pr merge 1/);
+    // That PR is given up; the library goes on without it.
+    expect(ship?.libs[0]?.prs[0]?.error).toMatch(/^merging #1 failed: failed: gh pr merge 1/);
+    expect(listAttention(config.stateDir)[0]?.text).toMatch(/o\/pi-git needs you: merging #1 failed/);
 
     world.fail = [];
     world.prs["o/pi-git"] = [
@@ -431,6 +438,8 @@ describe("shipTick", () => {
     let ship = await tick();
     expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5"]);
     expect(watched).toEqual(["o/pi-git#4"]);
+    // The fix starts at once, not on the watcher's next round.
+    expect(fixes).toEqual(["o/pi-git#4"]);
     expect(ship?.libs[0]).toMatchObject({ state: "merge", adopted: [4] });
     // Still conflicting while the watcher works: not handed over twice.
     await tick();
@@ -440,6 +449,21 @@ describe("shipTick", () => {
     ship = await tick();
     expect(calls).toContain("gh pr merge 4 -R o/pi-git --squash --match-head-commit rebased4");
     expect(ship?.libs[0]?.state).toBe("done");
+  });
+
+  test("every PR each round, oldest first: a waiting one does not hold up a green one, conflicts are fixed at once and together", async () => {
+    world.prs["o/pi-git"] = [pr(1, "feat: a"), pr(2, "feat: b"), pr(3, "feat: c"), pr(4, "feat: d")];
+    await plan([]);
+    world.prs["o/pi-git"] = [
+      pr(1, "feat: a", { statusCheckRollup: pending }),
+      pr(2, "feat: b", { mergeable: "CONFLICTING" }),
+      pr(3, "feat: c"),
+      pr(4, "feat: d", { mergeable: "CONFLICTING" }),
+    ];
+    const ship = await tick();
+    expect(world.merged).toContain("o/pi-git#3");
+    expect(fixes).toEqual(["o/pi-git#2", "o/pi-git#4"]);
+    expect(ship?.libs[0]?.state).toBe("merge");
   });
 
   test("the watcher gave up on a red PR: that library needs you", async () => {
@@ -453,7 +477,8 @@ describe("shipTick", () => {
     await tick();
     removeEntry(config.stateDir, entryId("o/pi-git", 4));
     const ship = await tick();
-    expect(ship?.libs[0]?.error).toBe("#4: checks fail, and the watcher could not fix it");
+    expect(ship?.libs[0]?.prs[0]?.error).toBe("#4: checks fail, and the watcher could not fix it");
+    expect(ship?.libs[0]?.state).toBe("done");
   });
 
   test("a PR without a feat or fix: retitled to feat when the owner chose it", async () => {

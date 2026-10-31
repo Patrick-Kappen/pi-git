@@ -10,7 +10,7 @@ import type { gitPr as GitPr } from "./pr.ts";
 import { findMainCheckout } from "./start.ts";
 import { addSummary, entryId, loadEntries, saveEntry } from "./state.ts";
 import { gitWatch, worktreeOf } from "./status.ts";
-import { type Check, rollup } from "./watch.ts";
+import { type Check, rollup, stepEntry } from "./watch.ts";
 
 // /ship: merge what is ready, release what the owner picks, lock the releases in the NixOS
 // configuration, merge that, and wait until the host is deployed. The owner's command: it runs in the
@@ -38,6 +38,10 @@ export interface ShipPr {
   note?: string;
   /** The PR's base when it is not the default branch: stacked, merged after its base. */
   stackedOn?: string;
+  /** Merged by the ship. */
+  merged?: boolean;
+  /** Why the ship gave up on this PR; the other PRs go on. */
+  error?: string;
 }
 
 interface Stage {
@@ -124,6 +128,8 @@ export interface ShipDeps {
   gitPr: typeof GitPr;
   /** Hands a PR to the watcher (quietly); a string is why not. Default: a worktree on its branch, then git_watch. */
   watchPr?: (repo: string, number: number) => Promise<string | undefined>;
+  /** Starts the watcher's fix of a queued PR at once, in the background. Default: stepEntry. */
+  fixNow?: (repo: string, number: number) => void;
   now?: () => Date;
   log?: (text: string) => void;
 }
@@ -471,6 +477,9 @@ export const RELEASE_PROMPT = [
   '"reason": "<one sentence>"} or {"release": false, "reason": "<one sentence>"}.',
 ].join("\n");
 
+/** PRs whose fix runs now, so a ship round does not start a second one. */
+const FIXING = new Set<string>();
+
 class Shipping {
   private readonly deps: ShipDeps;
   private readonly ship: Ship;
@@ -514,6 +523,21 @@ class Shipping {
     if (fresh) {
       await notifyTerminals(this.deps.run, "pi-git ship", text);
       this.tellAgent("failed", text, item.repo);
+    }
+  }
+
+  /** A problem with one PR: the owner and the agent hear of it; the rest of the ship goes on. */
+  private async problem(repo: string, error: string): Promise<void> {
+    const text = `pi-git ship: ${repo} needs you: ${error}`;
+    this.deps.log?.(text);
+    const { fresh } = addAttention(
+      this.deps.config.stateDir,
+      { kind: "watcher", repo, text },
+      `ship-${this.ship.id}-${error}`,
+    );
+    if (fresh) {
+      await notifyTerminals(this.deps.run, "pi-git ship", text);
+      this.tellAgent("failed", text, `${repo}-${error.slice(0, 20)}`);
     }
   }
 
@@ -599,7 +623,9 @@ class Shipping {
   private async handToWatcher(item: { adopted?: number[] }, repo: string, pr: ListedPr, why: string): Promise<string> {
     if (item.adopted?.includes(pr.number)) {
       const watched = loadEntries(this.deps.config.stateDir).some((entry) => entry.id === entryId(repo, pr.number));
-      return watched ? "wait" : `#${pr.number}: ${why}, and the watcher could not fix it`;
+      if (!watched) return `#${pr.number}: ${why}, and the watcher could not fix it`;
+      this.fixNow(repo, pr.number);
+      return "wait";
     }
     const error = await (this.deps.watchPr ?? ((r, n) => watchPr(this.deps, `ship-${this.ship.id}`, r, n)))(
       repo,
@@ -607,27 +633,46 @@ class Shipping {
     );
     if (error) return `#${pr.number}: ${why}; ${error}`;
     item.adopted = [...(item.adopted ?? []), pr.number];
+    this.fixNow(repo, pr.number);
     return "wait";
   }
 
-  /** Merge the PRs in order; false when the item has to wait or failed. */
+  /** Start the fix of a red or conflicting PR at once, beside everything else; once at a time per PR. */
+  private fixNow(repo: string, number: number): void {
+    if (this.deps.fixNow) {
+      this.deps.fixNow(repo, number);
+      return;
+    }
+    const entry = loadEntries(this.deps.config.stateDir).find((item) => item.id === entryId(repo, number));
+    if (!entry || FIXING.has(entry.id)) return;
+    FIXING.add(entry.id);
+    void stepEntry(this.deps, entry).finally(() => FIXING.delete(entry.id));
+  }
+
+  /**
+   * Every PR, oldest first, each round: green ones are merged, red or conflicting ones are being
+   * fixed (each by its own helper, at the same time), the rest waits. One PR the ship gives up on
+   * does not stop the others. True when every PR is merged or given up.
+   */
   private async mergeAll(
     item: Stage & { state: string; repo: string },
     prs: ShipPr[],
     method: string,
   ): Promise<boolean> {
+    let waiting: number | undefined;
     for (const pr of prs) {
+      if (pr.merged || pr.error) continue;
       const merged = await this.mergeWhenReady(item.repo, pr.number, method, item as { adopted?: number[] });
-      if (merged === "wait") {
-        await this.wait(item, `#${pr.number} to be ready`);
-        return false;
-      }
-      if (merged !== "merged") {
-        await this.fail(item, merged);
-        return false;
+      if (merged === "merged") pr.merged = true;
+      else if (merged === "wait") waiting ??= pr.number;
+      else {
+        pr.error = merged;
+        await this.problem(item.repo, merged);
       }
     }
-    return true;
+    if (waiting === undefined) return true;
+    await this.wait(item, `#${waiting} to be ready`);
+    return false;
   }
 
   private async mergeMethod(repo: string): Promise<string> {

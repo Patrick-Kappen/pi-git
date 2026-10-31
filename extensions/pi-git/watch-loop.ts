@@ -10,13 +10,13 @@ export interface LoopParts {
 }
 
 /** How often the ship looks while it runs. */
-export const SHIP_EVERY_MS = 10_000;
+export const SHIP_EVERY_MS = 5_000;
 /** How often the queued PRs are looked at while a ship keeps this run alive. */
 export const PRS_EVERY_MS = 60_000;
 
 /**
  * One run of the watcher. The ship and the PRs move side by side, so a fix by the helper (minutes)
- * never holds the ship up. While a ship runs, the run stays alive: the ship looks every 10 seconds
+ * never holds the ship up. While a ship runs, the run stays alive: the ship looks every 5 seconds
  * and the PRs every minute, without waiting for the timer between runs.
  */
 export async function runWatcher(parts: LoopParts): Promise<void> {

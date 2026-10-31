@@ -52,7 +52,7 @@ describe("runWatcher", () => {
     expect(w.events).toEqual(["ship@0", "prs@0"]);
   });
 
-  test("a running ship looks every 10 seconds, the PRs every minute, and the run ends with the ship", async () => {
+  test("a running ship looks every few seconds, the PRs every minute, and the run ends with the ship", async () => {
     const w = world(8);
     const done = runWatcher(w.parts);
     await w.pump();
@@ -60,7 +60,10 @@ describe("runWatcher", () => {
     const ship = w.events.filter((e) => e.startsWith("ship")).map((e) => Number(e.split("@")[1]));
     const prs = w.events.filter((e) => e.startsWith("prs")).map((e) => Number(e.split("@")[1]));
     expect(ship).toEqual([0, 1, 2, 3, 4, 5, 6, 7].map((i) => i * SHIP_EVERY_MS));
-    expect(prs).toEqual([0, PRS_EVERY_MS]);
+    // 8 ship rounds take 7 waits; the PRs look once a minute within that time.
+    expect(prs).toEqual(
+      Array.from({ length: Math.floor((7 * SHIP_EVERY_MS) / PRS_EVERY_MS) + 1 }, (_, i) => i * PRS_EVERY_MS),
+    );
   });
 
   test("a slow round over the PRs (a helper fix) does not hold the ship up", async () => {
@@ -69,6 +72,6 @@ describe("runWatcher", () => {
     await w.pump();
     await done;
     const ship = w.events.filter((e) => e.startsWith("ship")).map((e) => Number(e.split("@")[1]));
-    expect(ship).toEqual([0, 10_000, 20_000, 30_000]);
+    expect(ship).toEqual([0, 1, 2, 3].map((i) => i * SHIP_EVERY_MS));
   });
 });

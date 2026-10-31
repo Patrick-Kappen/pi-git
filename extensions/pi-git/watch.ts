@@ -531,6 +531,23 @@ class Watch {
   }
 }
 
+/**
+ * One step of one queued PR, under a lock of its own: a ship can fix a PR at once, beside the
+ * watcher's round, without two fixes of the same PR at the same time. Skipped when it is busy.
+ */
+export async function stepEntry(deps: WatchDeps, entry: Entry): Promise<void> {
+  const release = lock(deps.config.runtimeDir, `pr-${entry.id}`, LOCK_MAX_AGE_MS);
+  if (!release) return;
+  try {
+    const fresh = loadEntries(deps.config.stateDir).find((item) => item.id === entry.id) ?? entry;
+    await new Watch(deps, fresh).step();
+  } catch (error) {
+    deps.log?.(`${entry.id}: ${(error as Error).message}`);
+  } finally {
+    release();
+  }
+}
+
 /** One round of the watcher: every queued PR once. Returns how many it looked at. */
 export async function tick(deps: WatchDeps): Promise<number> {
   const release = lock(deps.config.runtimeDir, "watcher", LOCK_MAX_AGE_MS);
@@ -541,13 +558,7 @@ export async function tick(deps: WatchDeps): Promise<number> {
   try {
     pruneDelivered(deps.config.stateDir, DELIVERED_MAX_AGE_MS, (deps.now?.() ?? new Date()).getTime());
     const entries = loadEntries(deps.config.stateDir);
-    for (const entry of entries) {
-      try {
-        await new Watch(deps, entry).step();
-      } catch (error) {
-        deps.log?.(`${entry.id}: ${(error as Error).message}`);
-      }
-    }
+    for (const entry of entries) await stepEntry(deps, entry);
     return entries.length;
   } finally {
     release();
