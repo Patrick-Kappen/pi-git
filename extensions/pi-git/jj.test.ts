@@ -605,6 +605,16 @@ describe("the watcher with a jj workspace", () => {
     expect(texts()[0]).toContain(`is merged; removed the worktree ${path} and the branch ${branch}`);
   });
 
+  test("merged, but the branch has a logical commit that is not in the PR: kept", async () => {
+    const { path, branch } = await opened();
+    view(branch, { state: "MERGED" });
+    writeFileSync(join(path, "later.txt"), "later\n");
+    expect((await gitCommit({ path, intent: "Later.", title: "feat: later" }, deps())).ok).toBe(true);
+    await once();
+    expect(existsSync(path)).toBe(true);
+    expect(texts()[0]).toContain("commits that are not in the PR: 1 on the worktree");
+  });
+
   test("merged with work in progress: the workspace is kept", async () => {
     const { path, branch } = await opened();
     writeFileSync(join(path, "later.txt"), "later\n");

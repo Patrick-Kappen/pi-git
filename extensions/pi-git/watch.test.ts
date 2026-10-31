@@ -194,6 +194,45 @@ describe("tick", () => {
     expect(saved()).toBeUndefined();
   });
 
+  test("merged, then a commit on the branch: the worktree and the branch are kept", async () => {
+    view({ state: "MERGED" });
+    writeFileSync(join(entry.worktree, "later.txt"), "later\n");
+    sh(entry.worktree, "add", "-A");
+    sh(entry.worktree, "commit", "-q", "-m", "later");
+    sh(entry.worktree, "push", "-q", "origin", entry.branch);
+    await once();
+    expect(existsSync(entry.worktree)).toBe(true);
+    expect(sh(main, "branch", "--list", entry.branch)).toContain(entry.branch);
+    expect(texts()[0]).toMatch(
+      /is merged, but the branch feat\/t\d+ has commits that are not in the PR: 1 on the worktree \(\w{8}\), 1 on GitHub \(\w{8}\)\. The worktree .* and the branch are kept/,
+    );
+    expect(readFileSync(ghLog, "utf8")).not.toContain("api -X DELETE");
+    expect(
+      listAttention(config.stateDir)
+        .map((item) => item.text)
+        .join("\n"),
+    ).toContain("not in the PR");
+  });
+
+  test("merged, and a commit only on GitHub: kept", async () => {
+    view({ state: "MERGED" });
+    writeFileSync(join(entry.worktree, "later.txt"), "later\n");
+    sh(entry.worktree, "add", "-A");
+    sh(entry.worktree, "commit", "-q", "-m", "later");
+    sh(entry.worktree, "push", "-q", "origin", entry.branch);
+    sh(entry.worktree, "reset", "-q", "--hard", "HEAD~1");
+    await once();
+    expect(existsSync(entry.worktree)).toBe(true);
+    expect(texts()[0]).toContain("commits that are not in the PR: 1 on GitHub");
+  });
+
+  test("merged, the PR's head cannot be fetched: kept", async () => {
+    view({ state: "MERGED", headRefOid: "0123456789abcdef0123456789abcdef01234567" });
+    await once();
+    expect(existsSync(entry.worktree)).toBe(true);
+    expect(texts()[0]).toContain("the PR's head 01234567 could not be fetched to compare");
+  });
+
   test("merged with uncommitted changes: the worktree is kept", async () => {
     writeFileSync(join(entry.worktree, "wip.txt"), "wip\n");
     view({ state: "MERGED" });

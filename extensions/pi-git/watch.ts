@@ -207,7 +207,7 @@ class Watch {
       return this.save();
     }
     this.entry.errors = 0;
-    if (pr.state === "MERGED") return this.merged();
+    if (pr.state === "MERGED") return this.merged(pr.headRefOid);
     if (pr.state === "CLOSED")
       return this.finish("closed", "was closed without merging; the worktree and the branch are kept.");
     if (!existsSync(this.entry.worktree))
@@ -262,7 +262,31 @@ class Watch {
   }
 
   /** After the merge: remove the worktree and the local branch, when the worktree is clean. */
-  private async merged(): Promise<void> {
+  /**
+   * Commits of the branch that the merged PR does not have: on the worktree's branch (pushed after
+   * the merge, or never pushed) or on GitHub. The text says where; undefined when there are none.
+   */
+  private async unmerged(head: string): Promise<string | undefined> {
+    const { branch, number } = this.entry;
+    const known = async () => (await this.git(["cat-file", "-e", `${head}^{commit}`])).code === 0;
+    if (!(await known())) await this.git(["fetch", "origin", `pull/${number}/head`]);
+    if (!(await known())) return `the PR's head ${head.slice(0, 8)} could not be fetched to compare`;
+    await this.git(["fetch", "origin", branch]);
+    const tips: Array<[string, string]> = [
+      [this.jj ? `refs/heads/${branch}` : "HEAD", "the worktree"],
+      [`refs/remotes/origin/${branch}`, "GitHub"],
+    ];
+    const found: string[] = [];
+    for (const [ref, where] of tips) {
+      const tip = await this.gitText("rev-parse", "--verify", "-q", ref);
+      if (tip === "" || (await this.git(["merge-base", "--is-ancestor", tip, head])).code === 0) continue;
+      const count = await this.gitText("rev-list", "--count", `${head}..${tip}`);
+      found.push(`${count} on ${where} (${tip.slice(0, 8)})`);
+    }
+    return found.length > 0 ? `commits that are not in the PR: ${found.join(", ")}` : undefined;
+  }
+
+  private async merged(head: string): Promise<void> {
     const { worktree, mainRoot, branch } = this.entry;
     if (!existsSync(worktree)) return this.finish("merged", `is merged. The worktree was already gone.`);
     if (this.locked("worktree")) {
@@ -273,6 +297,12 @@ class Watch {
     }
     if (await this.dirty()) {
       return this.finish("merged", `is merged. The worktree ${worktree} has uncommitted changes, so it is kept.`);
+    }
+    const extra = await this.unmerged(head);
+    if (extra) {
+      const text = `is merged, but the branch ${branch} has ${extra}. The worktree ${worktree} and the branch are kept: open a new PR for them.`;
+      // Work would be lost: this needs the user, like a failure.
+      return this.finish("failed", text);
     }
     const failure = await this.removeWorktree();
     const remote = await this.deleteRemoteBranch();
