@@ -1,0 +1,275 @@
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { type Config, defaults } from "./config.ts";
+import { type Runner, run } from "./exec.ts";
+import { gitPr, type PrInput } from "./pr.ts";
+
+const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-git-pr-")));
+const origin = join(root, "origin.git");
+const main = join(root, "main");
+const hooks = join(root, "hooks");
+const bin = join(root, "bin");
+const ghLog = join(root, "gh.log");
+const helperLog = join(root, "helper.log");
+
+function sh(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function script(path: string, text: string): string {
+  writeFileSync(path, `#!/bin/sh\n${text}`);
+  chmodSync(path, 0o755);
+  return path;
+}
+
+beforeAll(() => {
+  // Only this test's git config: no variables of a calling hook, no global hooks, a fixed identity.
+  for (const key of Object.keys(process.env)) if (key.startsWith("GIT_")) delete process.env[key];
+  const gitconfig = join(root, "gitconfig");
+  writeFileSync(gitconfig, "[user]\n\tname = t\n\temail = t@t\n[init]\n\tdefaultBranch = main\n");
+  process.env.GIT_CONFIG_GLOBAL = gitconfig;
+  process.env.GIT_CONFIG_NOSYSTEM = "1";
+
+  mkdirSync(hooks);
+  mkdirSync(bin);
+  script(
+    join(hooks, "pre-commit"),
+    'if git diff --cached | grep -q BAD; then echo "lint: BAD found" >&2; exit 1; fi\n',
+  );
+  script(
+    join(hooks, "commit-msg"),
+    'head -1 "$1" | grep -q "^feat: " || { echo "commit-msg: use feat: <subject>" >&2; exit 1; }\n',
+  );
+  script(
+    join(hooks, "pre-push"),
+    'if grep -q FAIL push.txt 2>/dev/null; then echo "check: push.txt says FAIL" >&2; exit 1; fi\n',
+  );
+
+  // The helper: answers by task, fixes by stage, and logs each call.
+  script(
+    join(bin, "pi"),
+    `for last; do :; done
+input=$(cat)
+echo "$PI_GIT_HELPER|$last" | head -1 >> "${helperLog}"
+case "$PI_GIT_HELPER" in
+  fix)
+    case "$input" in
+      *CANTFIX*) echo "CANNOT FIX: the intent forbids it" ;;
+      *"pre-commit checks"*) sed -i 's/BAD/GOOD/' bad.txt; echo "Replaced BAD with GOOD in bad.txt." ;;
+      *"pre-push checks"*) echo OK > push.txt; echo "Set push.txt to OK." ;;
+    esac ;;
+  answer)
+    case "$input$last" in
+      *BADMSG*) echo '{"subject": "nope", "body": ""}' ;;
+      *"commit-msg hook rejected"*) echo '{"subject": "feat: add the thing", "body": "Needed for the test."}' ;;
+      *"commit message"*) echo 'Here: {"subject": "add the thing", "body": ""}' ;;
+      *"pull request"*) printf '\`\`\`json\\n{"title": "feat: add the thing", "body": "## What\\\\nThe thing."}\\n\`\`\`\\n' ;;
+    esac ;;
+esac
+`,
+  );
+  // gh: no open PR unless gh.pr says so; pr create prints a URL.
+  script(
+    join(bin, "gh"),
+    `echo "$*" >> "${ghLog}"
+case "$1 $2" in
+  "pr view") if [ -f "${root}/gh.pr" ]; then cat "${root}/gh.pr"; else exit 1; fi ;;
+  "pr create") if [ -f "${root}/gh.fail" ]; then echo "create refused" >&2; exit 1; fi; echo "https://github.com/owner/repo/pull/7" ;;
+  "pr edit") if [ -f "${root}/gh.fail" ]; then echo "edit refused" >&2; exit 1; fi ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+
+  execFileSync("git", ["init", "-q", "--bare", origin]);
+  execFileSync("git", ["clone", "-q", origin, main]);
+  writeFileSync(join(main, "README.md"), "# repo\n");
+  sh(main, "add", "-A");
+  sh(main, "commit", "-q", "-m", "feat: start");
+  sh(main, "push", "-q", "origin", "main");
+  sh(main, "remote", "set-head", "origin", "main");
+  sh(main, "config", "core.hooksPath", hooks);
+});
+
+let config: Config;
+let worktree: string;
+let counter = 0;
+const steps: string[] = [];
+const runner: Runner = (command, args, options) => run(command === "gh" ? join(bin, "gh") : command, args, options);
+
+beforeEach(() => {
+  counter++;
+  worktree = join(root, "worktrees", `topic-${counter}`);
+  sh(main, "worktree", "add", "-q", "-b", `feat/topic-${counter}`, worktree, "origin/main");
+  config = { ...defaults(join(root, "pi-git.json"), {}, root), pi: join(bin, "pi"), attempts: 2 };
+  writeFileSync(ghLog, "");
+  writeFileSync(helperLog, "");
+  writeFileSync(join(root, "gh.pr"), "");
+  execFileSync("rm", ["-f", join(root, "gh.pr"), join(root, "gh.fail")]);
+  steps.length = 0;
+});
+
+const pr = (input: Partial<PrInput> = {}) =>
+  gitPr(
+    { path: worktree, intent: "Add the thing.", ...input },
+    { run: runner, config, progress: (step) => steps.push(step) },
+  );
+
+describe("gitPr", () => {
+  test("fixes the checks, writes message and PR, pushes and opens the PR", async () => {
+    writeFileSync(join(worktree, "bad.txt"), "BAD\n");
+    writeFileSync(join(worktree, "push.txt"), "FAIL\n");
+    const result = await pr();
+
+    expect(result.summary).toContain("Opened PR #7: https://github.com/owner/repo/pull/7");
+    expect(result.ok).toBe(true);
+    expect(result.pr).toEqual({ number: 7, url: "https://github.com/owner/repo/pull/7", created: true });
+    expect(result.commit?.subject).toBe("feat: add the thing");
+    expect(result.notes).toEqual(["pre-commit: Replaced BAD with GOOD in bad.txt.", "pre-push: Set push.txt to OK."]);
+
+    // One commit, amended with the pre-push fix, on GitHub.
+    const branch = `feat/topic-${counter}`;
+    expect(sh(origin, "log", "--format=%s", `main..${branch}`)).toBe("feat: add the thing");
+    expect(sh(origin, "show", `${branch}:bad.txt`)).toBe("GOOD");
+    expect(sh(origin, "show", `${branch}:push.txt`)).toBe("OK");
+    expect(sh(origin, "log", "-1", "--format=%b", branch)).toBe("Needed for the test.");
+
+    const gh = readFileSync(ghLog, "utf8");
+    expect(gh).toContain(`pr create --base main --head ${branch} --title feat: add the thing --body-file`);
+    expect(steps).toContain("pre-commit: checks fail; the helper fixes them (attempt 1/2)");
+    const helper = readFileSync(helperLog, "utf8");
+    expect(helper).toMatch(/^fix\|/m);
+    expect(helper).toMatch(/^answer\|/m);
+  });
+
+  test("a draft PR", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await pr({ draft: true });
+    expect(result.summary).toContain("Opened PR #7 (draft)");
+    expect(readFileSync(ghLog, "utf8")).toMatch(/--draft/);
+  });
+
+  test("updates the open PR instead of opening one", async () => {
+    writeFileSync(
+      join(root, "gh.pr"),
+      JSON.stringify({ number: 3, url: "https://x/pull/3", title: "t", body: "b", baseRefName: "main", state: "OPEN" }),
+    );
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await pr();
+    expect(result.summary).toContain("Updated PR #3: https://x/pull/3");
+    expect(readFileSync(ghLog, "utf8")).toContain("pr edit 3 --title feat: add the thing --body-file");
+  });
+
+  test("pushes commits that are already there", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: by hand");
+    const result = await pr();
+    expect(result.ok).toBe(true);
+    expect(result.commit).toBeUndefined();
+    expect(result.summary).toContain(`Pushed feat/topic-${counter}; the local checks passed.`);
+  });
+
+  test("rebases on commits that appeared on GitHub", async () => {
+    const branch = `feat/topic-${counter}`;
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: first");
+    sh(worktree, "push", "-q", "-u", "origin", branch);
+    // Someone (the watcher) adds a commit on GitHub.
+    const other = join(root, `other-${counter}`);
+    execFileSync("git", ["clone", "-q", "-b", branch, origin, other]);
+    writeFileSync(join(other, "b.txt"), "b\n");
+    sh(other, "add", "-A");
+    sh(other, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "feat: remote");
+    sh(other, "push", "-q");
+
+    writeFileSync(join(worktree, "c.txt"), "c\n");
+    const result = await pr();
+    expect(result.ok).toBe(true);
+    expect(steps).toContain("the branch on GitHub moved; rebasing on it");
+    expect(sh(origin, "log", "--format=%s", `main..${branch}`).split("\n")).toEqual([
+      "feat: add the thing",
+      "feat: remote",
+      "feat: first",
+    ]);
+  });
+
+  test("stops when the helper cannot fix, with the changes staged", async () => {
+    writeFileSync(join(worktree, "bad.txt"), "BAD\n");
+    const result = await pr({ intent: "CANTFIX on purpose." });
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/^git_pr stopped: The pre-commit checks still fail:/);
+    expect(result.summary).toContain("CANNOT FIX: the intent forbids it");
+    expect(result.summary).toContain("nothing was pushed");
+    expect(sh(worktree, "diff", "--cached", "--name-only")).toBe("bad.txt");
+  });
+
+  test("nothing to do", async () => {
+    const result = await pr();
+    expect(result.summary).toMatch(/nothing to do: no changes/);
+  });
+
+  test("refuses the main checkout and a detached HEAD", async () => {
+    expect((await pr({ path: main })).summary).toContain("is the main checkout. Work in a worktree");
+    sh(worktree, "switch", "-q", "--detach");
+    expect((await pr()).summary).toContain("has a detached HEAD");
+    expect((await pr({ path: root })).summary).toContain("is not in a git repository");
+  });
+
+  test("an unknown base cannot be fetched", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    expect((await pr({ base: "nope" })).summary).toContain("git fetch origin nope failed");
+  });
+  test("stops when every commit message is rejected", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await pr({ intent: "BADMSG" });
+    expect(result.summary).toContain("No commit message: the commit-msg hook rejected every message the helper wrote");
+  });
+
+  test("a fix after the commit is on GitHub becomes a new commit", async () => {
+    const branch = `feat/topic-${counter}`;
+    writeFileSync(join(worktree, "push.txt"), "FAIL\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: by hand");
+    sh(worktree, "-c", "core.hooksPath=/dev/null", "push", "-q", "origin", `HEAD:refs/heads/backup-${counter}`);
+    const result = await pr();
+    expect(result.ok).toBe(true);
+    expect(sh(origin, "log", "--format=%s", `main..${branch}`).split("\n")).toEqual([
+      "feat: add the thing",
+      "feat: by hand",
+    ]);
+  });
+
+  test("stops when the branch on GitHub conflicts", async () => {
+    const branch = `feat/topic-${counter}`;
+    writeFileSync(join(worktree, "a.txt"), "mine\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: mine");
+    const other = join(root, `other-${counter}`);
+    execFileSync("git", ["clone", "-q", origin, other]);
+    sh(other, "switch", "-q", "-c", branch);
+    writeFileSync(join(other, "a.txt"), "theirs\n");
+    sh(other, "add", "-A");
+    sh(other, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "feat: theirs");
+    sh(other, "push", "-q", "origin", branch);
+    const result = await pr();
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("The branch on GitHub has commits that conflict with this worktree.");
+    expect(sh(worktree, "status", "--porcelain")).toBe("");
+  });
+
+  test("reports gh failures", async () => {
+    writeFileSync(join(root, "gh.fail"), "");
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    expect((await pr()).summary).toContain("gh pr create failed:\ncreate refused");
+    writeFileSync(
+      join(root, "gh.pr"),
+      JSON.stringify({ number: 3, url: "u", title: "t", body: "b", baseRefName: "main", state: "OPEN" }),
+    );
+    expect((await pr()).summary).toContain("gh pr edit failed:\nedit refused");
+  });
+});

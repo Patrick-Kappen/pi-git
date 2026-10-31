@@ -16,6 +16,6 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "*.ts"],
+  "include": ["extensions/**/*.ts", "test/**/*.ts", "*.ts"],
   "exclude": ["node_modules", ".devenv", "coverage"]
 }
