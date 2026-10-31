@@ -113,7 +113,7 @@ adds it to the context for your next prompt, `notify` only shows it to you.
 |---|---|
 | `topic` | Short, lower case with hyphens: the worktree directory and the branch name. |
 | `type` | `feat` (default), `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore` or `perf`. |
-| `base` | The base branch; default: the default branch. For a stacked change, the branch it builds on. |
+| `base` | The base branch; default: the default branch. For a stacked change, the branch it builds on: `origin/<base>` after the fetch, or the local branch of another worktree when it is not on GitHub yet. |
 | `repo` | The repository: a directory in it, `owner/name`, or `name` (found in `~/private`, `~/work`, `~/src`, `~/code` or `~`); default: the working directory. |
 | `setup` | Run the setup; default: `true`. |
 
@@ -122,7 +122,7 @@ It fetches, then adds the worktree `<worktrees>/<repo>/<topic>` on `<type>/<topi
 runs the setup: `devenv shell -- true` with a `devenv.nix`, else `npm ci --ignore-scripts` or
 `uv sync`. It returns the path and what to know before the change: the default branch, the commit
 style with recent subjects, the check command, a PR template or CONTRIBUTING.md to read, and the
-other worktrees of the repository. A failing setup is reported, not fatal. It follows the
+other worktrees of the repository. A failing setup is reported, not fatal. For a worktree that exists already on that branch, it says how many commits it is behind `origin/<base>`. It follows the
 `worktree` step of the lock of that repository; `/git worktree <topic> [type]` does it once as your
 own action.
 

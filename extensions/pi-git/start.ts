@@ -147,6 +147,8 @@ interface Plan {
   base: string;
   defaultName: string;
   resume: boolean;
+  /** What the branch starts from: `origin/<base>`, or the local branch `<base>` (a worktree not pushed yet). */
+  from: string;
 }
 
 /** Everything git_start needs before it adds the worktree, or why it cannot. */
@@ -159,41 +161,64 @@ async function plan(input: StartInput, deps: StartDeps): Promise<Plan | StartRes
   const slug = repoSlug(origin);
   const branch = `${input.type ?? "feat"}/${input.topic}`;
   const path = join(expand(deps.config.worktrees, deps.home), repoName(origin), input.topic);
-  if (existsSync(path)) {
-    const current = await git(deps, path, "symbolic-ref", "--short", "-q", "HEAD");
-    if (current === branch)
-      return { ok: true, summary: `The worktree already exists: ${path} (${branch})`, path, branch, slug };
-    return { ok: false, summary: `${path} exists${current ? ` on ${current}` : ""}; pick another topic` };
-  }
   deps.progress("fetch origin");
   const fetched = await deps.run("git", ["fetch", "origin", "--prune"], { cwd: main, env: OWN, signal: deps.signal });
   if (fetched.code !== 0) return { ok: false, summary: `git fetch failed:\n${clipStart(outputOf(fetched), 600)}` };
   const defaultName = await defaultBranch(deps.run, main);
+  if (existsSync(path)) return existing(deps, path, branch, slug, input.base ?? defaultName);
   const base = input.base ?? defaultName;
-  if (!(await git(deps, main, "rev-parse", "--verify", "-q", `origin/${base}`))) {
-    return { ok: false, summary: `origin/${base} does not exist` };
-  }
+  const from = await startPoint(deps, main, base);
+  if (!from) return { ok: false, summary: `neither origin/${base} nor a local branch ${base} exists` };
   if (await git(deps, main, "rev-parse", "--verify", "-q", `refs/heads/${branch}`)) {
     return { ok: false, summary: `the branch ${branch} exists already; pick another topic, or remove the old branch` };
   }
   const resume = (await git(deps, main, "rev-parse", "--verify", "-q", `origin/${branch}`)) !== undefined;
-  return { main, slug, branch, path, base, defaultName, resume };
+  return { main, slug, branch, path, base, defaultName, resume, from };
+}
+
+/**
+ * Where a new branch starts: the freshly fetched `origin/<base>`, or, for a change stacked on work
+ * that is not on GitHub yet, the local branch `<base>` of another worktree.
+ */
+async function startPoint(deps: StartDeps, main: string, base: string): Promise<string | undefined> {
+  if (await git(deps, main, "rev-parse", "--verify", "-q", `refs/remotes/origin/${base}`)) return `origin/${base}`;
+  if (await git(deps, main, "rev-parse", "--verify", "-q", `refs/heads/${base}`)) return base;
+  return undefined;
+}
+
+/** A worktree that exists already on the branch: hand it back, and say when it is behind its base. */
+async function existing(
+  deps: StartDeps,
+  path: string,
+  branch: string,
+  slug: string,
+  base: string,
+): Promise<StartResult> {
+  const current = await git(deps, path, "symbolic-ref", "--short", "-q", "HEAD");
+  if (current !== branch)
+    return { ok: false, summary: `${path} exists${current ? ` on ${current}` : ""}; pick another topic` };
+  const behind = Number((await git(deps, path, "rev-list", "--count", `HEAD..origin/${base}`)) ?? 0);
+  const note = behind > 0 ? `; it is ${behind} commits behind origin/${base}: rebase on it before more work` : "";
+  return { ok: true, summary: `The worktree already exists: ${path} (${branch})${note}`, path, branch, slug };
 }
 
 /** Creates the worktree of a new change: fetch, worktree and branch from the fresh base, setup. */
 export async function gitStart(input: StartInput, deps: StartDeps): Promise<StartResult> {
   const planned = await plan(input, deps);
   if ("ok" in planned) return planned;
-  const { main, slug, branch, path, base, defaultName, resume } = planned;
+  const { main, slug, branch, path, base, defaultName, resume, from } = planned;
   const args = resume
     ? ["worktree", "add", "--track", "-b", branch, path, `origin/${branch}`]
-    : ["worktree", "add", "--no-track", "-b", branch, path, `origin/${base}`];
-  deps.progress(resume ? `worktree on the existing origin/${branch}` : `worktree from origin/${base}`);
+    : ["worktree", "add", "--no-track", "-b", branch, path, from];
+  deps.progress(resume ? `worktree on the existing origin/${branch}` : `worktree from ${from}`);
   const added = await deps.run("git", args, { cwd: main, env: OWN, signal: deps.signal });
   if (added.code !== 0) return { ok: false, summary: `git worktree add failed:\n${clipStart(outputOf(added), 600)}` };
   const lines = [
     `Worktree: ${path}`,
-    `Branch: ${branch}${resume ? ` (continues origin/${branch})` : ` from origin/${base}`}`,
+    `Branch: ${branch}${resume ? ` (continues origin/${branch})` : ` from ${from}`}`,
+    ...(from === base
+      ? [`Stacked on the local branch ${base}, which is not on GitHub yet: push it (or open its PR) before this PR.`]
+      : []),
     ...(input.setup === false ? [] : [await setup(deps, path)]),
     ...(await facts(deps, path, main, base, defaultName)),
   ];

@@ -92,12 +92,35 @@ describe("gitStart", () => {
   test.each([
     [{ type: "feature" }, /type must be one of/],
     [{ topic: "Bad Topic" }, /topic: lower case/],
-    [{ base: "nope" }, /origin\/nope does not exist/],
+    [{ base: "nope" }, /neither origin\/nope nor a local branch nope exists/],
     [{ repo: "missing" }, /no main checkout/],
   ])("%j is refused", async (input, message) => {
     const result = await start({ topic: "refused", setup: false, ...input });
     expect(result.ok).toBe(false);
     expect(result.summary).toMatch(message);
+  });
+
+  test("a change stacked on a worktree that is not on GitHub starts from its local branch", async () => {
+    const first = await start({ topic: "local-base", setup: false });
+    writeFileSync(join(first.path ?? "", "base.txt"), "base\n");
+    g(first.path ?? "", "add", ".");
+    g(first.path ?? "", "commit", "-q", "-m", "feat: local base");
+    const result = await start({ topic: "on-local", base: "feat/local-base", setup: false });
+    expect(result.summary).toContain("Branch: feat/on-local from feat/local-base");
+    expect(result.summary).toContain("Stacked on the local branch feat/local-base, which is not on GitHub yet");
+    expect(g(result.path ?? "", "log", "--format=%s", "-1")).toBe("feat: local base");
+  });
+
+  test("an existing worktree that is behind its base says so", async () => {
+    const first = await start({ topic: "behind", setup: false });
+    writeFileSync(join(main, "new.txt"), "new\n");
+    g(main, "add", ".");
+    g(main, "commit", "-q", "-m", "feat: moved on");
+    g(main, "push", "-q");
+    const again = await start({ topic: "behind", setup: false });
+    expect(again.summary).toBe(
+      `The worktree already exists: ${first.path} (feat/behind); it is 1 commits behind origin/main: rebase on it before more work`,
+    );
   });
 
   test("an existing local branch is refused", async () => {

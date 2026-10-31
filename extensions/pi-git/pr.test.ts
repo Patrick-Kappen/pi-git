@@ -29,6 +29,8 @@ function script(path: string, text: string): string {
 beforeAll(() => {
   // Only this test's git config: no variables of a calling hook, no global hooks, a fixed identity.
   for (const key of Object.keys(process.env)) if (key.startsWith("GIT_")) delete process.env[key];
+  // A pi-git switch belongs to the invoking session, not these temporary test repositories.
+  delete process.env.PI_GIT_SWITCH;
   const gitconfig = join(root, "gitconfig");
   writeFileSync(gitconfig, "[user]\n\tname = t\n\temail = t@t\n[init]\n\tdefaultBranch = main\n");
   process.env.GIT_CONFIG_GLOBAL = gitconfig;
