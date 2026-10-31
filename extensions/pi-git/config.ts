@@ -40,6 +40,9 @@ export interface Config {
   shipNixos: string | undefined;
   /** /ship: the host whose deploy check (`deploy-<host>`) confirms the ship. */
   shipHost: string;
+  /** /ship: the model and thinking level of the agent that decides the releases. */
+  shipModel: string;
+  shipThinking: string;
   errors: string[];
 }
 
@@ -82,6 +85,8 @@ export function defaults(path: string, env: NodeJS.ProcessEnv, home: string): Co
       : join(state, "pi-git", "run"),
     shipNixos: undefined,
     shipHost: hostname(),
+    shipModel: "openai-codex/gpt-6-luna",
+    shipThinking: "medium",
     errors: [],
   };
 }
@@ -90,7 +95,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-type Field = "model" | "thinking" | "skill" | "pi" | "worktrees" | "stateDir" | "runtimeDir" | "shipNixos" | "shipHost";
+type Field =
+  | "model"
+  | "thinking"
+  | "skill"
+  | "pi"
+  | "worktrees"
+  | "stateDir"
+  | "runtimeDir"
+  | "shipNixos"
+  | "shipHost"
+  | "shipModel"
+  | "shipThinking";
 const STRINGS: readonly Field[] = [
   "model",
   "thinking",
@@ -101,6 +117,8 @@ const STRINGS: readonly Field[] = [
   "runtimeDir",
   "shipNixos",
   "shipHost",
+  "shipModel",
+  "shipThinking",
 ];
 const PATHS: ReadonlySet<Field> = new Set(["skill", "worktrees", "stateDir", "runtimeDir", "shipNixos"]);
 const NUMBERS = ["attempts", "checkTimeout", "helperTimeout"] as const;

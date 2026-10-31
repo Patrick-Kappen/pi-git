@@ -185,6 +185,16 @@ in
         example = "gaia";
         description = "The host whose deploy check (deploy-<host>) confirms a ship; default: this machine's host name.";
       };
+      model = lib.mkOption {
+        type = lib.types.str;
+        default = "openai-codex/gpt-6-luna";
+        description = "The model of the agent that decides /ship's releases for changes without feat or fix.";
+      };
+      thinking = lib.mkOption {
+        type = lib.types.str;
+        default = "medium";
+        description = "The thinking level of that agent.";
+      };
     };
 
     watcher = {
@@ -267,6 +277,10 @@ in
         // lib.optionalAttrs (cfg.skill != null) { skill = "${cfg.skill}"; }
         // lib.optionalAttrs (cfg.ship.nixos != null) { shipNixos = cfg.ship.nixos; }
         // lib.optionalAttrs (cfg.ship.host != null) { shipHost = cfg.ship.host; }
+        // {
+          shipModel = cfg.ship.model;
+          shipThinking = cfg.ship.thinking;
+        }
       );
     };
   };

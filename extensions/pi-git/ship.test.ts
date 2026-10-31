@@ -20,7 +20,7 @@ import {
   shipLines,
   shipTick,
 } from "./ship.ts";
-import { type Entry, entryId, removeEntry, saveEntry } from "./state.ts";
+import { type Entry, entryId, loadSummaries, removeEntry, saveEntry } from "./state.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-git-ship-")));
 const nixos = join(root, "nixos");
@@ -157,7 +157,8 @@ const watchPr = vi.fn(async (repo: string, number: number) => {
   saveEntry(config.stateDir, { id: entryId(repo, number), repo, number } as Entry);
   return undefined;
 });
-const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr });
+// One pass per tick, so each test can look at every step; "a round keeps going" tests the default.
+const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr }, 1);
 
 beforeEach(() => {
   n++;
@@ -259,7 +260,7 @@ describe("index", () => {
 });
 
 async function plan(releases: string[]): Promise<Ship> {
-  const ship = createShip(await indexShip(fake, nixos), releases, "gaia", clock);
+  const ship = { ...createShip(await indexShip(fake, nixos), releases, "gaia", clock), sessionId: "s-ship" };
   saveShip(config.stateDir, ship);
   return ship;
 }
@@ -268,8 +269,10 @@ describe("shipTick", () => {
   test("the whole chain: merge, release, lock, merge, deploy", async () => {
     await plan(["o/pi-git"]);
     let ship = await tick();
-    // pi-git merged #1; pi-skills (behind only) is done at once; NixOS waits for the libraries.
-    expect(world.merged).toContain("o/pi-git#1");
+    // At the same time: pi-git merged #1, pi-skills (behind only) is done, and NixOS merged its own
+    // #5 with a merge commit (its setting) without waiting for the libraries.
+    expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5"]);
+    expect(calls).toContain("gh pr merge 5 -R o/Nixos --merge --match-head-commit sha5");
     expect(ship?.libs.map((lib) => lib.state)).toEqual(["release", "done"]);
     expect(ship?.nixos.state).toBe("libs");
 
@@ -285,12 +288,9 @@ describe("shipTick", () => {
     world.tags["o/pi-git@v0.3.0"] = "new-git";
     world.latest["o/pi-git"] = "new-git";
     ship = await tick();
-    // pi-git done; NixOS merges #5 with a merge commit (its setting), then opens the flake.lock PR.
+    // pi-git done; NixOS locks the releases.
     expect(ship?.libs[0]?.state).toBe("done");
-    expect(ship?.nixos).toMatchObject({ state: "merge", inputs: ["pi-git", "pi-skills"] });
-    ship = await tick();
-    expect(calls).toContain("gh pr merge 5 -R o/Nixos --merge --match-head-commit sha5");
-    expect(ship?.nixos.state).toBe("update");
+    expect(ship?.nixos).toMatchObject({ state: "update", inputs: ["pi-git", "pi-skills"] });
 
     ship = await tick();
     expect(calls.some((line) => line === "nix flake update pi-git pi-skills")).toBe(true);
@@ -313,11 +313,27 @@ describe("shipTick", () => {
     ship = await tick();
     expect(ship).toMatchObject({ status: "done", nixos: { state: "done" } });
     expect(existsSync(ship?.nixos.worktree ?? "x")).toBe(false);
+    // The end goes into the history of the session that started the ship, once and quietly.
+    expect(loadSummaries(config.stateDir).map((item) => [item.status, item.sessionId, item.text])).toEqual([
+      ["merged", "s-ship", "pi-git ship: done. Released o/pi-git v0.3.0. Deployed on gaia."],
+    ]);
     expect(shipLines(ship as Ship)).toEqual(["o/pi-git: done v0.3.0", "o/pi-skills: done", "o/Nixos: done PR #77"]);
     // A finished ship does nothing more.
     calls.length = 0;
     await tick();
     expect(calls).toEqual([]);
+  });
+
+  test("a round keeps going while something moves: from merge to the flake.lock PR in one round", async () => {
+    world.releaseRun = { status: "completed", conclusion: "success" };
+    world.tags["o/pi-git@v0.3.0"] = "new-git";
+    world.latest["o/pi-git"] = "new-git";
+    await plan(["o/pi-git"]);
+    const ship = await shipTick({ run: fake, config, gitPr, now: () => clock, watchPr });
+    expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5", "o/pi-git#9"]);
+    expect(ship?.libs[0]).toMatchObject({ state: "done", tag: "v0.3.0" });
+    // It stops where it has to wait: the checks of the flake.lock PR.
+    expect(ship?.nixos).toMatchObject({ state: "check", pr: 77 });
   });
 
   test("a failing release workflow: that library needs you, the rest goes on", async () => {
@@ -329,8 +345,11 @@ describe("shipTick", () => {
     expect(listAttention(config.stateDir).map((item) => item.text)).toEqual([
       "pi-git ship: o/pi-git needs you: the release workflow ended with failure",
     ]);
+    expect(loadSummaries(config.stateDir).map((item) => [item.status, item.text])).toEqual([
+      ["failed", "pi-git ship: o/pi-git needs you: the release workflow ended with failure"],
+    ]);
     // NixOS continues with pi-skills only.
-    expect(ship?.nixos).toMatchObject({ state: "merge", inputs: ["pi-skills"] });
+    expect(ship?.nixos).toMatchObject({ state: "update", inputs: ["pi-skills"] });
   });
 
   test("waiting longer than the stage timeout fails the stage", async () => {
@@ -346,8 +365,8 @@ describe("shipTick", () => {
     world.latest = { "o/pi-git": "old-git", "o/pi-skills": "skills-latest" };
     await plan([]);
     let ship = await tick();
-    // Only NixOS #5: merged, then the deploy of its merge commit.
-    expect(ship?.nixos.state).toBe("merge");
+    // Only NixOS #5: merged at once, then the deploy of its merge commit.
+    expect(ship?.nixos.state).toBe("libs");
     ship = await tick();
     expect(ship?.nixos).toMatchObject({ state: "deploy", mergeSha: "merge-5" });
     world.deploy = { name: "x deploy-gaia", status: "completed", conclusion: "failure" };
@@ -380,7 +399,7 @@ describe("shipTick", () => {
     // Merging #1 makes #4 conflict: the watcher gets it, the ship waits.
     world.prs["o/pi-git"] = [pr(1, "feat: one"), pr(4, "feat: two", { mergeable: "CONFLICTING" })];
     let ship = await tick();
-    expect(world.merged).toEqual(["o/pi-git#1"]);
+    expect(world.merged).toEqual(["o/pi-git#1", "o/Nixos#5"]);
     expect(watched).toEqual(["o/pi-git#4"]);
     expect(ship?.libs[0]).toMatchObject({ state: "merge", adopted: [4] });
     // Still conflicting while the watcher works: not handed over twice.
@@ -417,6 +436,170 @@ describe("shipTick", () => {
     expect(calls).toContain("gh pr edit 6 -R o/pi-git --title feat(git): words");
     expect(ship?.libs[0]?.error).toBeUndefined();
     expect(ship?.libs[0]?.state).toBe("release");
+  });
+
+  test("the reviewing agent decides a release for changes without feat or fix, with luna at medium", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    const index = await indexShip(fake, nixos);
+    saveShip(config.stateDir, createShip(index, [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const answers: string[] = [];
+    const reviewer: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        answers.push(args.join(" "));
+        return ok('{"release": true, "pr": 6, "type": "feat", "reason": "the skill text is shipped"}');
+      }
+      if (command === "gh" && args[1] === "view" && args.includes("number,title,body,files"))
+        return ok({ number: 6, title: "docs(git): skill words", files: [{ path: "skills/git/SKILL.md" }] });
+      return fake(command, args, options);
+    };
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(answers[0]).toContain("--model openai-codex/gpt-6-luna --thinking medium");
+    expect(ship?.reviewed).toBe(true);
+    expect(ship?.libs[0]).toMatchObject({ release: true, retitle: [6], retitleType: "feat" });
+    expect(calls).toContain("gh pr edit 6 -R o/pi-git --title feat(git): skill words");
+  });
+
+  test("the reviewing agent says no release: merged, not released", async () => {
+    world.prs["o/pi-git"] = [pr(6, "ci: runner")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const reviewer: Runner = async (command, args, options) =>
+      command === "pi-fake" ? ok('{"release": false, "reason": "only CI"}') : fake(command, args, options);
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+  });
+
+  test("an unusable review answer is retried and does not release when a PR disappeared", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const answers: string[] = [];
+    const logs: string[] = [];
+    const reviewer: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        answers.push(args.join(" "));
+        return ok('{"release": true, "pr": 6, "type": "docs"}');
+      }
+      if (command === "gh" && args[1] === "view" && args.includes("number,title,body,files")) return no;
+      return fake(command, args, options);
+    };
+    const ship = await shipTick({
+      run: reviewer,
+      config,
+      gitPr,
+      now: () => clock,
+      watchPr,
+      log: (text) => logs.push(text),
+    });
+    expect(answers).toHaveLength(2);
+    expect(answers[1]).toContain("previous answer could not be used");
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+    expect(logs[0]).toContain("no release decision");
+  });
+
+  test.each([
+    ["not JSON", "no JSON object in the answer"],
+    ["{}", '"release" must be true or false'],
+    ['{"release":true}', 'a release needs "pr" (a number) and "type" (feat or fix)'],
+  ])("an unusable release decision (%s) is retried, then safely ignored", async (answer, problem) => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const prompts: string[] = [];
+    const reviewer: Runner = async (command, args, options) => {
+      if (command === "pi-fake") {
+        prompts.push(args.at(-1) ?? "");
+        return ok(answer);
+      }
+      return fake(command, args, options);
+    };
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(`previous answer could not be used (${problem})`);
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+  });
+
+  test("a release decision for an unknown PR is ignored, including a non-string reason", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const reviewer: Runner = async (command, args, options) =>
+      command === "pi-fake" ? ok('{"release":true,"pr":999,"type":"fix","reason":2}') : fake(command, args, options);
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+    expect(calls).not.toContain("gh pr edit 6 -R o/pi-git --title fix(git): skill words");
+  });
+
+  test("the reviewing agent can classify a change as a fix", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): skill words")];
+    saveShip(config.stateDir, createShip(await indexShip(fake, nixos), [], "gaia", clock));
+    config = { ...config, pi: "pi-fake" };
+    const reviewer: Runner = async (command, args, options) =>
+      command === "pi-fake"
+        ? ok('{"release":true,"pr":6,"type":"fix","reason":"corrects shipped guidance"}')
+        : fake(command, args, options);
+    const ship = await shipTick({ run: reviewer, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ release: true, retitle: [6], retitleType: "fix" });
+    expect(calls).toContain("gh pr edit 6 -R o/pi-git --title fix(git): skill words");
+  });
+
+  test("a prefixed release version is preserved even when the merge SHA is unavailable", async () => {
+    world.prs["o/pi-git"] = [
+      pr(1, "feat: start"),
+      pr(9, "chore(main): release v0.3.0", { labels: [{ name: "autorelease: pending" }] }),
+    ];
+    await plan(["o/pi-git"]);
+    const commitQueries: string[] = [];
+    const runner: Runner = async (command, args, options) => {
+      if (command === "gh" && args[0] === "api" && args[1] === "repos/o/pi-git/commits/HEAD") return ok("");
+      if (command === "gh" && args[0] === "run") commitQueries.push(args[args.indexOf("--commit") + 1] ?? "missing");
+      return fake(command, args, options);
+    };
+
+    await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+    world.releaseRun = { status: "completed", conclusion: "success" };
+    const ship = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+
+    expect(commitQueries).toContain("");
+    expect(ship?.libs[0]).toMatchObject({ state: "tag", tag: "v0.3.0" });
+  });
+
+  test("a stacked PR is never merged into its base's branch: it waits until GitHub moves it to main", async () => {
+    world.prs["o/pi-git"] = [pr(8, "feat: top", { baseRefName: "feat/base" }), pr(7, "feat: base")];
+    const index = await indexShip(fake, nixos);
+    // Base first, the stacked one after it, with a note.
+    expect(index.libs[0]?.ready.map((item) => [item.number, item.note])).toEqual([
+      [7, undefined],
+      [8, "stacked on feat/base: after it"],
+    ]);
+    saveShip(config.stateDir, createShip(index, [], "gaia", clock));
+    let ship = await tick();
+    expect(world.merged).toEqual(["o/pi-git#7", "o/Nixos#5"]);
+    expect(calls.some((line) => line.startsWith("gh pr merge 8"))).toBe(false);
+    expect(ship?.libs[0]?.state).toBe("merge");
+    // GitHub moved #8 to main after #7 was merged.
+    world.prs["o/pi-git"] = [pr(7, "feat: base"), pr(8, "feat: top", { baseRefName: "main" })];
+    ship = await tick();
+    expect(world.merged).toEqual(["o/pi-git#7", "o/Nixos#5", "o/pi-git#8"]);
+    expect(ship?.libs[0]?.state).toBe("done");
+  });
+
+  test("a merge refused because the branch just moved: wait and try again", async () => {
+    world.prs["o/pi-git"] = [pr(1, "feat: start")];
+    await plan([]);
+    world.fail = ["pr merge 1"];
+    const realFake = fake;
+    const moved: Runner = async (command, args, options) =>
+      command === "gh" && args[1] === "merge"
+        ? { code: 1, stdout: "", stderr: "GraphQL: Head branch was modified. Review and try the merge again." }
+        : realFake(command, args, options);
+    let ship = await shipTick({ run: moved, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ state: "merge" });
+    expect(ship?.libs[0]?.error).toBeUndefined();
+    world.fail = [];
+    ship = await tick();
+    expect(ship?.libs[0]?.state).toBe("done");
   });
 
   test("no release PR after the merges", async () => {
@@ -482,6 +665,28 @@ describe("shipTick", () => {
     world.nixosPr = { ...pr(77, "flake: lock", { mergeable: "CONFLICTING" }), state: "OPEN" };
     gitPr.mockResolvedValueOnce({ ok: false, summary: "rejected", notes: [] } as never);
     expect((await tick())?.nixos.error).toBe("the new flake.lock could not be pushed: rejected");
+  });
+
+  test("status lines include errors for failed libraries and NixOS", () => {
+    const ship: Ship = {
+      id: "x",
+      host: "gaia",
+      status: "running",
+      libs: [
+        {
+          repo: "o/lib",
+          input: "lib",
+          prs: [],
+          release: false,
+          behind: false,
+          state: "failed",
+          since: "",
+          error: "needs review",
+        },
+      ],
+      nixos: { repo: "o/Nixos", root: nixos, prs: [], state: "failed", since: "", error: "CI failed" },
+    };
+    expect(shipLines(ship)).toEqual(["o/lib: failed (needs review)", "o/Nixos: failed (CI failed)"]);
   });
 
   test("nothing running: no ship, nothing done", async () => {

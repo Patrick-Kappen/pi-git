@@ -116,9 +116,10 @@ and looks for summaries every 20 seconds:
 
 Delivered summaries stay in `<stateDir>/delivered` for seven days, then the watcher deletes them.
 
-Each summary goes into the history once. `delivery` decides how: with `turn` (default), a PR that
-needs the agent (the watcher gave up) starts a turn; green, merged and closed PRs are added quietly
-for the next prompt. `message` adds every summary quietly, `notify` only shows it to you.
+Green is only shown to you; it is not done yet. Merged and closed PRs go into the history once,
+quietly, for the next prompt. A PR that needs the agent (the watcher gave up) goes into the history
+and, with `delivery: turn` (default), starts a turn. `message` never starts a turn, `notify` only
+shows everything to you.
 
 ## `git_start`
 
@@ -174,9 +175,10 @@ from open PRs to a deployed host:
    and are shipped when green. Also: waiting release PRs, releases that are not locked yet, and
    changes that lead to no release (no feat or fix). The `flake.lock` is read from GitHub's default
    branch.
-2. **Plan**: a widget lists what ships, what waits or is fixed first, and what does not and why.
-   For each library that would release, you pick Release or Skip; for one whose changes lead to no
-   release, you can make a PR a feat (its title is changed before the merge); then one confirmation.
+2. **No questions**: the plan shows as a widget, and the ship starts. Every library with a feat or fix
+   releases. For a library whose PRs have no feat or fix, an agent (`shipModel`, default
+   `openai-codex/gpt-6-luna` at `medium`) reads the PRs and decides whether users get something new;
+   then /ship gives one PR a feat or fix title before the merge, and it releases.
 3. **Run**: the watcher advances the ship every minute, out of the agents' sight:
    - merges the ready PRs (each when it is green and mergeable, on the head it just checked; a PR
      that conflicts after an earlier merge waits for the watcher's rebase);
@@ -188,10 +190,15 @@ from open PRs to a deployed host:
      makes the lock again on the fresh default branch and force-pushes with a lease, at most 3
      times;
    - waits for the check run `…deploy-<host>` on that merge commit.
-4. **Done** when `deploy-<host>` succeeds: one notification with the released versions.
+4. **Done** when `deploy-<host>` succeeds: one notification with the released versions, and the
+   same text once, quietly, in the history of the session that started the ship. A problem goes there
+   too, as it happens.
 
-A problem (a failing release workflow, a red check, a deploy that fails, or a stage that waits longer
-than 90 minutes) stops only that part, notifies you, and shows in `/git` and the tmux sign; the rest
+Red checks and conflicts are fixed by the helper, also when it is hard; it stops only when the fix
+would change behavior (choosing between behaviors, dropping a feature, changing what a test expects),
+and that PR comes back to you as a notification with the decision. Any problem (that, a failing
+release workflow, a deploy that fails, or a stage that waits longer than 90 minutes) stops only that
+part, notifies you, and shows in `/git` and the tmux sign; the rest
 goes on. `/ship status` shows every part. Settings: `shipNixos` (the configuration's main checkout)
 and `shipHost` (default: this machine's host name).
 

@@ -5,9 +5,10 @@ import { addAttention, notifyTerminals } from "./attention.ts";
 import type { Config } from "./config.ts";
 import { clipStart, outputOf, type Runner } from "./exec.ts";
 import { repoName, repoSlug } from "./git.ts";
+import { askJson } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { findMainCheckout } from "./start.ts";
-import { entryId, loadEntries } from "./state.ts";
+import { addSummary, entryId, loadEntries } from "./state.ts";
 import { gitWatch, worktreeOf } from "./status.ts";
 import { type Check, rollup } from "./watch.ts";
 
@@ -35,6 +36,8 @@ export interface ShipPr {
   url: string;
   /** Not ready yet when indexed: it waits for its checks, or the watcher fixes it first. */
   note?: string;
+  /** The PR's base when it is not the default branch: stacked, merged after its base. */
+  stackedOn?: string;
 }
 
 interface Stage {
@@ -50,8 +53,12 @@ export interface LibItem extends Stage {
   input: string;
   prs: ShipPr[];
   release: boolean;
-  /** PRs whose title becomes a feat, so their merge leads to a release (the owner chose it). */
+  /** PRs whose title gets a releasing type, so their merge leads to a release. */
   retitle?: number[];
+  /** The type for `retitle`: feat or fix, as the reviewing agent decided. */
+  retitleType?: "feat" | "fix";
+  /** PRs without a feat or fix: the reviewing agent decides whether they release. */
+  review?: number[];
   /** PRs handed to the watcher to fix (red checks, conflicts). */
   adopted?: number[];
   /** Whether the input needs a new lock even without a release here (an earlier release is not locked). */
@@ -81,6 +88,10 @@ export interface Ship {
   id: string;
   host: string;
   status: "running" | "done";
+  /** The pi session that started the ship: its agent gets the result in the history. */
+  sessionId?: string;
+  /** The reviewing agent decided the releases of the libraries in `review`. */
+  reviewed?: boolean;
   libs: LibItem[];
   nixos: NixItem;
 }
@@ -124,9 +135,13 @@ interface ListedPr {
   headRefOid: string;
   labels?: { name: string }[];
   author?: { login: string };
+  baseRefName?: string;
 }
 
-const PR_FIELDS = "number,title,url,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,labels,author";
+const PR_FIELDS =
+  "number,title,url,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,labels,author,baseRefName";
+/** GitHub refuses a merge while the branch moves under it: wait and try again. */
+const MOVED = /Head branch was modified|Base branch was modified|is not mergeable|try the merge again/i;
 
 async function gh(run: Runner, cwd: string, args: string[]): Promise<string | undefined> {
   const result = await run("gh", args, { cwd });
@@ -186,7 +201,7 @@ export function latestInputs(lockText: string): LockedInput[] {
   return result.sort((a, b) => a.input.localeCompare(b.input));
 }
 
-function addListedPr(index: RepoIndex, pr: ListedPr): void {
+function addListedPr(index: RepoIndex, pr: ListedPr, defaultBranch: string): void {
   if (pr.labels?.some((label) => label.name === RELEASE_LABEL)) {
     index.releasePr = { number: pr.number, title: pr.title };
     return;
@@ -196,14 +211,21 @@ function addListedPr(index: RepoIndex, pr: ListedPr): void {
     index.problems.push(`#${pr.number} ${pr.title}: ${why}`);
     return;
   }
-  const note =
-    why === undefined ? undefined : FIXABLE.has(why) ? `the watcher fixes it: ${why}` : "waits for its checks";
+  const stacked = pr.baseRefName !== undefined && pr.baseRefName !== defaultBranch ? pr.baseRefName : undefined;
+  const note = stacked
+    ? `stacked on ${stacked}: after it`
+    : why === undefined
+      ? undefined
+      : FIXABLE.has(why)
+        ? `the watcher fixes it: ${why}`
+        : "waits for its checks";
   index.ready.push({
     number: pr.number,
     title: pr.title,
     sha: pr.headRefOid,
     url: pr.url,
     ...(note ? { note } : {}),
+    ...(stacked ? { stackedOn: stacked } : {}),
   });
 }
 
@@ -214,7 +236,13 @@ async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIn
     index.problems.push("could not list the PRs (gh failed)");
     return index;
   }
-  for (const pr of list) addListedPr(index, pr);
+  const defaultBranch =
+    (await gh(run, cwd, ["repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"])) ??
+    "main";
+  // Oldest first, and stacked PRs after the others: a stacked PR ships once its base is merged.
+  const sorted = [...list].sort((a, b) => a.number - b.number);
+  for (const pr of sorted) addListedPr(index, pr, defaultBranch);
+  index.ready.sort((a, b) => Number(a.stackedOn !== undefined) - Number(b.stackedOn !== undefined));
   index.releasable = index.releasePr !== undefined || index.ready.some((pr) => RELEASING.test(pr.title));
   const first = index.ready[0];
   if (!index.releasable && first) index.noRelease = first.number;
@@ -287,11 +315,14 @@ export function createShip(
         prs: lib.ready,
         release: releases.includes(lib.repo),
         ...(retitles[lib.repo] !== undefined ? { retitle: [retitles[lib.repo] as number] } : {}),
+        ...(lib.noRelease !== undefined && retitles[lib.repo] === undefined
+          ? { review: lib.ready.map((pr) => pr.number) }
+          : {}),
         behind: lib.behind,
         state: "merge" as const,
         since,
       })),
-    nixos: { repo: index.nixos.repo, root: index.nixos.root, prs: index.nixos.ready, state: "libs", since },
+    nixos: { repo: index.nixos.repo, root: index.nixos.root, prs: index.nixos.ready, state: "merge", since },
   };
 }
 
@@ -360,6 +391,41 @@ export async function watchPr(
   return watched.ok ? undefined : watched.summary;
 }
 
+interface ReleaseDecision {
+  release: boolean;
+  pr?: number;
+  type?: "feat" | "fix";
+  reason: string;
+}
+
+function parseDecision(value: unknown): ReleaseDecision | Error {
+  if (typeof value !== "object" || value === null) return new Error("expected an object");
+  const v = value as Record<string, unknown>;
+  if (typeof v.release !== "boolean") return new Error('"release" must be true or false');
+  if (v.release && (typeof v.pr !== "number" || (v.type !== "feat" && v.type !== "fix"))) {
+    return new Error('a release needs "pr" (a number) and "type" (feat or fix)');
+  }
+  return {
+    release: v.release,
+    ...(typeof v.pr === "number" ? { pr: v.pr } : {}),
+    ...(v.type === "feat" || v.type === "fix" ? { type: v.type } : {}),
+    reason: typeof v.reason === "string" ? v.reason : "",
+  };
+}
+
+export const RELEASE_PROMPT = [
+  "You decide for pi-git /ship whether merged changes of a repository should be released.",
+  "The input has the open PRs that will be merged, with title, body and changed files; none is titled feat or fix,",
+  "so no release would follow on its own.",
+  "",
+  "Release when users of the repository get something different: code, behavior, configuration, a skill or",
+  "prompt that is shipped, or documentation that is part of the package. Do not release for CI, repository",
+  "tooling, tests only, or internal notes.",
+  "",
+  'Answer with JSON only: {"release": true, "pr": <number of the PR to retitle>, "type": "feat" | "fix",',
+  '"reason": "<one sentence>"} or {"release": false, "reason": "<one sentence>"}.',
+].join("\n");
+
 class Shipping {
   private readonly deps: ShipDeps;
   private readonly ship: Ship;
@@ -400,7 +466,23 @@ class Shipping {
       { kind: "watcher", repo: item.repo, text },
       `ship-${this.ship.id}`,
     );
-    if (fresh) await notifyTerminals(this.deps.run, "pi-git ship", text);
+    if (fresh) {
+      await notifyTerminals(this.deps.run, "pi-git ship", text);
+      this.tellAgent("failed", text, item.repo);
+    }
+  }
+
+  /** Put a message into the history of the agent that started the ship (or of the next session there). */
+  private tellAgent(status: "merged" | "failed", text: string, part: string): void {
+    addSummary(this.deps.config.stateDir, {
+      entryId: `ship-${this.ship.id}-${part.replace(/[^A-Za-z0-9._-]/g, "_")}`,
+      repo: this.ship.nixos.repo,
+      number: 0,
+      sessionId: this.ship.sessionId ?? "",
+      status,
+      text,
+      created: this.now().toISOString(),
+    });
   }
 
   /** Waits, or gives up after the stage timeout. */
@@ -431,6 +513,8 @@ class Shipping {
     if (!pr) return "wait";
     if (pr.state === "MERGED") return "merged";
     if (pr.state !== "OPEN") return `#${number} is ${pr.state.toLowerCase()}`;
+    // Never merge into another PR's branch: wait until its base is merged and GitHub moves it.
+    if (pr.baseRefName && pr.baseRefName !== (await this.defaultBranch(repo))) return "wait";
     const why = notReady(pr);
     if (why && WAITS.has(why)) return "wait";
     if (why && FIXABLE.has(why) && item) return this.handToWatcher(item, repo, pr, why);
@@ -440,7 +524,27 @@ class Shipping {
       ["pr", "merge", String(number), "-R", repo, method, "--match-head-commit", pr.headRefOid],
       { cwd: this.ship.nixos.root },
     );
-    return result.code === 0 ? "merged" : `merging #${number} failed: ${clipStart(outputOf(result).trim(), 300)}`;
+    if (result.code === 0) return "merged";
+    if (MOVED.test(outputOf(result))) return "wait";
+    return `merging #${number} failed: ${clipStart(outputOf(result).trim(), 300)}`;
+  }
+
+  private readonly defaults = new Map<string, string>();
+
+  private async defaultBranch(repo: string): Promise<string> {
+    if (!this.defaults.has(repo)) {
+      const name = await this.gh([
+        "repo",
+        "view",
+        repo,
+        "--json",
+        "defaultBranchRef",
+        "--jq",
+        ".defaultBranchRef.name",
+      ]);
+      this.defaults.set(repo, name ?? "main");
+    }
+    return this.defaults.get(repo) as string;
   }
 
   /**
@@ -491,6 +595,47 @@ class Shipping {
     return allowed?.squash === false && allowed.merge ? "--merge" : "--squash";
   }
 
+  /** The reviewing agent decides per library without a feat or fix whether it releases; no questions. */
+  async review(): Promise<void> {
+    const { config } = this.deps;
+    const agent = { ...config, model: config.shipModel, thinking: config.shipThinking, skill: undefined };
+    for (const item of this.ship.libs) {
+      if ((item.review ?? []).length === 0) continue;
+      await this.reviewLibrary(item, agent);
+    }
+    this.ship.reviewed = true;
+  }
+
+  private async reviewLibrary(
+    item: LibItem,
+    agent: Omit<Config, "model" | "thinking" | "skill"> & { model: string; thinking: string; skill: undefined },
+  ): Promise<void> {
+    const prs: string[] = [];
+    for (const number of item.review ?? []) {
+      const view = await this.gh(["pr", "view", String(number), "-R", item.repo, "--json", "number,title,body,files"]);
+      if (view) prs.push(clipStart(view, 6000));
+    }
+    const decision = await askJson(
+      this.deps.run,
+      agent,
+      {
+        cwd: this.ship.nixos.root,
+        prompt: RELEASE_PROMPT,
+        input: `Repository: ${item.repo}\n\n${prs.join("\n\n")}`,
+      },
+      parseDecision,
+    );
+    if (decision instanceof Error) {
+      this.deps.log?.(`pi-git ship: ${item.repo}: no release decision (${decision.message}); not released`);
+      return;
+    }
+    this.deps.log?.(`pi-git ship: ${item.repo}: ${decision.release ? "release" : "no release"}: ${decision.reason}`);
+    if (!decision.release || decision.pr === undefined || !(item.review ?? []).includes(decision.pr)) return;
+    item.release = true;
+    item.retitle = [decision.pr];
+    item.retitleType = decision.type ?? "feat";
+  }
+
   async lib(item: LibItem): Promise<void> {
     if (item.state === "merge") return this.libMerge(item);
     if (item.state === "release") return this.libRelease(item);
@@ -511,7 +656,7 @@ class Shipping {
     for (const number of item.retitle ?? []) {
       const pr = item.prs.find((entry) => entry.number === number);
       if (!pr || RELEASING.test(pr.title)) continue;
-      const title = pr.title.replace(/^[a-z]+/, "feat");
+      const title = pr.title.replace(/^[a-z]+/, item.retitleType ?? "feat");
       const edited = await this.deps.run("gh", ["pr", "edit", String(number), "-R", item.repo, "--title", title], {
         cwd: this.ship.nixos.root,
       });
@@ -582,18 +727,20 @@ class Shipping {
     if (n.state === "deploy") return this.nixDeploy(n);
   }
 
+  /** The configuration's own PRs do not wait for the libraries: merged at once. */
+  private async nixMerge(n: NixItem): Promise<void> {
+    const method = await this.mergeMethod(n.repo);
+    if (!(await this.mergeAll(n, n.prs, method))) return;
+    this.move(n, "libs");
+  }
+
+  /** Once every library is done or failed: lock the releases, or deploy the merged PRs, or nothing. */
   private async nixLibs(n: NixItem): Promise<void> {
     if (this.ship.libs.some((lib) => lib.state !== "done" && lib.state !== "failed")) return;
     n.inputs = this.ship.libs
       .filter((lib) => lib.state === "done" && ((lib.release && lib.tag) || lib.behind))
       .map((lib) => lib.input);
-    this.move(n, "merge");
-  }
-
-  private async nixMerge(n: NixItem): Promise<void> {
-    const method = await this.mergeMethod(n.repo);
-    if (!(await this.mergeAll(n, n.prs, method))) return;
-    if ((n.inputs ?? []).length > 0) return this.move(n, "update");
+    if (n.inputs.length > 0) return this.move(n, "update");
     const last = n.prs.at(-1);
     if (!last) return this.move(n, "done");
     const sha = await this.gh([
@@ -751,20 +898,42 @@ class Shipping {
         : `pi-git ship: finished with ${failed} problem(s); /ship status shows them.`;
     this.deps.log?.(text);
     await notifyTerminals(this.deps.run, "pi-git ship", text);
+    // Problems were told one by one; the end goes into the history once, quietly.
+    this.tellAgent("merged", text, "end");
   }
 }
 
-/** One round of the running ship, from the watcher: every item as far as it can go without waiting. */
-export async function shipTick(deps: ShipDeps): Promise<Ship | undefined> {
+/** While a ship runs, the watcher looks this often within one run of its timer, */
+export const SHIP_POLL_MS = 10_000;
+/** for at most this long, so it ends before the timer starts it again. */
+export const SHIP_WINDOW_MS = 45_000;
+
+/** Passes per round: each moves every part as far as it can; a round stops early when nothing moved. */
+export const MAX_PASSES = 8;
+
+/**
+ * One round of the running ship, from the watcher. The libraries and the configuration move at the
+ * same time (they do not depend on each other until the flake.lock update), and a round keeps going
+ * while something moves, so nothing waits for the next round without a reason.
+ */
+export async function shipTick(deps: ShipDeps, passes = MAX_PASSES): Promise<Ship | undefined> {
   const ship = loadShip(deps.config.stateDir);
   if (ship?.status !== "running") return ship;
   const shipping = new Shipping(deps, ship);
-  for (const lib of ship.libs) {
-    await shipping.lib(lib);
+  if (!ship.reviewed) {
+    await shipping.review();
     saveShip(deps.config.stateDir, ship);
   }
-  await shipping.nixos();
-  await shipping.finishIfDone();
-  saveShip(deps.config.stateDir, ship);
+  for (let pass = 0; pass < passes && ship.status === "running"; pass++) {
+    const before = JSON.stringify(ship);
+    // The configuration merges its own PRs at the same time as the libraries; its later steps look
+    // at the libraries, so they come after them in the pass.
+    const nixFirst = ship.nixos.state === "merge";
+    await Promise.all([...ship.libs.map((lib) => shipping.lib(lib)), ...(nixFirst ? [shipping.nixos()] : [])]);
+    if (!nixFirst) await shipping.nixos();
+    await shipping.finishIfDone();
+    saveShip(deps.config.stateDir, ship);
+    if (JSON.stringify(ship) === before) break;
+  }
   return ship;
 }

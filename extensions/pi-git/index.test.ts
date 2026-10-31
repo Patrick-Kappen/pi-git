@@ -115,8 +115,8 @@ const summary = (sessionId: string, repo = "o/r") => ({
   repo,
   number: 1,
   sessionId,
-  status: "green" as const,
-  text: `green for ${sessionId}`,
+  status: "merged" as const,
+  text: `merged for ${sessionId}`,
   created: new Date().toISOString(),
 });
 
@@ -236,10 +236,19 @@ describe("summaries", () => {
     await handlers.get("session_start")?.({}, ctx("s1"));
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
-      { customType: "pi-git", content: "green for s1", display: true },
+      { customType: "pi-git", content: "merged for s1", display: true },
       { deliverAs: "nextTurn" },
     );
     expect(state.loadSummaries(stateDir).map((s) => s.sessionId)).toEqual(["s2"]);
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("green is only shown to the user, not put into the history", async () => {
+    const { handlers, ctx, sendMessage, notify, stateDir } = load();
+    state.addSummary(stateDir, { ...summary("s1"), status: "green", text: "green for s1" });
+    await handlers.get("session_start")?.({}, ctx("s1"));
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith("green for s1", "info");
     handlers.get("session_shutdown")?.({}, ctx());
   });
 
@@ -262,7 +271,7 @@ describe("summaries", () => {
     state.addSummary(stateDir, summary("gone", "other/repo"));
     await handlers.get("session_start")?.({}, ctx("s1"));
     expect(sendMessage).toHaveBeenCalledWith(
-      { customType: "pi-git", content: "green for old", display: true },
+      { customType: "pi-git", content: "merged for old", display: true },
       { deliverAs: "nextTurn" },
     );
     expect(state.loadSummaries(stateDir).map((s) => s.repo)).toEqual(["other/repo"]);
@@ -275,7 +284,7 @@ describe("summaries", () => {
     await handlers.get("session_start")?.({}, ctx("s1"));
     state.addSummary(stateDir, summary("s1"));
     vi.advanceTimersByTime(POLL_MS);
-    expect(notify).toHaveBeenCalledWith("green for s1", "info");
+    expect(notify).toHaveBeenCalledWith("merged for s1", "info");
     expect(sendMessage).not.toHaveBeenCalled();
     expect(state.sessionAlive(config.runtimeDir, "s1", 60_000)).toBe(true);
     await handlers.get("session_start")?.({}, ctx("s1", false));
