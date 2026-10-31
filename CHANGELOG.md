@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.8.0...v0.9.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** preflight every ship, merge in a logical order, and handle stacks ([#35](https://github.com/Patrick-Kappen/pi-git/issues/35)) ([b559184](https://github.com/Patrick-Kappen/pi-git/commit/b559184a82a847ac813f1ed383e1134ba15e487d))
+* **pi-git:** rebase jj workspaces in the watcher ([#34](https://github.com/Patrick-Kappen/pi-git/issues/34)) ([603af86](https://github.com/Patrick-Kappen/pi-git/commit/603af86a56d6ef4586c779527191977f1d11fcee))
+
+
+### Bug Fixes
+
+* **pi-git:** preserve commits missing from merged PR ([#36](https://github.com/Patrick-Kappen/pi-git/issues/36)) ([b106297](https://github.com/Patrick-Kappen/pi-git/commit/b106297a40e80c48127bc41d3251a309b0464499))
+* **pi-git:** preserve the main checkout's Git index ([#38](https://github.com/Patrick-Kappen/pi-git/issues/38)) ([5114c00](https://github.com/Patrick-Kappen/pi-git/commit/5114c0047c3e3d07a12a8caae0306834fc8e2914))
+
 ## [0.8.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.7.0...v0.8.0) (2026-10-31)
 
 
