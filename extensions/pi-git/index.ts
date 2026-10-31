@@ -49,7 +49,32 @@ export interface Options {
 }
 
 /** The pi methods this extension uses; a subset of ExtensionAPI, so tests can pass a fake. */
-export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool" | "sendMessage" | "registerCommand">;
+export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool" | "sendMessage" | "registerCommand"> &
+  Partial<Pick<ExtensionAPI, "events">>;
+
+/**
+ * The event other extensions use to hand an open PR to the watcher, like git_watch:
+ * `pi.events.emit(WATCH_EVENT, { pr, path, reply })`. `path` is a worktree with the PR's branch;
+ * `reply`, when given, gets the outcome. pi-orchestrator uses it for the PRs of its tasks.
+ */
+export const WATCH_EVENT = "pi-git:watch";
+
+export interface WatchRequest {
+  pr: string;
+  path: string;
+  reply?: (result: { ok: boolean; summary: string }) => void;
+}
+
+function isWatchRequest(data: unknown): data is WatchRequest {
+  const request = data as Partial<WatchRequest> | null;
+  return (
+    typeof request === "object" &&
+    request !== null &&
+    typeof request.pr === "string" &&
+    typeof request.path === "string" &&
+    (request.reply === undefined || typeof request.reply === "function")
+  );
+}
 
 /** The name of the system prompt section with the state of the lock. */
 export const PROMPT_SECTION = "pi_git";
@@ -502,6 +527,13 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       const text = await gitStatus({ run: runner, config, home });
       return { content: [{ type: "text", text }], details: undefined };
     },
+  });
+
+  pi.events?.on(WATCH_EVENT, (data) => {
+    if (!isWatchRequest(data)) return;
+    gitWatch({ run: runner, config, home }, { pr: data.pr, path: data.path, sessionId, quiet: true })
+      .then((result) => data.reply?.({ ok: result.ok, summary: result.summary }))
+      .catch((error: unknown) => data.reply?.({ ok: false, summary: (error as Error).message }));
   });
 
   pi.registerTool({

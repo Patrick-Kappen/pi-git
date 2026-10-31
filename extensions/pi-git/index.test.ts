@@ -53,7 +53,7 @@ vi.mock("./pr.ts", () => ({
   }),
 }));
 
-const { createPiGit, default: piGit, enqueue, guardHelper, POLL_MS, takes } = await import("./index.ts");
+const { createPiGit, default: piGit, enqueue, guardHelper, POLL_MS, takes, WATCH_EVENT } = await import("./index.ts");
 const { gitCommit, gitPr, gitPush } = await import("./pr.ts");
 const { gitStart } = await import("./start.ts");
 const { gitCheck } = await import("./check.ts");
@@ -82,11 +82,20 @@ function load(settings: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = {
     string,
     { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions: (prefix: string) => unknown }
   >();
+  const listeners = new Map<string, (data: unknown) => void>();
+  const events = {
+    on: (channel: string, handler: (data: unknown) => void) => {
+      listeners.set(channel, handler);
+      return () => listeners.delete(channel);
+    },
+    emit: (channel: string, data: unknown) => listeners.get(channel)?.(data),
+  };
   const pi = {
     on: (name: string, handler: never) => handlers.set(name, handler),
     registerTool: (tool: never) => tools.push(tool),
     registerCommand: (name: string, command: never) => commands.set(name, command),
     sendMessage,
+    events,
   };
   createPiGit(pi as never, { env: { PI_GIT_CONFIG: join(dir, "pi-git.json"), ...env }, home: dir, run: origin });
   const notify = vi.fn();
@@ -98,7 +107,7 @@ function load(settings: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = {
     sessionManager: { getSessionId: () => sessionId },
   });
   const config = { ...defaults("p", {}, dir), stateDir };
-  return { handlers, tools, commands, sendMessage, notify, setStatus, ctx, stateDir, config, dir };
+  return { handlers, tools, commands, sendMessage, notify, setStatus, ctx, stateDir, config, dir, events };
 }
 
 const summary = (sessionId: string, repo = "o/r") => ({
@@ -687,5 +696,25 @@ describe("the lock", () => {
       ["request", "o/r: Committed; push is locked, run /git push once."],
     ]);
     handlers.get("session_shutdown")?.({}, ctx());
+  });
+});
+
+describe("the watch event", () => {
+  test("hands a PR to the watcher and replies with the outcome", async () => {
+    const { events } = load();
+    const reply = vi.fn();
+    events.emit(WATCH_EVENT, { pr: "7", path: "/w", reply });
+    await vi.waitFor(() => expect(reply).toHaveBeenCalledTimes(1));
+    expect(reply.mock.calls[0]?.[0]).toMatchObject({ ok: false });
+    expect(typeof reply.mock.calls[0]?.[0].summary).toBe("string");
+  });
+
+  test("ignores what is not a request; a request without reply is fine", async () => {
+    const { events } = load();
+    for (const data of [undefined, null, "x", { pr: 7, path: "/w" }, { pr: "7" }, { pr: "7", path: "/w", reply: 1 }]) {
+      expect(() => events.emit(WATCH_EVENT, data)).not.toThrow();
+    }
+    events.emit(WATCH_EVENT, { pr: "7", path: "/w" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
   });
 });
