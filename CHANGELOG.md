@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.3.0...v0.4.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** ship everything that is ready with /ship ([#16](https://github.com/Patrick-Kappen/pi-git/issues/16)) ([d7602a7](https://github.com/Patrick-Kappen/pi-git/commit/d7602a7e60d2e75176e5ea9b4c92d064e81eac6d))
+
 ## [0.3.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.2.0...v0.3.0) (2026-10-31)
 
 
