@@ -17,7 +17,11 @@ const ghLog = join(root, "gh.log");
 const helperLog = join(root, "helper.log");
 
 function sh(cwd: string, ...args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, PI_GIT_SWITCH: "" },
+  }).trim();
 }
 
 function script(path: string, text: string): string {

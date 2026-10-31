@@ -43,6 +43,7 @@ beforeAll(() => {
   writeFileSync(join(repo, "a.txt"), "a\n");
   process.env.PI_CODING_AGENT_DIR = agentDir;
   delete process.env.PI_GIT_CONFIG;
+  delete process.env.PI_GIT_HELPER;
 });
 
 afterAll(() => {

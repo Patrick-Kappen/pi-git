@@ -20,6 +20,7 @@ import {
   shipLines,
   shipTick,
 } from "./ship.ts";
+import { type Entry, entryId, removeEntry, saveEntry } from "./state.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-git-ship-")));
 const nixos = join(root, "nixos");
@@ -127,6 +128,7 @@ function ghReply(args: readonly string[]): Reply {
   const key = `${args[0]} ${args[1]}`;
   if (key === "pr list") return prList(repo, args);
   if (key === "pr view") return prView(repo, args);
+  if (key === "pr edit") return ok("");
   if (key === "pr merge") {
     world.merged.push(`${repo}#${args[2]}`);
     return ok("");
@@ -148,7 +150,14 @@ let config: Config;
 let clock = new Date("2026-01-01T00:00:00Z");
 let n = 0;
 const gitPr = vi.fn<typeof GitPr>();
-const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock });
+const watched: string[] = [];
+const watchPr = vi.fn(async (repo: string, number: number) => {
+  watched.push(`${repo}#${number}`);
+  // The watcher follows it: an entry in the queue.
+  saveEntry(config.stateDir, { id: entryId(repo, number), repo, number } as Entry);
+  return undefined;
+});
+const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr });
 
 beforeEach(() => {
   n++;
@@ -158,7 +167,8 @@ beforeEach(() => {
     worktrees: join(root, `trees${n}`),
     shipNixos: nixos,
   };
-  clock = new Date("2026-01-01T00:00:00Z");
+  // A clock of its own per test: the ship's id, and so its branch in the shared repository, differs.
+  clock = new Date(Date.UTC(2026, 0, 1, 0, n));
   calls.length = 0;
   world = {
     prs: {
@@ -167,7 +177,7 @@ beforeEach(() => {
         pr(2, "fix: draft", { isDraft: true }),
         pr(9, "chore(main): release 0.3.0", { labels: [{ name: "autorelease: pending" }] }),
       ],
-      "o/pi-skills": [pr(3, "docs: words", { statusCheckRollup: pending })],
+      "o/pi-skills": [pr(3, "docs: words", { isDraft: true })],
       "o/Nixos": [pr(5, "feat: host")],
     },
     merged: [],
@@ -178,6 +188,7 @@ beforeEach(() => {
     nixosPr: undefined,
     fail: [],
   };
+  watched.length = 0;
   gitPr.mockReset();
   gitPr.mockResolvedValue({ ok: true, summary: "PR opened", notes: [], pr: { number: 77, url: "u77" } } as never);
 });
@@ -219,14 +230,31 @@ describe("index", () => {
     });
     expect(git?.ready.map((item) => item.number)).toEqual([1]);
     expect(git?.problems).toEqual(["#2 fix: draft: draft"]);
-    expect(skills).toMatchObject({ behind: true, releasable: false, problems: ["#3 docs: words: checks still run"] });
+    expect(skills).toMatchObject({ behind: true, releasable: false, problems: ["#3 docs: words: draft"] });
     expect(planLines(index)).toEqual([
       "o/pi-git: merge #1; release PR #9 (chore(main): release 0.3.0)",
       "  not shipped: #2 fix: draft: draft",
       "o/pi-skills: released, not locked yet",
-      "  not shipped: #3 docs: words: checks still run",
+      "  not shipped: #3 docs: words: draft",
       "o/Nixos: merge #5",
     ]);
+  });
+
+  test("index explains why pending and failing PRs are not ready", async () => {
+    world.prs["o/pi-git"] = [
+      pr(4, "feat: pending", { statusCheckRollup: pending }),
+      pr(5, "feat: failing", {
+        statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "FAILURE" }],
+      }),
+    ];
+    const index = await indexShip(fake, nixos);
+    expect(index.libs[0]?.ready).toMatchObject([
+      { number: 4, note: "waits for its checks" },
+      { number: 5, note: "the watcher fixes it: checks fail" },
+    ]);
+    expect(planLines(index)[0]).toBe(
+      "o/pi-git: merge #4 (waits for its checks), #5 (the watcher fixes it: checks fail); a release follows",
+    );
   });
 });
 
@@ -349,16 +377,46 @@ describe("shipTick", () => {
   test("a PR that conflicts after an earlier merge waits, and merges its new head once ready", async () => {
     world.prs["o/pi-git"] = [pr(1, "feat: one"), pr(4, "feat: two")];
     await plan([]);
-    // Merging #1 makes #4 conflict.
+    // Merging #1 makes #4 conflict: the watcher gets it, the ship waits.
     world.prs["o/pi-git"] = [pr(1, "feat: one"), pr(4, "feat: two", { mergeable: "CONFLICTING" })];
     let ship = await tick();
     expect(world.merged).toEqual(["o/pi-git#1"]);
-    expect(ship?.libs[0]?.state).toBe("merge");
+    expect(watched).toEqual(["o/pi-git#4"]);
+    expect(ship?.libs[0]).toMatchObject({ state: "merge", adopted: [4] });
+    // Still conflicting while the watcher works: not handed over twice.
+    await tick();
+    expect(watched).toEqual(["o/pi-git#4"]);
     // The watcher rebased #4: a new head, green again.
     world.prs["o/pi-git"] = [pr(1, "feat: one"), pr(4, "feat: two", { headRefOid: "rebased4" })];
     ship = await tick();
     expect(calls).toContain("gh pr merge 4 -R o/pi-git --squash --match-head-commit rebased4");
     expect(ship?.libs[0]?.state).toBe("done");
+  });
+
+  test("the watcher gave up on a red PR: that library needs you", async () => {
+    world.prs["o/pi-git"] = [
+      pr(4, "feat: red", {
+        statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "FAILURE" }],
+      }),
+    ];
+    const ship0 = await plan([]);
+    expect(ship0.libs[0]?.prs[0]?.note).toBe("the watcher fixes it: checks fail");
+    await tick();
+    removeEntry(config.stateDir, entryId("o/pi-git", 4));
+    const ship = await tick();
+    expect(ship?.libs[0]?.error).toBe("#4: checks fail, and the watcher could not fix it");
+  });
+
+  test("a PR without a feat or fix: retitled to feat when the owner chose it", async () => {
+    world.prs["o/pi-git"] = [pr(6, "docs(git): words")];
+    const index = await indexShip(fake, nixos);
+    expect(index.libs[0]).toMatchObject({ releasable: false, noRelease: 6 });
+    expect(planLines(index)[0]).toBe("o/pi-git: merge #6; no release follows (no feat or fix)");
+    saveShip(config.stateDir, createShip(index, ["o/pi-git"], "gaia", clock, { "o/pi-git": 6 }));
+    const ship = await tick();
+    expect(calls).toContain("gh pr edit 6 -R o/pi-git --title feat(git): words");
+    expect(ship?.libs[0]?.error).toBeUndefined();
+    expect(ship?.libs[0]?.state).toBe("release");
   });
 
   test("no release PR after the merges", async () => {
@@ -385,6 +443,45 @@ describe("shipTick", () => {
     };
     const ship = await tick();
     expect(ship?.nixos).toMatchObject({ state: "failed", error: "#77: checks fail" });
+  });
+
+  test("the flake.lock PR conflicts after main moved: made again on the fresh main, at most 3 times", async () => {
+    world.prs["o/pi-git"] = [];
+    world.prs["o/Nixos"] = [];
+    await plan([]);
+    await tick();
+    await tick();
+    let ship = await tick();
+    expect(ship?.nixos.state).toBe("check");
+    const worktree = ship?.nixos.worktree ?? "";
+    // Someone merged into main meanwhile; the PR now conflicts.
+    world.nixosPr = { ...pr(77, "flake: lock", { mergeable: "CONFLICTING", headRefOid: "lock1" }), state: "OPEN" };
+    calls.length = 0;
+    ship = await tick();
+    expect(calls).toContain("git fetch origin --prune");
+    expect(calls).toContain("git reset --hard origin/main");
+    expect(calls).toContain("nix flake update pi-skills");
+    expect(gitPr.mock.calls.at(-1)?.[0]).toMatchObject({ path: worktree, forceWithLease: "lock1", updatePr: false });
+    expect(ship?.nixos).toMatchObject({ state: "check", refreshes: 1 });
+    await tick();
+    await tick();
+    ship = await tick();
+    expect(ship?.nixos).toMatchObject({
+      state: "failed",
+      error: "PR #77 still conflicts after 3 new locks on the default branch",
+    });
+  });
+
+  test("a failing push of the new lock", async () => {
+    world.prs["o/pi-git"] = [];
+    world.prs["o/Nixos"] = [];
+    await plan([]);
+    await tick();
+    await tick();
+    await tick();
+    world.nixosPr = { ...pr(77, "flake: lock", { mergeable: "CONFLICTING" }), state: "OPEN" };
+    gitPr.mockResolvedValueOnce({ ok: false, summary: "rejected", notes: [] } as never);
+    expect((await tick())?.nixos.error).toBe("the new flake.lock could not be pushed: rejected");
   });
 
   test("nothing running: no ship, nothing done", async () => {

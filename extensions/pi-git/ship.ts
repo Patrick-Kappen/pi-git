@@ -1,27 +1,40 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { addAttention, notifyTerminals } from "./attention.ts";
 import type { Config } from "./config.ts";
 import { clipStart, outputOf, type Runner } from "./exec.ts";
 import { repoName, repoSlug } from "./git.ts";
 import type { gitPr as GitPr } from "./pr.ts";
+import { findMainCheckout } from "./start.ts";
+import { entryId, loadEntries } from "./state.ts";
+import { gitWatch, worktreeOf } from "./status.ts";
 import { type Check, rollup } from "./watch.ts";
 
 // /ship: merge what is ready, release what the owner picks, lock the releases in the NixOS
 // configuration, merge that, and wait until the host is deployed. The owner's command: it runs in the
 // watcher, out of the agents' sight, and only notifies the owner when something needs them.
 
+/** How often the flake.lock PR is made again on a newer default branch before the ship gives up. */
+export const MAX_REFRESHES = 3;
 /** How long one stage may wait (for CI, a release PR, a tag, a deploy) before the ship gives up on it. */
 export const STAGE_TIMEOUT_MS = 90 * 60 * 1000;
 const RELEASE_LABEL = "autorelease: pending";
 /** Reasons that pass by themselves (or by the watcher): wait instead of failing. */
-const WAITS = new Set(["checks still run", "GitHub has not decided whether it can merge", "conflicts with the base"]);
+const WAITS = new Set(["checks still run", "GitHub has not decided whether it can merge"]);
+/** Reasons the watcher can fix: /ship hands the PR to it and waits. */
+const FIXABLE = new Set(["checks fail", "conflicts with the base"]);
+/** Reasons only the owner can solve: the PR stays out of the ship. */
+const OWNER = new Set(["draft", "changes requested"]);
+const RELEASING = /^(feat|fix)(\(.+\))?!?:/;
 
 export interface ShipPr {
   number: number;
   title: string;
   sha: string;
   url: string;
+  /** Not ready yet when indexed: it waits for its checks, or the watcher fixes it first. */
+  note?: string;
 }
 
 interface Stage {
@@ -37,6 +50,10 @@ export interface LibItem extends Stage {
   input: string;
   prs: ShipPr[];
   release: boolean;
+  /** PRs whose title becomes a feat, so their merge leads to a release (the owner chose it). */
+  retitle?: number[];
+  /** PRs handed to the watcher to fix (red checks, conflicts). */
+  adopted?: number[];
   /** Whether the input needs a new lock even without a release here (an earlier release is not locked). */
   behind: boolean;
   state: LibState;
@@ -51,10 +68,13 @@ export interface NixItem extends Stage {
   prs: ShipPr[];
   state: NixState;
   inputs?: string[];
+  adopted?: number[];
   worktree?: string;
   branch?: string;
   pr?: number;
   mergeSha?: string;
+  /** How often the flake.lock PR was made again on a newer default branch, after a conflict. */
+  refreshes?: number;
 }
 
 export interface Ship {
@@ -73,6 +93,8 @@ export interface RepoIndex {
   releasePr?: { number: number; title: string };
   /** A release PR exists, or a ready PR is a feat or fix: merging leads to a release. */
   releasable: boolean;
+  /** PRs ship merges, but none leads to a release (docs, chore, ...): the owner may make one a feat. */
+  noRelease?: number;
   behind: boolean;
 }
 
@@ -85,6 +107,8 @@ export interface ShipDeps {
   run: Runner;
   config: Config;
   gitPr: typeof GitPr;
+  /** Hands a PR to the watcher (quietly); a string is why not. Default: a worktree on its branch, then git_watch. */
+  watchPr?: (repo: string, number: number) => Promise<string | undefined>;
   now?: () => Date;
   log?: (text: string) => void;
 }
@@ -162,6 +186,27 @@ export function latestInputs(lockText: string): LockedInput[] {
   return result.sort((a, b) => a.input.localeCompare(b.input));
 }
 
+function addListedPr(index: RepoIndex, pr: ListedPr): void {
+  if (pr.labels?.some((label) => label.name === RELEASE_LABEL)) {
+    index.releasePr = { number: pr.number, title: pr.title };
+    return;
+  }
+  const why = notReady(pr);
+  if (why && OWNER.has(why)) {
+    index.problems.push(`#${pr.number} ${pr.title}: ${why}`);
+    return;
+  }
+  const note =
+    why === undefined ? undefined : FIXABLE.has(why) ? `the watcher fixes it: ${why}` : "waits for its checks";
+  index.ready.push({
+    number: pr.number,
+    title: pr.title,
+    sha: pr.headRefOid,
+    url: pr.url,
+    ...(note ? { note } : {}),
+  });
+}
+
 async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIndex> {
   const list = await ghJson<ListedPr[]>(run, cwd, ["pr", "list", "-R", repo, "--state", "open", "--json", PR_FIELDS]);
   const index: RepoIndex = { repo, ready: [], problems: [], releasable: false, behind: false };
@@ -169,17 +214,10 @@ async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIn
     index.problems.push("could not list the PRs (gh failed)");
     return index;
   }
-  for (const pr of list) {
-    if (pr.labels?.some((label) => label.name === RELEASE_LABEL)) {
-      index.releasePr = { number: pr.number, title: pr.title };
-      continue;
-    }
-    const why = notReady(pr);
-    if (why) index.problems.push(`#${pr.number} ${pr.title}: ${why}`);
-    else index.ready.push({ number: pr.number, title: pr.title, sha: pr.headRefOid, url: pr.url });
-  }
-  index.releasable =
-    index.releasePr !== undefined || index.ready.some((pr) => /^(feat|fix)(\(.+\))?!?:/.test(pr.title));
+  for (const pr of list) addListedPr(index, pr);
+  index.releasable = index.releasePr !== undefined || index.ready.some((pr) => RELEASING.test(pr.title));
+  const first = index.ready[0];
+  if (!index.releasable && first) index.noRelease = first.number;
   return index;
 }
 
@@ -205,26 +243,37 @@ export async function indexShip(run: Runner, nixosRoot: string): Promise<ShipInd
 }
 
 /** The plan as lines for the owner: what ships, and what does not and why. */
+function planLinesForRepo(lib: RepoIndex): string[] {
+  const parts = [
+    lib.ready.length > 0
+      ? `merge ${lib.ready.map((pr) => `#${pr.number}${pr.note ? ` (${pr.note})` : ""}`).join(", ")}`
+      : "",
+    lib.noRelease !== undefined && lib.input !== undefined ? "no release follows (no feat or fix)" : "",
+    lib.releasePr
+      ? `release PR #${lib.releasePr.number} (${lib.releasePr.title})`
+      : lib.releasable
+        ? "a release follows"
+        : "",
+    lib.behind ? "released, not locked yet" : "",
+  ].filter(Boolean);
+  return [
+    `${lib.repo}: ${parts.join("; ") || "nothing"}`,
+    ...lib.problems.map((problem) => `  not shipped: ${problem}`),
+  ];
+}
+
 export function planLines(index: ShipIndex): string[] {
-  const lines: string[] = [];
-  for (const lib of [...index.libs, index.nixos]) {
-    const parts = [
-      lib.ready.length > 0 ? `merge ${lib.ready.map((pr) => `#${pr.number}`).join(" ")}` : "",
-      lib.releasePr
-        ? `release PR #${lib.releasePr.number} (${lib.releasePr.title})`
-        : lib.releasable
-          ? "a release follows"
-          : "",
-      lib.behind ? "released, not locked yet" : "",
-    ].filter(Boolean);
-    lines.push(`${lib.repo}: ${parts.length > 0 ? parts.join("; ") : "nothing"}`);
-    for (const problem of lib.problems) lines.push(`  not shipped: ${problem}`);
-  }
-  return lines;
+  return [...index.libs, index.nixos].flatMap(planLinesForRepo);
 }
 
 /** The ship from the index and the owner's choices: which libraries release. */
-export function createShip(index: ShipIndex, releases: readonly string[], host: string, now: Date): Ship {
+export function createShip(
+  index: ShipIndex,
+  releases: readonly string[],
+  host: string,
+  now: Date,
+  retitles: Readonly<Record<string, number>> = {},
+): Ship {
   const since = now.toISOString();
   return {
     id: since.replace(/[:.]/g, "-"),
@@ -237,6 +286,7 @@ export function createShip(index: ShipIndex, releases: readonly string[], host: 
         input: lib.input ?? repoName(lib.repo),
         prs: lib.ready,
         release: releases.includes(lib.repo),
+        ...(retitles[lib.repo] !== undefined ? { retitle: [retitles[lib.repo] as number] } : {}),
         behind: lib.behind,
         state: "merge" as const,
         since,
@@ -274,6 +324,40 @@ export function shipLines(ship: Ship): string[] {
   const n = ship.nixos;
   lines.push(`${n.repo}: ${n.state}${n.pr ? ` PR #${n.pr}` : ""}${n.error ? ` (${n.error})` : ""}`);
   return lines;
+}
+
+/** A worktree on the PR's branch (made when missing), then quietly watched; a string is why not. */
+export async function watchPr(
+  deps: ShipDeps,
+  sessionId: string,
+  repo: string,
+  number: number,
+): Promise<string | undefined> {
+  const tools = { run: deps.run, config: deps.config, home: homedir(), progress: () => {} };
+  const main = await findMainCheckout(tools, repo);
+  if (typeof main !== "string") return main.error;
+  const branch = await gh(deps.run, main, [
+    "pr",
+    "view",
+    String(number),
+    "-R",
+    repo,
+    "--json",
+    "headRefName",
+    "--jq",
+    ".headRefName",
+  ]);
+  if (!branch) return "gh could not read the branch";
+  if (!(await worktreeOf(deps.run, main, branch))) {
+    const dir = join(deps.config.worktrees, repoName(repo), branch.replace(/^[^/]+\//, "").replace(/\//g, "-"));
+    await deps.run("git", ["fetch", "origin", branch], { cwd: main });
+    const added = await deps.run("git", ["worktree", "add", "--track", "-b", branch, dir, `origin/${branch}`], {
+      cwd: main,
+    });
+    if (added.code !== 0) return `no worktree: ${clipStart(outputOf(added).trim(), 200)}`;
+  }
+  const watched = await gitWatch(tools, { pr: String(number), path: main, sessionId, quiet: true });
+  return watched.ok ? undefined : watched.summary;
 }
 
 class Shipping {
@@ -329,7 +413,12 @@ class Shipping {
    * watcher rebases PRs it follows, and an earlier merge of the same ship can cause that); an error
    * string when it cannot be merged. It merges the head it just checked.
    */
-  private async mergeWhenReady(repo: string, number: number, method: string): Promise<"merged" | "wait" | string> {
+  private async mergeWhenReady(
+    repo: string,
+    number: number,
+    method: string,
+    item?: { adopted?: number[] },
+  ): Promise<"merged" | "wait" | string> {
     const pr = await this.ghJson<ListedPr & { state: string }>([
       "pr",
       "view",
@@ -344,6 +433,7 @@ class Shipping {
     if (pr.state !== "OPEN") return `#${number} is ${pr.state.toLowerCase()}`;
     const why = notReady(pr);
     if (why && WAITS.has(why)) return "wait";
+    if (why && FIXABLE.has(why) && item) return this.handToWatcher(item, repo, pr, why);
     if (why) return `#${number}: ${why}`;
     const result = await this.deps.run(
       "gh",
@@ -353,6 +443,24 @@ class Shipping {
     return result.code === 0 ? "merged" : `merging #${number} failed: ${clipStart(outputOf(result).trim(), 300)}`;
   }
 
+  /**
+   * A PR with red checks or a conflict: hand it to the watcher once (a worktree on its branch, then
+   * quietly watched), and wait. When the watcher gave up and the PR is still red, it fails.
+   */
+  private async handToWatcher(item: { adopted?: number[] }, repo: string, pr: ListedPr, why: string): Promise<string> {
+    if (item.adopted?.includes(pr.number)) {
+      const watched = loadEntries(this.deps.config.stateDir).some((entry) => entry.id === entryId(repo, pr.number));
+      return watched ? "wait" : `#${pr.number}: ${why}, and the watcher could not fix it`;
+    }
+    const error = await (this.deps.watchPr ?? ((r, n) => watchPr(this.deps, `ship-${this.ship.id}`, r, n)))(
+      repo,
+      pr.number,
+    );
+    if (error) return `#${pr.number}: ${why}; ${error}`;
+    item.adopted = [...(item.adopted ?? []), pr.number];
+    return "wait";
+  }
+
   /** Merge the PRs in order; false when the item has to wait or failed. */
   private async mergeAll(
     item: Stage & { state: string; repo: string },
@@ -360,7 +468,7 @@ class Shipping {
     method: string,
   ): Promise<boolean> {
     for (const pr of prs) {
-      const merged = await this.mergeWhenReady(item.repo, pr.number, method);
+      const merged = await this.mergeWhenReady(item.repo, pr.number, method, item as { adopted?: number[] });
       if (merged === "wait") {
         await this.wait(item, `#${pr.number} to be ready`);
         return false;
@@ -390,10 +498,27 @@ class Shipping {
   }
 
   private async libMerge(item: LibItem): Promise<void> {
+    const retitled = await this.retitle(item);
+    if (retitled) return this.fail(item, retitled);
     if (!(await this.mergeAll(item, item.prs, "--squash"))) return;
     const sha = await this.gh(["api", `repos/${item.repo}/commits/HEAD`, "--jq", ".sha"]);
     if (sha) item.mainSha = sha;
     this.move(item, item.release ? "release" : "done");
+  }
+
+  /** Make the chosen PRs a feat, so the merge leads to a release; a string is the error. */
+  private async retitle(item: LibItem): Promise<string | undefined> {
+    for (const number of item.retitle ?? []) {
+      const pr = item.prs.find((entry) => entry.number === number);
+      if (!pr || RELEASING.test(pr.title)) continue;
+      const title = pr.title.replace(/^[a-z]+/, "feat");
+      const edited = await this.deps.run("gh", ["pr", "edit", String(number), "-R", item.repo, "--title", title], {
+        cwd: this.ship.nixos.root,
+      });
+      if (edited.code !== 0) return `could not retitle #${number}: ${clipStart(outputOf(edited).trim(), 200)}`;
+      pr.title = title;
+    }
+    return undefined;
   }
 
   private async libRelease(item: LibItem): Promise<void> {
@@ -490,42 +615,77 @@ class Shipping {
     return this.deps.run("git", args, { cwd, ...(timeoutMs ? { timeoutMs } : {}) });
   }
 
-  private async nixUpdate(n: NixItem): Promise<void> {
+  /**
+   * The ship's worktree of the NixOS configuration on the fresh default branch, with the inputs
+   * updated: fetch, start from (or reset to) origin's default branch, nix flake update. The branch
+   * holds only the ship's flake.lock change, so a reset loses nothing. A string is the error.
+   */
+  private async freshLock(n: NixItem): Promise<string | undefined> {
     const { config } = this.deps;
-    const inputs = n.inputs ?? [];
-    const branch = `flake/ship-${this.ship.id.slice(0, 16).toLowerCase()}`;
-    const worktree = join(config.worktrees, repoName(n.repo), `ship-${this.ship.id.slice(0, 16).toLowerCase()}`);
-    if (!existsSync(worktree)) {
-      await this.git(n.root, ["fetch", "origin", "--prune"]);
-      const head = await this.git(n.root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
-      const base = head.code === 0 ? head.stdout.trim() : "origin/main";
-      const added = await this.git(n.root, ["worktree", "add", "--no-track", "-b", branch, worktree, base]);
-      if (added.code !== 0) return this.fail(n, `git worktree add failed: ${clipStart(outputOf(added).trim(), 300)}`);
-    }
-    n.worktree = worktree;
-    n.branch = branch;
-    const update = await this.deps.run("nix", ["flake", "update", ...inputs], {
-      cwd: worktree,
+    const id = this.ship.id.slice(0, 16).toLowerCase();
+    n.branch = `flake/ship-${id}`;
+    n.worktree = join(config.worktrees, repoName(n.repo), `ship-${id}`);
+    await this.git(n.root, ["fetch", "origin", "--prune"]);
+    const head = await this.git(n.root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    const base = head.code === 0 ? head.stdout.trim() : "origin/main";
+    const placed = existsSync(n.worktree)
+      ? await this.git(n.worktree, ["reset", "--hard", base])
+      : await this.git(n.root, ["worktree", "add", "--no-track", "-b", n.branch, n.worktree, base]);
+    if (placed.code !== 0) return `could not put the worktree on ${base}: ${clipStart(outputOf(placed).trim(), 300)}`;
+    const update = await this.deps.run("nix", ["flake", "update", ...(n.inputs ?? [])], {
+      cwd: n.worktree,
       timeoutMs: config.checkTimeout * 1000,
     });
-    if (update.code !== 0) return this.fail(n, `nix flake update failed: ${clipStart(outputOf(update).trim(), 300)}`);
+    return update.code === 0 ? undefined : `nix flake update failed: ${clipStart(outputOf(update).trim(), 300)}`;
+  }
+
+  private lockIntent(n: NixItem): string {
     const tags = this.ship.libs
-      .filter((lib) => inputs.includes(lib.input))
+      .filter((lib) => (n.inputs ?? []).includes(lib.input))
       .map((lib) => `${lib.input} ${lib.tag ?? "latest"}`);
+    return `Lock the new releases in flake.lock: ${tags.join(", ")}. Only flake.lock changes; shipped with pi-git /ship.`;
+  }
+
+  private async nixUpdate(n: NixItem): Promise<void> {
+    const error = await this.freshLock(n);
+    if (error) return this.fail(n, error);
     const result = await this.deps.gitPr(
-      {
-        path: worktree,
-        intent: `Lock the new releases in flake.lock: ${tags.join(", ")}. Only flake.lock changes; shipped with pi-git /ship.`,
-      },
-      { run: this.deps.run, config, progress: () => {} },
+      { path: n.worktree as string, intent: this.lockIntent(n) },
+      { run: this.deps.run, config: this.deps.config, progress: () => {} },
     );
     if (!result.ok || !result.pr) return this.fail(n, `the flake.lock PR failed: ${clipStart(result.summary, 300)}`);
     n.pr = result.pr.number;
     this.move(n, "check");
   }
 
+  /** The default branch moved and the flake.lock PR conflicts: make it again on the fresh branch. */
+  private async refresh(n: NixItem, head: string): Promise<void> {
+    if ((n.refreshes ?? 0) >= MAX_REFRESHES) {
+      return this.fail(n, `PR #${n.pr} still conflicts after ${MAX_REFRESHES} new locks on the default branch`);
+    }
+    n.refreshes = (n.refreshes ?? 0) + 1;
+    const error = await this.freshLock(n);
+    if (error) return this.fail(n, error);
+    const result = await this.deps.gitPr(
+      { path: n.worktree as string, intent: this.lockIntent(n), forceWithLease: head, updatePr: false },
+      { run: this.deps.run, config: this.deps.config, progress: () => {} },
+    );
+    if (!result.ok) return this.fail(n, `the new flake.lock could not be pushed: ${clipStart(result.summary, 300)}`);
+    this.move(n, "check");
+  }
+
   private async nixCheck(n: NixItem): Promise<void> {
     if (n.pr === undefined) return this.fail(n, "no flake.lock PR");
+    const view = await this.ghJson<{ mergeable: string; headRefOid: string; state: string }>([
+      "pr",
+      "view",
+      String(n.pr),
+      "-R",
+      n.repo,
+      "--json",
+      "mergeable,headRefOid,state",
+    ]);
+    if (view?.state === "OPEN" && view.mergeable === "CONFLICTING") return this.refresh(n, view.headRefOid);
     const merged = await this.mergeWhenReady(n.repo, n.pr, await this.mergeMethod(n.repo));
     if (merged === "wait") return this.wait(n, `the checks of PR #${n.pr}`);
     if (merged !== "merged") return this.fail(n, merged);

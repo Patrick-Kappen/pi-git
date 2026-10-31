@@ -154,18 +154,25 @@ Your command, like `/git commit`: agents never start it, and it ignores the lock
 library whose flake input in the NixOS configuration follows `latest`, plus the configuration itself,
 from open PRs to a deployed host:
 
-1. **Index** (reads only, a few seconds): the open PRs of each repository with what blocks them
-   (draft, changes requested, failing or running checks, conflicts), waiting release PRs, and
-   releases that are not locked yet. The `flake.lock` is read from GitHub's default branch.
-2. **Plan**: a widget lists what ships and what does not and why. For each library that would
-   release, you pick Release or Skip; then one confirmation.
+1. **Index** (reads only, a few seconds): every open PR of each repository. Only drafts and PRs with
+   changes requested stay out (they need you). PRs whose checks still run are shipped once they
+   pass; PRs with failing checks or a conflict are handed to the watcher, which fixes them quietly,
+   and are shipped when green. Also: waiting release PRs, releases that are not locked yet, and
+   changes that lead to no release (no feat or fix). The `flake.lock` is read from GitHub's default
+   branch.
+2. **Plan**: a widget lists what ships, what waits or is fixed first, and what does not and why.
+   For each library that would release, you pick Release or Skip; for one whose changes lead to no
+   release, you can make a PR a feat (its title is changed before the merge); then one confirmation.
 3. **Run**: the watcher advances the ship every minute, out of the agents' sight:
    - merges the ready PRs (each when it is green and mergeable, on the head it just checked; a PR
      that conflicts after an earlier merge waits for the watcher's rebase);
    - for a picked release: waits for the release workflow, merges the release PR when its CI is
      green, and waits until the tag and `latest` match;
    - in the NixOS configuration: merges its ready PRs, opens a PR that runs `nix flake update` for
-     the released inputs (the helper writes the commit and PR), merges it when its checks pass;
+     the released inputs on the freshly fetched default branch (the helper writes the commit and
+     PR), merges it when its checks pass. When the default branch moves and the PR conflicts, it
+     makes the lock again on the fresh default branch and force-pushes with a lease, at most 3
+     times;
    - waits for the check run `…deploy-<host>` on that merge commit.
 4. **Done** when `deploy-<host>` succeeds: one notification with the released versions.
 
