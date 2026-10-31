@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.4.0...v0.5.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** start stacked changes from local worktrees ([#22](https://github.com/Patrick-Kappen/pi-git/issues/22)) ([f421f75](https://github.com/Patrick-Kappen/pi-git/commit/f421f7509523abc19138fcba83f7a9342662ec91))
+
+
+### Bug Fixes
+
+* **pi-git:** refresh ship locks from the fresh default branch ([#21](https://github.com/Patrick-Kappen/pi-git/issues/21)) ([04e45c8](https://github.com/Patrick-Kappen/pi-git/commit/04e45c899fad7b44b94df9cbf8ffaf8e1565b74f))
+
 ## [0.4.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.3.0...v0.4.0) (2026-10-31)
 
 
