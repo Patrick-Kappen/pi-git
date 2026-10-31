@@ -109,6 +109,17 @@ export function takes(
   return slug !== undefined && summary.repo.toLowerCase() === slug.toLowerCase();
 }
 
+function watcherNotice(config: Config, result: PrResult, intent: string, sessionId: string): string | undefined {
+  try {
+    if (enqueue(config, result, intent, sessionId)) {
+      return "\nThe watcher follows CI and conflicts, and reports back when the PR is green, merged or needs you.";
+    }
+  } catch (error) {
+    return `\nThe watcher could not queue the PR: ${(error as Error).message}`;
+  }
+  return undefined;
+}
+
 const PR_DESCRIPTION = [
   "Commit the changes of a worktree, push them and open or update the PR, without doing it by hand.",
   "It stages everything, runs the repository's hooks, lets a helper agent fix failing checks, has it write",
@@ -117,6 +128,12 @@ const PR_DESCRIPTION = [
 ].join(" ");
 
 const prParameters = Type.Object({
+  title: Type.Optional(
+    Type.String({
+      description:
+        "The commit subject and PR title in the repository's style, e.g. fix(api): retry timeouts. With it, no helper writes them.",
+    }),
+  ),
   intent: Type.String({
     description: "What the change is for and why, in a few sentences: the basis of the commit message and the PR.",
   }),
@@ -128,6 +145,12 @@ const prParameters = Type.Object({
 });
 
 const commitParameters = Type.Object({
+  title: Type.Optional(
+    Type.String({
+      description:
+        "The commit subject and PR title in the repository's style, e.g. fix(api): retry timeouts. With it, no helper writes them.",
+    }),
+  ),
   intent: Type.String({ description: "What the change is for and why: the basis of the commit message." }),
   path: Type.Optional(Type.String({ description: "A directory in the worktree; default: the working directory." })),
 });
@@ -585,7 +608,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         throw new Error(lockedReason("commit", "git_commit", target));
       }
       const result = await gitCommit(
-        { path, intent: params.intent },
+        { path, intent: params.intent, ...(params.title ? { title: params.title } : {}) },
         { run: runner, config, progress: progressOf(onUpdate), signal },
       );
       if (!result.ok) throw new Error(result.summary);
@@ -613,6 +636,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         {
           path: params.path ?? ctx.cwd,
           intent: params.intent,
+          ...(params.title ? { title: params.title } : {}),
           ...(params.base === undefined ? {} : { base: params.base }),
           ...(params.draft === undefined ? {} : { draft: params.draft }),
         },
@@ -620,14 +644,8 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       );
       if (result.stopped) blocked(ctx, result.stopped, "git_pr", target);
       if (!result.ok) throw new Error(result.summary);
-      let text = result.summary;
-      try {
-        if (enqueue(config, result, params.intent, ctx.sessionManager.getSessionId())) {
-          text += "\nThe watcher follows CI and conflicts, and reports back when the PR is green, merged or needs you.";
-        }
-      } catch (error) {
-        text += `\nThe watcher could not queue the PR: ${(error as Error).message}`;
-      }
+      const text =
+        result.summary + (watcherNotice(config, result, params.intent, ctx.sessionManager.getSessionId()) ?? "");
       return {
         content: [{ type: "text", text }],
         details: { pr: result.pr, commit: result.commit, notes: result.notes },

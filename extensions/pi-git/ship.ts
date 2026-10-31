@@ -639,6 +639,14 @@ class Shipping {
     return update.code === 0 ? undefined : `nix flake update failed: ${clipStart(outputOf(update).trim(), 300)}`;
   }
 
+  /** The flake.lock commit and PR title, in the style of the configuration: no helper needed. */
+  private lockTitle(n: NixItem): string {
+    const tags = this.ship.libs
+      .filter((lib) => (n.inputs ?? []).includes(lib.input))
+      .map((lib) => `${lib.input} ${lib.tag ?? "latest"}`);
+    return `flake: lock ${tags.join(", ")}`;
+  }
+
   private lockIntent(n: NixItem): string {
     const tags = this.ship.libs
       .filter((lib) => (n.inputs ?? []).includes(lib.input))
@@ -650,7 +658,7 @@ class Shipping {
     const error = await this.freshLock(n);
     if (error) return this.fail(n, error);
     const result = await this.deps.gitPr(
-      { path: n.worktree as string, intent: this.lockIntent(n) },
+      { path: n.worktree as string, intent: this.lockIntent(n), title: this.lockTitle(n) },
       { run: this.deps.run, config: this.deps.config, progress: () => {} },
     );
     if (!result.ok || !result.pr) return this.fail(n, `the flake.lock PR failed: ${clipStart(result.summary, 300)}`);
@@ -667,7 +675,13 @@ class Shipping {
     const error = await this.freshLock(n);
     if (error) return this.fail(n, error);
     const result = await this.deps.gitPr(
-      { path: n.worktree as string, intent: this.lockIntent(n), forceWithLease: head, updatePr: false },
+      {
+        path: n.worktree as string,
+        intent: this.lockIntent(n),
+        title: this.lockTitle(n),
+        forceWithLease: head,
+        updatePr: false,
+      },
       { run: this.deps.run, config: this.deps.config, progress: () => {} },
     );
     if (!result.ok) return this.fail(n, `the new flake.lock could not be pushed: ${clipStart(result.summary, 300)}`);
