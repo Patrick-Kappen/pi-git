@@ -4,6 +4,23 @@ A pi extension that takes the git work off the main agent. The main agent makes 
 worktree and calls `git_pr`; pi-git commits, pushes and opens the PR. A cheap helper agent fixes
 failing checks and writes the commit message and the PR. The main agent only sees the result.
 
+## `git_start`
+
+| Parameter | Meaning |
+|---|---|
+| `repo` | The repository: a directory in it, `owner/name`, or `name` (found in `~/private`, `~/work`, `~/src`, `~/code` or `~`). |
+| `topic` | Short, lower case with hyphens: the worktree directory and the branch name. |
+| `type` | `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore` or `perf`. |
+| `base` | The base branch; default: the default branch. For a stacked change, the branch it builds on. |
+| `setup` | Run the setup; default: `true`. |
+
+It fetches, then adds the worktree `<worktrees>/<repo>/<topic>` on `<type>/<topic>` from the fresh
+`origin/<base>` (or continues `origin/<type>/<topic>` when that branch exists on GitHub only), and
+runs the setup: `devenv shell -- true` with a `devenv.nix`, else `npm ci` or `uv sync`. It returns
+the path and what to know before the change: the default branch, the commit style with recent
+subjects, the check command, a PR template or CONTRIBUTING.md to read, and the other worktrees of the
+repository. A failing setup is reported, not fatal. The `worktree` step of the lock covers it.
+
 ## `git_pr`
 
 | Parameter | Meaning |
@@ -110,7 +127,7 @@ By default, agents may not change git repositories. The lock has four steps, eac
 
 | Step | Covers |
 |---|---|
-| `worktree` | Creating and removing worktrees and branches |
+| `worktree` | `git_start`, and creating and removing worktrees and branches |
 | `commit` | `git_commit`, and git commands that change history or files: `commit`, `add`, `reset`, `rebase`, `checkout`, ... |
 | `push` | Pushing |
 | `pr` | Opening and changing PRs, and other gh commands that change GitHub |

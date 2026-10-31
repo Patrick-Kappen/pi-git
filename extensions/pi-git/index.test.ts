@@ -103,7 +103,7 @@ afterEach(() => {
 describe("git_pr", () => {
   test("runs the flow, reports progress, and queues the PR", async () => {
     const { tools, ctx, stateDir } = load();
-    expect(tools.map((tool) => tool.name)).toEqual(["git_request", "git_commit", "git_pr", "git_check"]);
+    expect(tools.map((tool) => tool.name)).toEqual(["git_request", "git_start", "git_commit", "git_pr", "git_check"]);
     const onUpdate = vi.fn();
     const result = await tools
       .find((tool) => tool.name === "git_pr")
@@ -325,7 +325,7 @@ describe("default export", () => {
     delete process.env.PI_GIT_HELPER;
     piGit({ on: vi.fn(), registerTool, registerCommand: vi.fn(), sendMessage: vi.fn() } as unknown as ExtensionAPI);
     if (saved !== undefined) process.env.PI_GIT_HELPER = saved;
-    expect(registerTool).toHaveBeenCalledTimes(4);
+    expect(registerTool).toHaveBeenCalledTimes(5);
   });
 });
 

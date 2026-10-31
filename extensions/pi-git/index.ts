@@ -25,6 +25,7 @@ import {
   statusText,
 } from "./lock.ts";
 import { gitCommit, gitPr, type PrResult } from "./pr.ts";
+import { findMainCheckout, gitStart, TYPES } from "./start.ts";
 import {
   claimSummary,
   type Entry,
@@ -127,6 +128,23 @@ const prParameters = Type.Object({
 const commitParameters = Type.Object({
   intent: Type.String({ description: "What the change is for and why: the basis of the commit message." }),
   path: Type.Optional(Type.String({ description: "A directory in the worktree; default: the working directory." })),
+});
+
+const startParameters = Type.Object({
+  repo: Type.String({ description: "The repository: a directory in it, owner/name, or name." }),
+  topic: Type.String({ description: "Short topic, lower case with hyphens, e.g. login-timeout." }),
+  type: Type.Union(
+    TYPES.map((type) => Type.Literal(type)),
+    { description: "The kind of change; the branch is <type>/<topic>." },
+  ),
+  base: Type.Optional(
+    Type.String({
+      description: "Base branch; default: the default branch. For a stacked change, the branch it needs.",
+    }),
+  ),
+  setup: Type.Optional(
+    Type.Boolean({ description: "Run the repository's setup (devenv, npm ci, uv sync); default: true." }),
+  ),
 });
 
 const requestParameters = Type.Object({
@@ -386,6 +404,45 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
           { type: "text", text: "The user is notified. Do not work around it; stop here until the user answers." },
         ],
         details: undefined,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "git_start",
+    label: "Git start",
+    description: [
+      "Start a change: fetch, create the worktree ~/.worktrees/<repo>/<topic> on <type>/<topic> from the fresh base",
+      "branch, and run the repository's setup. Returns the path and what to know about the repository (default branch,",
+      "commit style, checks, other worktrees). Make the change in that path, then call git_pr.",
+    ].join(" "),
+    promptSnippet: "Create the worktree and branch of a new change, with its setup",
+    promptGuidelines: ["Use git_start to begin a change instead of git worktree add and devenv shell."],
+    parameters: startParameters,
+    async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
+      const progress = progressOf(onUpdate);
+      const deps = { run: runner, config, home, progress, signal };
+      const main = await findMainCheckout(deps, params.repo);
+      if (typeof main !== "string") throw new Error(main.error);
+      const target = await slugOf(main);
+      if (lockOf(target, "worktree") === "locked") {
+        blocked(ctx, "worktree", "git_start", target);
+        throw new Error(lockedReason("worktree", "git_start", target));
+      }
+      const result = await gitStart(
+        {
+          repo: params.repo,
+          topic: params.topic,
+          type: params.type,
+          ...(params.base === undefined ? {} : { base: params.base }),
+          ...(params.setup === undefined ? {} : { setup: params.setup }),
+        },
+        deps,
+      );
+      if (!result.ok) throw new Error(result.summary);
+      return {
+        content: [{ type: "text", text: result.summary }],
+        details: { path: result.path, branch: result.branch },
       };
     },
   });
