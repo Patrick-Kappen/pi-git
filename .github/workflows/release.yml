@@ -25,12 +25,21 @@ jobs:
       released: ${{ steps.release.outputs.release_created }}
       tag: ${{ steps.release.outputs.tag_name }}
     steps:
+      # A PR opened with GITHUB_TOKEN does not start CI. With the release App (variable
+      # RELEASE_APP_CLIENT_ID, secret RELEASE_APP_PRIVATE_KEY) the release PR is opened by the App, so
+      # its CI runs. Without them, GITHUB_TOKEN is used and the release PR needs an admin merge.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
-          # A PR opened with GITHUB_TOKEN does not start CI. Set RELEASE_PLEASE_TOKEN (a fine-grained
-          # token with contents and pull-requests write) to get CI on the release PR.
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          token: ${{ steps.app.outputs.token || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
