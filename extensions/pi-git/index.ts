@@ -312,6 +312,11 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       if (ctx.hasUI) ctx.ui.notify(summary.text, "info");
       return;
     }
+    // Green is not done yet: only you see it. Merged, closed and a finished ship go into the history once.
+    if (summary.status === "green" || summary.status === "watching") {
+      if (ctx.hasUI) ctx.ui.notify(summary.text, "info");
+      return;
+    }
     const options =
       config.delivery === "turn" && summary.status === "failed"
         ? ({ triggerTurn: true, deliverAs: "followUp" } as const)
@@ -446,7 +451,8 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
 
   pi.registerCommand("ship", {
     description: "Merge what is ready, release what you pick, lock it in NixOS and wait for the deploy (/ship status)",
-    handler: (args, ctx) => shipCommand(args, ctx.ui, { run: runner, config }),
+    handler: (args, ctx) =>
+      shipCommand(args, ctx.ui, { run: runner, config, sessionId: ctx.sessionManager.getSessionId() }),
   });
 
   pi.registerTool({

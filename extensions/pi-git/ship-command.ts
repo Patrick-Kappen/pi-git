@@ -11,7 +11,11 @@ export interface ShipUi {
 const WIDGET = "pi-git-ship";
 
 /** /ship and /ship status: index, show the plan, and let the watcher run it; no questions. */
-export async function shipCommand(args: string, ui: ShipUi, deps: { run: Runner; config: Config }): Promise<void> {
+export async function shipCommand(
+  args: string,
+  ui: ShipUi,
+  deps: { run: Runner; config: Config; sessionId?: string },
+): Promise<void> {
   const { config } = deps;
   const current = loadShip(config.stateDir);
   if (args.trim() === "status" || current?.status === "running") {
@@ -28,7 +32,10 @@ export async function shipCommand(args: string, ui: ShipUi, deps: { run: Runner;
   // Every library with a feat or fix releases; for the others the reviewing agent decides. No questions:
   // only a fix that would change behavior comes back to the owner, as a notification.
   const releases = index.libs.filter((lib) => lib.releasable).map((lib) => lib.repo);
-  const ship = createShip(index, releases, config.shipHost, new Date());
+  const ship = {
+    ...createShip(index, releases, config.shipHost, new Date()),
+    ...(deps.sessionId ? { sessionId: deps.sessionId } : {}),
+  };
   if (ship.libs.length === 0 && ship.nixos.prs.length === 0) {
     ui.notify("pi-git ship: nothing to ship.", "info");
     return;

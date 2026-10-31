@@ -57,7 +57,8 @@ describe("/ship", () => {
   test("no questions: every feat or fix releases, the rest goes to the reviewing agent, and it runs", async () => {
     const c = config();
     const { fake, log } = ui();
-    await shipCommand("", fake, { run, config: c });
+    await shipCommand("", fake, { run, config: c, sessionId: "s1" });
+    expect(loadShip(c.stateDir)?.sessionId).toBe("s1");
     expect(log[1]).toBe(
       "widget /ship: running in the background | o/a: merge #1; a release follows | o/b: nothing |   not shipped: #2 t: draft | o/c: merge #5; no release follows (no feat or fix) | o/Nixos: nothing",
     );

@@ -8,7 +8,7 @@ import { repoName, repoSlug } from "./git.ts";
 import { askJson } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { findMainCheckout } from "./start.ts";
-import { entryId, loadEntries } from "./state.ts";
+import { addSummary, entryId, loadEntries } from "./state.ts";
 import { gitWatch, worktreeOf } from "./status.ts";
 import { type Check, rollup } from "./watch.ts";
 
@@ -86,6 +86,8 @@ export interface Ship {
   id: string;
   host: string;
   status: "running" | "done";
+  /** The pi session that started the ship: its agent gets the result in the history. */
+  sessionId?: string;
   /** The reviewing agent decided the releases of the libraries in `review`. */
   reviewed?: boolean;
   libs: LibItem[];
@@ -445,7 +447,23 @@ class Shipping {
       { kind: "watcher", repo: item.repo, text },
       `ship-${this.ship.id}`,
     );
-    if (fresh) await notifyTerminals(this.deps.run, "pi-git ship", text);
+    if (fresh) {
+      await notifyTerminals(this.deps.run, "pi-git ship", text);
+      this.tellAgent("failed", text, item.repo);
+    }
+  }
+
+  /** Put a message into the history of the agent that started the ship (or of the next session there). */
+  private tellAgent(status: "merged" | "failed", text: string, part: string): void {
+    addSummary(this.deps.config.stateDir, {
+      entryId: `ship-${this.ship.id}-${part.replace(/[^A-Za-z0-9._-]/g, "_")}`,
+      repo: this.ship.nixos.repo,
+      number: 0,
+      sessionId: this.ship.sessionId ?? "",
+      status,
+      text,
+      created: this.now().toISOString(),
+    });
   }
 
   /** Waits, or gives up after the stage timeout. */
@@ -837,6 +855,8 @@ class Shipping {
         : `pi-git ship: finished with ${failed} problem(s); /ship status shows them.`;
     this.deps.log?.(text);
     await notifyTerminals(this.deps.run, "pi-git ship", text);
+    // Problems were told one by one; the end goes into the history once, quietly.
+    this.tellAgent("merged", text, "end");
   }
 }
 
