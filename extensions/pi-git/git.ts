@@ -1,5 +1,6 @@
 import { basename, dirname } from "node:path";
 import type { Runner } from "./exec.ts";
+import { isJj, jjBranch } from "./jj.ts";
 
 /** What git_pr needs to know about the worktree. */
 export interface Worktree {
@@ -12,6 +13,8 @@ export interface Worktree {
   slug: string;
   /** The main checkout that owns the worktree. */
   mainRoot: string;
+  /** A jj workspace: jj keeps the history, the branch is a bookmark. */
+  jj?: boolean;
 }
 
 async function git(run: Runner, cwd: string, ...args: string[]): Promise<string | undefined> {
@@ -68,12 +71,17 @@ export async function inspectWorktree(run: Runner, path: string): Promise<Worktr
   if (gitDir === commonDir) {
     return `${root} is the main checkout. Work in a worktree: git worktree add -b <type>/<topic> ~/.worktrees/${repo}/<topic> origin/<default branch>`;
   }
-  const branch = await git(run, root, "symbolic-ref", "--short", "-q", "HEAD");
-  if (!branch) return `${root} has a detached HEAD; switch to a branch first`;
+  const jj = isJj(root);
+  const branch = jj ? await jjBranch(run, root) : await git(run, root, "symbolic-ref", "--short", "-q", "HEAD");
+  if (!branch) {
+    return jj
+      ? `${root} has no bookmark for its branch; create one: jj bookmark create <type>/<topic> -r @-`
+      : `${root} has a detached HEAD; switch to a branch first`;
+  }
   const main = await defaultBranch(run, root);
   if (branch === main) return `${root} is on the default branch ${main}; changes go on a <type>/<topic> branch`;
   const mainRoot = basename(commonDir ?? "") === ".git" ? dirname(commonDir as string) : (commonDir as string);
-  return { root, branch, defaultBranch: main, repo, slug: repoSlug(origin), mainRoot };
+  return { root, branch, defaultBranch: main, repo, slug: repoSlug(origin), mainRoot, ...(jj ? { jj } : {}) };
 }
 
 /** Whether the repository uses Conventional Commits (a checker or release-please), and recent subjects. */

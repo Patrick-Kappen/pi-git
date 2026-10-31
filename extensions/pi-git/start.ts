@@ -1,9 +1,11 @@
 import { existsSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import type { Backend } from "./backend.ts";
 import { detectCommand } from "./check.ts";
 import type { Config } from "./config.ts";
 import { clipStart, outputOf, type Runner } from "./exec.ts";
 import { commitStyle, defaultBranch, repoName, repoSlug } from "./git.ts";
+import { isJj, jj, jjBranch, jjStart, track } from "./jj.ts";
 
 /** The commit types a branch may start with, as in the git skill. */
 export const TYPES = ["feat", "fix", "docs", "refactor", "test", "build", "ci", "chore", "perf"] as const;
@@ -34,6 +36,8 @@ export interface StartDeps {
   home: string;
   progress: (text: string) => void;
   signal?: AbortSignal | undefined;
+  /** How new worktrees of a repository are made; default: git. */
+  backendOf?: (slug: string) => Backend;
 }
 
 /** Where the owner keeps main checkouts, searched for `owner/name` and `name`. */
@@ -149,6 +153,8 @@ interface Plan {
   resume: boolean;
   /** What the branch starts from: `origin/<base>`, or the local branch `<base>` (a worktree not pushed yet). */
   from: string;
+  /** A jj workspace instead of a git worktree. */
+  jj: boolean;
 }
 
 /** Everything git_start needs before it adds the worktree, or why it cannot. */
@@ -173,7 +179,7 @@ async function plan(input: StartInput, deps: StartDeps): Promise<Plan | StartRes
     return { ok: false, summary: `the branch ${branch} exists already; pick another topic, or remove the old branch` };
   }
   const resume = (await git(deps, main, "rev-parse", "--verify", "-q", `origin/${branch}`)) !== undefined;
-  return { main, slug, branch, path, base, defaultName, resume, from };
+  return { main, slug, branch, path, base, defaultName, resume, from, jj: deps.backendOf?.(slug) === "jj" };
 }
 
 /**
@@ -194,7 +200,9 @@ async function existing(
   slug: string,
   base: string,
 ): Promise<StartResult> {
-  const current = await git(deps, path, "symbolic-ref", "--short", "-q", "HEAD");
+  const current = isJj(path)
+    ? await jjBranch(deps.run, path)
+    : await git(deps, path, "symbolic-ref", "--short", "-q", "HEAD");
   if (current !== branch)
     return { ok: false, summary: `${path} exists${current ? ` on ${current}` : ""}; pick another topic` };
   const behind = Number((await git(deps, path, "rev-list", "--count", `HEAD..origin/${base}`)) ?? 0);
@@ -202,20 +210,51 @@ async function existing(
   return { ok: true, summary: `The worktree already exists: ${path} (${branch})${note}`, path, branch, slug };
 }
 
+/** What the agent needs to know in a jj workspace. */
+export const JJ_NOTE =
+  "History: jj (a jj workspace). Edit files as usual and do not commit yourself: each of your turns becomes a wip: commit, and git_commit or git_pr turns them into logical commits.";
+
+async function addWorktree(deps: StartDeps, plan: Plan): Promise<string | undefined> {
+  const { main, branch, path, resume, from } = plan;
+  const args = resume
+    ? ["worktree", "add", "--track", "-b", branch, path, `origin/${branch}`]
+    : ["worktree", "add", "--no-track", "-b", branch, path, from];
+  const added = await deps.run("git", args, { cwd: main, env: OWN, signal: deps.signal });
+  return added.code === 0 ? undefined : `git worktree add failed:\n${clipStart(outputOf(added), 600)}`;
+}
+
+/** The jj route: a colocated workspace (a git worktree too) with the branch as a bookmark. */
+async function addWorkspace(deps: StartDeps, plan: Plan): Promise<string | undefined> {
+  const { main, branch, path, resume, from } = plan;
+  if (!isJj(main)) {
+    // The backend is jj, but the repository has no jj yet: colocate it, git keeps working as before.
+    deps.progress("jj git init --colocate: the backend of this repository is jj");
+    const init = await jj(deps.run, main, ["git", "init", "--colocate"], deps.signal);
+    if (init.code !== 0) return `jj git init --colocate failed in ${main}:\n${clipStart(outputOf(init), 600)}`;
+  }
+  const topic = path.split("/").at(-1) ?? branch;
+  const failure = await jjStart(
+    deps.run,
+    { main, path, topic, branch, from: resume ? `origin/${branch}` : from },
+    deps.signal,
+  );
+  if (failure) return clipStart(failure, 600);
+  if (resume) await track(deps.run, path, branch);
+  return undefined;
+}
+
 /** Creates the worktree of a new change: fetch, worktree and branch from the fresh base, setup. */
 export async function gitStart(input: StartInput, deps: StartDeps): Promise<StartResult> {
   const planned = await plan(input, deps);
   if ("ok" in planned) return planned;
   const { main, slug, branch, path, base, defaultName, resume, from } = planned;
-  const args = resume
-    ? ["worktree", "add", "--track", "-b", branch, path, `origin/${branch}`]
-    : ["worktree", "add", "--no-track", "-b", branch, path, from];
   deps.progress(resume ? `worktree on the existing origin/${branch}` : `worktree from ${from}`);
-  const added = await deps.run("git", args, { cwd: main, env: OWN, signal: deps.signal });
-  if (added.code !== 0) return { ok: false, summary: `git worktree add failed:\n${clipStart(outputOf(added), 600)}` };
+  const failure = planned.jj ? await addWorkspace(deps, planned) : await addWorktree(deps, planned);
+  if (failure) return { ok: false, summary: failure };
   const lines = [
     `Worktree: ${path}`,
     `Branch: ${branch}${resume ? ` (continues origin/${branch})` : ` from ${from}`}`,
+    ...(planned.jj ? [JJ_NOTE] : []),
     ...(from === base
       ? [`Stacked on the local branch ${base}, which is not on GitHub yet: push it (or open its PR) before this PR.`]
       : []),

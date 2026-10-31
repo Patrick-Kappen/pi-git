@@ -5,8 +5,22 @@ import type { Config } from "./config.ts";
 import { clipEnd, clipStart, outputOf, type Runner, type RunResult } from "./exec.ts";
 import { commitStyle, findPullRequest, inspectWorktree, type PullRequest, prNumber, type Worktree } from "./git.ts";
 import { askJson, runHelper } from "./helper.ts";
+import {
+  applyPlan,
+  changedFiles,
+  countWork,
+  gatherWork,
+  hasWork,
+  onRemote,
+  type PlannedCommit,
+  parsePlan,
+  pushTarget,
+  rebaseOnRemote,
+  setBookmark,
+  track,
+} from "./jj.ts";
 import { stringField } from "./json.ts";
-import { fixPrompt, messagePrompt, messageRetryPrompt, pullRequestPrompt, type Stage } from "./prompts.ts";
+import { fixPrompt, messagePrompt, messageRetryPrompt, pullRequestPrompt, type Stage, splitPrompt } from "./prompts.ts";
 import type { Step } from "./switch.ts";
 
 export interface PrInput {
@@ -175,10 +189,41 @@ class Flow {
 
   /** The main agent's title did not pass the commit-msg hook: the helper writes the PR text too. */
   private titleRejected = false;
+  /**
+   * The work of a jj workspace spans several turns: the main agent's title covers only its last
+   * one, so the helper splits the work and writes the PR text, with the title as a hint.
+   */
+  private severalTurns = false;
 
   stageAll = async (): Promise<void> => {
     await this.git(["add", "-A"]);
   };
+
+  /** The base, when the change is stacked on another branch (jj keeps that branch's commits out of the work). */
+  private get stackBase(): string | undefined {
+    return this.base === this.wt.defaultBranch ? undefined : this.base;
+  }
+
+  /** What is pushed and goes in the PR: HEAD, or in a jj workspace the branch (HEAD is the work in progress there). */
+  get tip(): string {
+    return this.wt.jj ? `refs/heads/${this.wt.branch}` : "HEAD";
+  }
+
+  /** Whether the worktree has changes to commit: uncommitted files, or work in progress in a jj workspace. */
+  async hasChanges(): Promise<boolean> {
+    if (this.wt.jj) return hasWork(this.deps.run, this.wt.root, this.stackBase);
+    return (await this.gitText("status", "--porcelain")) !== "";
+  }
+
+  /** Commits ahead of the base; in a jj workspace, the branch first moves to the newest logical commit. */
+  async ahead(): Promise<number | string> {
+    if (this.wt.jj) {
+      const target = await pushTarget(this.deps.run, this.wt.root, this.stackBase);
+      if (target instanceof Error) return target.message;
+      if (target) await setBookmark(this.deps.run, this.wt.root, this.wt.branch, target);
+    }
+    return Number((await this.gitText("rev-list", "--count", `origin/${this.base}..${this.tip}`)) || 0);
+  }
 
   /** Ask the helper for a commit message that the commit-msg hook accepts. */
   async writeMessage(): Promise<Message | Error> {
@@ -192,7 +237,7 @@ class Flow {
       `Staged diff:\n${clipStart(diff, MAX_DIFF)}`,
     ].join("\n\n");
     let prompt = messagePrompt(this.conventional);
-    if (this.input.title) {
+    if (this.input.title && !this.severalTurns) {
       const own = { subject: this.input.title.trim(), body: this.input.intent.trim() };
       const file = this.file("COMMIT_MSG", messageText(own));
       const hook = await this.git(["hook", "run", "--ignore-missing", "commit-msg", "--", file]);
@@ -220,6 +265,7 @@ class Flow {
 
   /** Stage, run the pre-commit checks until green, write the message, commit. */
   async commit(): Promise<{ sha: string; subject: string } | string> {
+    if (this.wt.jj) return this.jjCommit();
     await this.stageAll();
     this.deps.progress("pre-commit: running the checks");
     const precommit = await this.untilGreen(
@@ -244,11 +290,125 @@ class Flow {
 
   /** Whether HEAD is already on origin. */
   async headPushed(): Promise<boolean> {
-    return (await this.gitText("branch", "-r", "--contains", "HEAD")) !== "";
+    return (await this.gitText("branch", "-r", "--contains", this.tip)) !== "";
+  }
+
+  /** The pre-commit checks on all changes until green; undefined when they pass. */
+  private preCommit(): Promise<string | undefined> {
+    this.deps.progress("pre-commit: running the checks");
+    return this.untilGreen(
+      "pre-commit",
+      () => this.git(["hook", "run", "--ignore-missing", "pre-commit"], this.checkTimeout),
+      this.stageAll,
+    );
+  }
+
+  /**
+   * The jj route: collect the work in progress of all turns in the working-copy commit, run the
+   * pre-commit checks on it, and make logical commits that the commit-msg hook accepts.
+   */
+  private async jjCommit(): Promise<{ sha: string; subject: string } | string> {
+    this.severalTurns = (await countWork(this.deps.run, this.wt.root, this.stackBase)) > 1;
+    const gathered = await gatherWork(this.deps.run, this.wt.root, this.stackBase);
+    if (gathered) return gathered;
+    await this.stageAll();
+    const precommit = await this.preCommit();
+    if (precommit !== undefined) return `The pre-commit checks still fail:\n${precommit}`;
+    await this.stageAll();
+    const plan = await this.planCommits();
+    if (plan instanceof Error) return `No commit message: ${plan.message}`;
+    this.deps.progress(plan.length > 1 ? `committing as ${plan.length} commits` : "committing");
+    const failure = await applyPlan(this.deps.run, this.wt.root, plan);
+    if (failure) return failure;
+    await setBookmark(this.deps.run, this.wt.root, this.wt.branch, "@-");
+    const subjects = plan.map((commit) => commit.message.split("\n")[0] ?? "");
+    return {
+      sha: await this.gitText("rev-parse", "--short", this.tip),
+      subject: subjects.length > 1 ? `${subjects.length} commits: ${subjects.join("; ")}` : (subjects[0] ?? ""),
+    };
+  }
+
+  /** How the changes become commits: the helper's split, or one commit with the agent's title or one file. */
+  private async planCommits(): Promise<PlannedCommit[] | Error> {
+    const files = await changedFiles(this.deps.run, this.wt.root);
+    if (files.length === 0) return new Error("no changes left after the checks");
+    const single = async (): Promise<PlannedCommit[] | Error> => {
+      const message = await this.writeMessage();
+      return message instanceof Error ? message : [{ files, message: messageText(message) }];
+    };
+    if ((this.input.title && !this.severalTurns) || files.length === 1) return single();
+    const input = [
+      `What the change is for:\n${this.input.intent}`,
+      this.input.title ? `The agent's title, for its last turn only: ${this.input.title}` : "",
+      `Branch: ${this.wt.branch}`,
+      `Recent subjects on ${this.base}:\n${this.recent.join("\n")}`,
+      `Changed files:\n${files.join("\n")}`,
+      `Diff:\n${clipStart(await this.gitText("diff", "--cached"), MAX_DIFF)}`,
+    ]
+      .filter((part) => part !== "")
+      .join("\n\n");
+    let problem: string | undefined;
+    for (let attempt = 0; attempt <= this.deps.config.attempts; attempt++) {
+      this.deps.progress("the helper splits the changes into commits");
+      const plan = await askJson(
+        this.deps.run,
+        this.deps.config,
+        { cwd: this.wt.root, prompt: splitPrompt(this.conventional, problem), input, signal: this.deps.signal },
+        (value) => parsePlan(value, files),
+      );
+      // A split the helper cannot get right becomes one commit.
+      if (plan instanceof Error) return single();
+      problem = await this.rejected(plan);
+      if (problem === undefined) return plan;
+    }
+    return single();
+  }
+
+  /** The output of the commit-msg hook for the first message it rejects. */
+  private async rejected(plan: readonly PlannedCommit[]): Promise<string | undefined> {
+    for (const commit of plan) {
+      const hook = await this.git([
+        "hook",
+        "run",
+        "--ignore-missing",
+        "commit-msg",
+        "--",
+        this.file("COMMIT_MSG", commit.message),
+      ]);
+      if (hook.code !== 0) return clipEnd(outputOf(hook), 4000);
+    }
+    return undefined;
+  }
+
+  /** The jj route of commitFix: fold the fix into an unpushed commit, else make it a commit of its own. */
+  private jjCommitFix = async (): Promise<void> => {
+    const { run } = this.deps;
+    const { root, branch } = this.wt;
+    if (!(await hasWork(run, root, this.stackBase))) return;
+    const tip = `bookmarks(exact:${JSON.stringify(branch)})`;
+    if (!(await onRemote(run, root, tip))) {
+      await this.jj(["squash", "--into", tip, "--use-destination-message"]);
+      return;
+    }
+    await this.stageAll();
+    const message = await this.writeMessage();
+    const text = message instanceof Error ? "fix: make the checks pass\n" : messageText(message);
+    await this.jj(["describe", "-m", text]);
+    await this.jj(["new"]);
+    await setBookmark(run, root, branch, "@-");
+  };
+
+  private jj(args: string[]) {
+    return this.deps.run("jj", ["--no-pager", "--color=never", ...args], {
+      cwd: this.wt.root,
+      env: { PI_GIT_SWITCH: "" },
+      signal: this.deps.signal,
+    });
   }
 
   /** After the helper fixed a pre-push failure: amend an unpushed commit, else add a commit. */
   commitFix = async (): Promise<void> => {
+    if (this.wt.jj) return this.jjCommitFix();
     await this.stageAll();
     if ((await this.git(["diff", "--cached", "--quiet"])).code === 0) return;
     if (!(await this.headPushed())) {
@@ -262,6 +422,7 @@ class Flow {
 
   /** Push; when GitHub has commits the worktree lacks (the watcher pushed), rebase on them first. */
   push = async (): Promise<RunResult> => {
+    if (this.wt.jj) return this.jjPush();
     const lease = this.input.forceWithLease;
     if (lease !== undefined) {
       return this.git(
@@ -284,6 +445,31 @@ class Flow {
     return this.git(["push", "-u", "origin", "HEAD"], this.checkTimeout);
   };
 
+  /**
+   * The jj route of push: `git push` of the branch (so the pre-push hook runs), then jj follows the
+   * branch on GitHub. When GitHub has commits the workspace lacks, jj rebases on them first.
+   */
+  private jjPush = async (): Promise<RunResult> => {
+    const { run } = this.deps;
+    const { root, branch } = this.wt;
+    const ref = `refs/heads/${branch}:refs/heads/${branch}`;
+    const lease = this.input.forceWithLease;
+    const args =
+      lease === undefined ? ["push", "origin", ref] : ["push", `--force-with-lease=${branch}:${lease}`, "origin", ref];
+    let push = await this.git(args, this.checkTimeout);
+    if (push.code !== 0 && lease === undefined && /\[rejected\]|non-fast-forward|fetch first/.test(push.stderr)) {
+      this.deps.progress("the branch on GitHub moved; rebasing on it with jj");
+      const failure = await rebaseOnRemote(run, root, branch);
+      if (failure)
+        return { ...push, stderr: `The branch on GitHub has commits that conflict with this workspace.\n${failure}` };
+      const ahead = await this.ahead();
+      if (typeof ahead === "string") return { ...push, stderr: ahead };
+      push = await this.git(args, this.checkTimeout);
+    }
+    if (push.code === 0) await track(run, root, branch);
+    return push;
+  };
+
   private template(): string {
     for (const name of [
       ".github/pull_request_template.md",
@@ -300,7 +486,7 @@ class Flow {
   async pullRequest(
     existing: PullRequest | undefined,
   ): Promise<{ number: number; url: string; created: boolean } | string> {
-    const range = `origin/${this.base}...HEAD`;
+    const range = `origin/${this.base}...${this.tip}`;
     const stacked =
       this.base === this.wt.defaultBranch ? undefined : await findPullRequest(this.deps.run, this.wt.root, this.base);
     const input = [
@@ -308,9 +494,12 @@ class Flow {
         ? `This PR is stacked on PR #${stacked.number} (${this.base}). Start the body with: "Stacked on #${stacked.number}; merge that first."`
         : "",
       `What the change is for:\n${this.input.intent}`,
+      this.input.title && this.severalTurns
+        ? `The agent's title, for its last turn only (the change has several turns): ${this.input.title}`
+        : "",
       `Branch: ${this.wt.branch} into ${this.base}`,
       `Recent subjects on ${this.base}:\n${this.recent.join("\n")}`,
-      `Commits:\n${clipStart(await this.gitText("log", "--format=- %s%n%n%b", `origin/${this.base}..HEAD`), 8000)}`,
+      `Commits:\n${clipStart(await this.gitText("log", "--format=- %s%n%n%b", `origin/${this.base}..${this.tip}`), 8000)}`,
       `Changed files:\n${await this.gitText("diff", "--stat", range)}`,
       `Diff:\n${clipStart(await this.gitText("diff", range), MAX_DIFF)}`,
       "Testing: the pre-commit and pre-push hooks of the repository passed locally.",
@@ -320,7 +509,8 @@ class Flow {
     ]
       .filter((part) => part !== "")
       .join("\n\n");
-    const text = this.input.title && !this.titleRejected ? this.ownText() : await this.helperText(existing, input);
+    const own = this.input.title && !this.titleRejected && !this.severalTurns;
+    const text = own ? this.ownText() : await this.helperText(existing, input);
     if (text instanceof Error) return `No PR text: ${text.message}`;
     return this.publish(existing, text);
   }
@@ -441,8 +631,7 @@ export async function gitCommit(input: PrInput, deps: Deps): Promise<PrResult> {
   if ("ok" in started) return started;
   const { wt, flow } = started;
   try {
-    if ((await flow.gitText("status", "--porcelain")) === "")
-      return failed(`nothing to commit in ${wt.root}`, flow, { worktree: wt });
+    if (!(await flow.hasChanges())) return failed(`nothing to commit in ${wt.root}`, flow, { worktree: wt });
     const commit = await flow.commit();
     if (typeof commit === "string")
       return failed(`${commit}\n\nThe changes are staged in ${wt.root}.`, flow, { worktree: wt });
@@ -481,10 +670,9 @@ export async function gitPush(input: PrInput, deps: Deps): Promise<PrResult> {
   try {
     const failure = await pushStep(flow, wt, undefined, deps);
     if (failure) return failure;
-    const dirty =
-      (await flow.gitText("status", "--porcelain")) !== ""
-        ? " Uncommitted changes stay in the worktree; git_commit commits them."
-        : "";
+    const dirty = (await flow.hasChanges())
+      ? " Uncommitted changes stay in the worktree; git_commit commits them."
+      : "";
     const fixed =
       flow.notes.length > 0
         ? `\nThe helper fixed on the way:\n${flow.notes.map((note) => `- ${note}`).join("\n")}`
@@ -522,7 +710,7 @@ async function commitStep(
   wt: Worktree,
   allowed: (step: Step) => boolean,
 ): Promise<{ commit: Commit } | PrResult> {
-  if ((await flow.gitText("status", "--porcelain")) === "") return { commit: undefined };
+  if (!(await flow.hasChanges())) return { commit: undefined };
   if (!allowed("commit")) return stop("commit", flow, wt, undefined);
   const made = await flow.commit();
   if (typeof made === "string")
@@ -533,7 +721,9 @@ async function commitStep(
 /** Push, when there is something to push and pushing is allowed. */
 async function pushStep(flow: Flow, wt: Worktree, commit: Commit, deps: Deps): Promise<PrResult | undefined> {
   const { base } = flow;
-  if ((await flow.gitText("rev-list", "--count", `origin/${base}..HEAD`)) === "0") {
+  const ahead = await flow.ahead();
+  if (typeof ahead === "string") return failed(ahead, flow, { worktree: wt });
+  if (ahead === 0) {
     return failed(`nothing to do: no changes in ${wt.root} and no commits ahead of origin/${base}`, flow, {
       worktree: wt,
     });

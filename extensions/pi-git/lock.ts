@@ -1,3 +1,4 @@
+import { type Backend, isBackend } from "./backend.ts";
 import { effective, isStep, type Lock, loadSwitch, type RepoSettings, STEPS, type Step } from "./switch.ts";
 
 /** The state of every step in a repository. */
@@ -88,6 +89,7 @@ export function describeLock(
     "/git unlock|lock|reset [steps]: this repository. /git global unlock|lock|reset [steps]: everywhere else.",
     "/git worktree <topic> [type], /git commit [intent], /git push, /git pr [intent]: once, also when the step is locked.",
     "/git clear: forget what needs you.",
+    "/git backend git|jj|reset: how git_start makes new worktrees of this repository (jj: colocated jj workspaces).",
   );
   return lines.join("\n");
 }
@@ -98,6 +100,7 @@ export type GitCommand =
   | { kind: "set"; scope: "repo" | "global"; steps: Step[]; lock: Lock | undefined }
   | { kind: "run"; step: Step; args: string }
   | { kind: "clear" }
+  | { kind: "backend"; choice: Backend | "reset" | undefined }
   | { kind: "bad" };
 
 const ACTIONS: Record<string, Lock | undefined> = { lock: "locked", unlock: "unlocked", reset: undefined };
@@ -111,6 +114,11 @@ export function parseGitCommand(args: string): GitCommand {
   if (words.length === 0) return { kind: "show" };
   if (isStep(words[0])) return { kind: "run", step: words[0], args: words.slice(1).join(" ") };
   if (words[0] === "clear" && words.length === 1) return { kind: "clear" };
+  if (words[0] === "backend" && words.length <= 2) {
+    const choice = words[1];
+    if (choice === undefined) return { kind: "backend", choice: undefined };
+    return isBackend(choice) || choice === "reset" ? { kind: "backend", choice } : { kind: "bad" };
+  }
   const scope = words[0] === "global" ? "global" : "repo";
   const rest = scope === "global" ? words.slice(1) : words;
   const [action, ...steps] = rest;
@@ -133,6 +141,10 @@ export function gitCompletions(prefix: string): Array<{ value: string; label: st
     "push",
     "pr",
     "clear",
+    "backend",
+    "backend git",
+    "backend jj",
+    "backend reset",
   ];
   return items.filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
 }

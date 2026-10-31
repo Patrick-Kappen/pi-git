@@ -30,6 +30,8 @@ describe("defaults", () => {
       delivery: "turn",
       locked: true,
       repos: {},
+      backend: "git",
+      backends: {},
       runtimeDir: "/home/u/.local/state/pi-git/run",
       shipNixos: undefined,
       shipHost: expect.any(String),
@@ -96,6 +98,18 @@ describe("parseConfig", () => {
     expect(parseConfig({ repos: [] }, base, home).errors).toEqual(['cfg: "repos" must be an object of patterns']);
     expect(parseConfig({ repos: { "o/r": "maybe" } }, base, home).errors).toEqual([
       'cfg: "repos": every pattern needs "locked", "unlocked" or steps',
+    ]);
+  });
+
+  test("backend and backends", () => {
+    const config = parseConfig({ backend: "jj", backends: { "o/*": "git", "o/r": "jj" } }, base, home);
+    expect([config.backend, config.backends, config.errors]).toEqual(["jj", { "o/*": "git", "o/r": "jj" }, []]);
+    expect(parseConfig({ backend: "hg", backends: { "o/r": "hg" } }, base, home).errors).toEqual([
+      'cfg: "backend" must be "git" or "jj"',
+      'cfg: "backends": every pattern needs "git" or "jj"',
+    ]);
+    expect(parseConfig({ backends: ["jj"] }, base, home).errors).toEqual([
+      'cfg: "backends" must be an object of patterns',
     ]);
   });
 

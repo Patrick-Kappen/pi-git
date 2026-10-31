@@ -80,6 +80,12 @@ describe("parseGitCommand", () => {
     ["push", { kind: "run", step: "push", args: "" }],
     ["worktree login-timeout fix", { kind: "run", step: "worktree", args: "login-timeout fix" }],
     ["pr", { kind: "run", step: "pr", args: "" }],
+    ["backend", { kind: "backend", choice: undefined }],
+    ["backend jj", { kind: "backend", choice: "jj" }],
+    ["backend git", { kind: "backend", choice: "git" }],
+    ["backend reset", { kind: "backend", choice: "reset" }],
+    ["backend hg", { kind: "bad" }],
+    ["backend jj now", { kind: "bad" }],
     ["unlock nope", { kind: "bad" }],
     ["global", { kind: "bad" }],
     ["maybe", { kind: "bad" }],
@@ -90,5 +96,6 @@ describe("parseGitCommand", () => {
   test("completions", () => {
     expect(gitCompletions("unlock p").map((item) => item.value)).toEqual(["unlock push", "unlock pr"]);
     expect(gitCompletions("co").map((item) => item.value)).toEqual(["commit"]);
+    expect(gitCompletions("backend j").map((item) => item.value)).toEqual(["backend jj"]);
   });
 });

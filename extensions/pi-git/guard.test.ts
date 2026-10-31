@@ -109,6 +109,36 @@ describe("ghWrites", () => {
   });
 });
 
+describe("jj", () => {
+  test("changes and their steps; reading commands are free", () => {
+    expect(gitChanges("jj git push -b x; jj --at-op abc commit -m y; jj workspace add ../w", "/w", "/h")).toEqual([
+      { what: "jj git push", step: "push", dir: "/w" },
+      { what: "jj commit", step: "commit", dir: "/w" },
+      { what: "jj workspace add", step: "worktree", dir: "/w" },
+    ]);
+    expect(gitChanges("jj -R ~/r bookmark set b -r @-; jj describe -m x", "/w", "/h")).toEqual([
+      { what: "jj bookmark set", step: "worktree", dir: "/h/r" },
+      { what: "jj describe", step: "commit", dir: "/w" },
+    ]);
+    expect(gitChanges("jj git remote add o url", "/w", "/h")).toEqual([
+      { what: "jj git remote", step: "commit", dir: "/w" },
+    ]);
+    expect(
+      gitChanges(
+        "jj log -r @; jj st; jj diff; jj bookmark list; jj git fetch; jj git remote list; jj op log; jj workspace list; jj --color never show; jj",
+        "/w",
+        "/h",
+      ),
+    ).toEqual([]);
+  });
+
+  test("the helper may read with jj, not change", () => {
+    expect(blockedForHelper("jj diff && jj log")).toBeUndefined();
+    expect(blockedForHelper("jj squash")).toBe("jj squash");
+    expect(blockedForHelper("jj git push")).toBe("jj git push");
+  });
+});
+
 describe("gitChanges", () => {
   test("directories from cd and -C, the repository from gh -R, and the step", () => {
     expect(gitChanges("git status && git commit -m x", "/w", "/home/u")).toEqual([

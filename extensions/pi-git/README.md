@@ -299,6 +299,37 @@ failing checks or CI, a conflict, or a commit message and PR text that the main 
   (`commit`, `push`, `rebase`, `reset`, `add`, ...) and `gh`: pi-git does those itself;
 - every prompt starts with `/skill:git` when `skill` is set, so the helper follows the git skill.
 
+## The jj backend
+
+git is the default. jj is an option next to it, per repository: `/git backend jj` in pi (remembered
+in `backends.json` in the state directory), `backends` in the config with patterns, or `backend` for
+every repository. `/git backend reset` follows the config again, and `/git` shows which backend new
+worktrees get. The backend only decides how `git_start` makes a new worktree; a worktree that exists
+keeps its kind.
+
+With jj, `git_start` makes a colocated jj workspace (`jj workspace add --colocate`): a git worktree
+as well, with the branch as a bookmark. In a repository without jj it runs `jj git init --colocate`
+in the main checkout first; git keeps working there as before, and the main checkout keeps its
+branch.
+
+- **One commit per turn.** At the end of every agent run, pi-git names the working-copy commit of
+  each jj workspace the agent worked in `wip: <the prompt>` and starts a new one. A run that changed
+  nothing makes no commit. The history of a change is its turns, and `jj undo` or `jj restore` goes
+  back to any of them.
+- **`git_commit` and `git_pr`** collect the `wip:` commits (and the working copy) into one change, run
+  the pre-commit hook on it (`git add -A` stages it for the hook), and let the helper split it by
+  file into logical commits with messages that the commit-msg hook accepts. With a `title`, or one
+  changed file, it is one commit. Commits the agent described itself stay as they are.
+- **Pushing** moves the bookmark to the newest logical commit and runs `git push`, so the pre-push
+  hook runs. When the branch on GitHub moved (the watcher pushed a fix), jj rebases on it first; on
+  conflicts everything is put back (`jj op restore`).
+- **The watcher** fixes red CI in a jj workspace like in a git worktree, and removes the workspace
+  after the merge (`jj workspace forget`, and the bookmark). A conflict with the base, or a stacked
+  PR whose base was merged, needs you for now: the watcher does not rebase jj workspaces yet.
+- **The lock** also covers jj, which runs no git hooks: `jj git push` is `push`, `jj workspace` and
+  `jj bookmark` are `worktree`, and the other jj commands that change history are `commit`. The
+  helper may only read with jj.
+
 ## Configuration
 
 `~/.pi/agent/pi-git.json` (Home Manager writes this file; see the [main README](../../README.md)):
@@ -315,6 +346,8 @@ failing checks or CI, a conflict, or a commit message and PR text that the main 
 | `delivery` | `turn` | How a summary reaches the main agent: `turn`, `message` or `notify` |
 | `locked` | `true` | Whether git changes are locked where neither `/git` nor `repos` says anything |
 | `repos` | `{}` | Locks per repository pattern: `{ "my-org/*": "locked", "my-org/app": { "push": "locked" } }` |
+| `backend` | `git` | How `git_start` makes new worktrees: `git` worktrees, or colocated `jj` workspaces |
+| `backends` | `{}` | Backends per repository pattern: `{ "my-org/sandbox": "jj" }`; `/git backend` wins over them |
 | `runtimeDir` | `$XDG_RUNTIME_DIR/pi-git` | Locks and session heartbeats; they must not survive a reboot |
 | `stateDir` | `~/.local/state/pi-git` | The queue, the summaries, the attention list and the switch: keep it across reboots (impermanence: persist it) |
 
