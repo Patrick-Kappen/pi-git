@@ -430,7 +430,15 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext) {
       const target = await slugOf(params.path ?? ctx.cwd);
       const step = params.step as Step | undefined;
-      const how = step ? ` /git unlock ${step}, or /git ${step} once.` : "";
+      // The agent often names the commands itself; add them only when it did not.
+      const how = step && !params.reason.includes("/git ") ? ` /git unlock ${step}, or /git ${step} once.` : "";
+      // A request for a step replaces the item of the blocked call that led to it.
+      if (step) {
+        clearAttention(
+          config.stateDir,
+          (item) => item.kind === "blocked" && item.step === step && item.repo?.toLowerCase() === target?.toLowerCase(),
+        );
+      }
       needYou(ctx, {
         kind: "request",
         ...(target ? { repo: target } : {}),

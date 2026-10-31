@@ -659,4 +659,22 @@ describe("the lock", () => {
     expect(notify).toHaveBeenLastCalledWith("git_pr stopped: x", "error");
     handlers.get("session_shutdown")?.({}, ctx());
   });
+
+  test("git_request replaces the blocked item of its step, and does not repeat the commands", async () => {
+    const { handlers, tools, ctx, stateDir } = load({ locked: true });
+    await handlers.get("session_start")?.({}, ctx());
+    await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git push" } }, ctx());
+    const request = tools.find((tool) => tool.name === "git_request");
+    await request?.execute(
+      "id",
+      { reason: "Committed; push is locked, run /git push once.", step: "push" },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    expect(listAttention(stateDir).map((item) => [item.kind, item.text])).toEqual([
+      ["request", "o/r: Committed; push is locked, run /git push once."],
+    ]);
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
 });
