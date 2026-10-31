@@ -1,4 +1,4 @@
-import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -725,5 +725,68 @@ describe("the watch event", () => {
     }
     events.emit(WATCH_EVENT, { pr: "7", path: "/w" });
     await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+});
+
+describe("/git backend", () => {
+  test("shows, sets and resets the backend of the repository", async () => {
+    const { commands, ctx, notify, stateDir } = load({ backends: { "o/*": "jj" } });
+    const git = commands.get("git");
+    await git?.handler("backend", ctx());
+    expect(notify).toHaveBeenLastCalledWith(
+      'pi-git: o/r: new worktrees: jj ("backends" in the config (o/*)); /git backend git|jj|reset',
+      "info",
+    );
+    await git?.handler("backend git", ctx());
+    expect(JSON.parse(readFileSync(join(stateDir, "backends.json"), "utf8"))).toEqual({ "o/r": "git" });
+    expect(notify).toHaveBeenLastCalledWith(
+      "pi-git: o/r: new worktrees: git (/git backend); /git backend git|jj|reset",
+      "info",
+    );
+    await git?.handler("backend reset", ctx());
+    await git?.handler("", ctx());
+    expect(notify.mock.lastCall?.[0]).toContain("new worktrees: jj");
+  });
+});
+
+describe("work in progress in jj workspaces", () => {
+  test("the end of a run makes a wip: commit in the jj workspaces the agent worked in", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-git-wip-"));
+    const workspace = join(dir, "ws");
+    mkdirSync(join(workspace, ".jj"), { recursive: true });
+    writeFileSync(join(workspace, ".git"), "gitdir: elsewhere\n");
+    mkdirSync(join(dir, "main", ".jj"), { recursive: true });
+    mkdirSync(join(dir, "main", ".git"));
+    writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir: join(dir, "state") }));
+    const calls: string[] = [];
+    const runner: Runner = async (command, args, options) => {
+      calls.push(`${options.cwd}: ${command} ${args.filter((arg) => !arg.startsWith("--")).join(" ")}`);
+      return { code: 0, stdout: args.includes("log") ? "open\n" : "", stderr: "" };
+    };
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      on: (name: string, handler: never) => handlers.set(name, handler),
+      registerTool: vi.fn(),
+      registerCommand: vi.fn(),
+      sendMessage: vi.fn(),
+    };
+    createPiGit(pi as never, { env: { PI_GIT_CONFIG: join(dir, "pi-git.json") }, home: dir, run: runner });
+    const ctx = { cwd: dir, hasUI: false, ui: { notify: vi.fn(), setStatus: vi.fn() } };
+    handlers.get("before_agent_start")?.(
+      { messageType: "user", prompt: "Add the thing\nwith details", systemPromptOptions: { sections: {} } },
+      ctx,
+    );
+    await handlers.get("tool_call")?.({ toolName: "edit", input: { path: "ws/src/a.ts" } }, ctx);
+    await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "cd main && ls" } }, ctx);
+    calls.length = 0;
+    await handlers.get("agent_end")?.({ messages: [] }, ctx);
+    expect(calls.filter((call) => !call.includes(" log "))).toEqual([
+      `${workspace}: jj describe -m wip: Add the thing`,
+      `${workspace}: jj new`,
+    ]);
+    // Nothing is left for the next run.
+    calls.length = 0;
+    await handlers.get("agent_end")?.({ messages: [] }, ctx);
+    expect(calls).toEqual([]);
   });
 });

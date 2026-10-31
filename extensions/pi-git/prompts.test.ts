@@ -7,6 +7,7 @@ import {
   messagePrompt,
   messageRetryPrompt,
   pullRequestPrompt,
+  splitPrompt,
   summaryPrompt,
 } from "./prompts.ts";
 
@@ -22,6 +23,14 @@ describe("prompts", () => {
     expect(messagePrompt(true)).toContain("uses Conventional Commits");
     expect(messagePrompt(false)).toContain("does not use Conventional Commits");
     expect(messageRetryPrompt(true, "bad")).toMatch(/rejected the previous message:\nbad$/);
+  });
+
+  test("split into logical commits", () => {
+    expect(splitPrompt(true)).toContain("Split by file: every changed file in the input goes into exactly one commit.");
+    expect(splitPrompt(true)).toContain("uses Conventional Commits");
+    expect(splitPrompt(false)).toContain("does not use Conventional Commits");
+    expect(splitPrompt(false)).not.toContain("rejected");
+    expect(splitPrompt(true, "use feat:")).toMatch(/rejected a message of the previous answer:\nuse feat:$/);
   });
 
   test("pull request, new or updated", () => {

@@ -4,6 +4,7 @@ import { addAttention, attentionId, clearAttention, notifyTerminals } from "./at
 import type { Config } from "./config.ts";
 import { clipEnd, outputOf, type Runner } from "./exec.ts";
 import { runHelper } from "./helper.ts";
+import { hasWork, isWorkspace, jjAtHead, jjForget } from "./jj.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { ciFixPrompt, conflictPrompt } from "./prompts.ts";
 import {
@@ -17,6 +18,10 @@ import {
   saveEntry,
 } from "./state.ts";
 import { effective, loadSwitch, type Step } from "./switch.ts";
+
+/** A conflict in a jj workspace: the watcher does not rebase with jj yet. */
+const JJ_REBASE = (base: string) =>
+  `the PR conflicts with ${base}, and the worktree is a jj workspace, which the watcher does not rebase yet: rebase it with jj (jj git fetch; jj rebase -d ${base}@origin), resolve the conflicts, and push with git_push.`;
 
 /** gh's view of a PR, as far as the watcher needs it. */
 export interface PrView {
@@ -221,6 +226,33 @@ class Watch {
     return this.save();
   }
 
+  /** A jj workspace: jj keeps its history, so some steps go through jj. */
+  private get jj(): boolean {
+    return isWorkspace(this.entry.worktree);
+  }
+
+  /** Uncommitted changes, or work in progress of a jj workspace. */
+  private async dirty(): Promise<boolean> {
+    if (this.jj) return hasWork(this.deps.run, this.entry.worktree);
+    return (await this.gitText("status", "--porcelain")) !== "";
+  }
+
+  /** Remove the worktree and its branch: with git, or for a jj workspace also with jj. */
+  private async removeWorktree(): Promise<string | undefined> {
+    const { worktree, mainRoot, branch } = this.entry;
+    const jj = this.jj;
+    const remove = await this.deps.run("git", ["worktree", "remove", ...(jj ? ["--force"] : []), worktree], {
+      cwd: mainRoot,
+    });
+    if (jj) {
+      if (remove.code === 0) await jjForget(this.deps.run, mainRoot, worktree, branch);
+      return remove.code === 0 ? undefined : outputOf(remove);
+    }
+    const deleted = await this.deps.run("git", ["branch", "-D", branch], { cwd: mainRoot });
+    if (remove.code === 0 && deleted.code === 0) return undefined;
+    return `${outputOf(remove)}\n${outputOf(deleted)}`;
+  }
+
   /** After the merge: remove the worktree and the local branch, when the worktree is clean. */
   private async merged(): Promise<void> {
     const { worktree, mainRoot, branch } = this.entry;
@@ -231,19 +263,14 @@ class Watch {
         `is merged. The worktree ${worktree} and the branch are kept: worktree is locked in ${this.entry.repo}.`,
       );
     }
-    if ((await this.gitText("status", "--porcelain")) !== "") {
+    if (await this.dirty()) {
       return this.finish("merged", `is merged. The worktree ${worktree} has uncommitted changes, so it is kept.`);
     }
-    const remove = await this.deps.run("git", ["worktree", "remove", worktree], { cwd: mainRoot });
-    const deleted = await this.deps.run("git", ["branch", "-D", branch], { cwd: mainRoot });
+    const failure = await this.removeWorktree();
     const remote = await this.deleteRemoteBranch();
     await this.deps.run("git", ["fetch", "origin", "--prune"], { cwd: mainRoot });
-    if (remove.code !== 0 || deleted.code !== 0) {
-      return this.finish(
-        "merged",
-        `is merged, but the cleanup failed:\n${clipEnd(`${outputOf(remove)}\n${outputOf(deleted)}`, 2000)}`,
-      );
-    }
+    if (failure !== undefined)
+      return this.finish("merged", `is merged, but the cleanup failed:\n${clipEnd(failure, 2000)}`);
     return this.finish("merged", `is merged; removed the worktree ${worktree} and the branch ${branch}${remote}.`);
   }
 
@@ -264,6 +291,7 @@ class Watch {
 
   /** Bring the worktree to the head of the PR; a string is why that is not possible. */
   private async atHead(head: string): Promise<string | undefined> {
+    if (this.jj) return jjAtHead(this.deps.run, this.entry.worktree, this.entry.branch, head);
     if ((await this.gitText("status", "--porcelain")) !== "")
       return `the worktree ${this.entry.worktree} has uncommitted changes`;
     await this.git(["fetch", "origin", this.entry.branch, this.entry.base]);
@@ -283,6 +311,7 @@ class Watch {
    */
   private async restack(pr: PrView, to: string): Promise<void> {
     if (this.locked("commit", "push")) return this.waitForUnlock(pr, "conflict");
+    if (this.jj) return this.finish("failed", `needs you: ${JJ_REBASE(to)} ${this.entry.url}`);
     const from = this.entry.base;
     const upstream = this.entry.baseSha;
     this.entry.base = to;
@@ -310,6 +339,8 @@ class Watch {
         `needs you: ${what} after ${this.entry.attempts} fixes by the helper. ${this.entry.url}`,
       );
     }
+    if (kind === "conflict" && this.jj)
+      return this.finish("failed", `needs you: ${JJ_REBASE(this.entry.base)} ${this.entry.url}`);
     const problem = await this.atHead(pr.headRefOid);
     if (problem) return this.finish("failed", `needs you: ${problem}. ${this.entry.url}`);
     this.entry.attempts++;
@@ -334,7 +365,10 @@ class Watch {
     if (working === undefined) return;
     delete this.entry.working;
     const done: string[] = [];
-    if (existsSync(this.entry.worktree)) {
+    if (this.jj) {
+      // jj keeps the changes of the fix in the working-copy commit; the next fix sees them and stops.
+      done.push("left the changes of its fix in the working-copy commit of the jj workspace");
+    } else if (existsSync(this.entry.worktree)) {
       const rebaseDirs = await Promise.all(
         ["rebase-merge", "rebase-apply"].map((name) =>
           this.gitText("rev-parse", "--path-format=absolute", "--git-path", name),

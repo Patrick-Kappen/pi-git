@@ -22,6 +22,7 @@ let
     pkgs.jq
     pkgs.gh
     pkgs.git
+    pkgs.jujutsu
     pkgs.coreutils
   ];
   # Hooks also run outside `devenv shell`, so each brings its own PATH. git sets GIT_INDEX_FILE and

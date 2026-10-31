@@ -30,6 +30,11 @@ cannot finish), pi-git sends a notification to your terminals (WezTerm shows it)
 puts a red `●` in the tmux status line. See
 [when the work needs you](extensions/pi-git/README.md#when-the-work-needs-you).
 
+git is the backend by default. With `backend = "jj"` (or `/git backend jj` for one repository),
+`git_start` makes colocated [jj](https://jj-vcs.github.io/jj/) workspaces instead: every agent turn
+becomes a `wip:` commit, and `git_commit` turns them into logical commits, while the git hooks and
+`git push` run as before. See [the jj backend](extensions/pi-git/README.md#the-jj-backend).
+
 It works with the `git` skill of [pi-skills](https://github.com/Patrick-Kappen/pi-skills), which
 both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on the default branch.
 
@@ -69,6 +74,8 @@ both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on
 | `delivery` | `"turn"` | How the watcher's summary reaches the main agent: `turn`, `message` or `notify` |
 | `locked` | `true` | Git changes by agents are locked until you run `/git unlock [worktree commit push pr]` in a repository (remembered); `false` unlocks by default |
 | `repos` | `{ }` | Locks per repository pattern, e.g. `{ "my-org/infra" = "locked"; "my-org/*".push = "locked"; }`; they win over `/git global` and `locked` |
+| `backend` | `"git"` | How `git_start` makes new worktrees: `git`, or colocated `jj` workspaces |
+| `backends` | `{ }` | Backends per repository pattern, e.g. `{ "my-org/sandbox" = "jj"; }`; `/git backend` wins over them |
 | `ship.nixos`, `ship.host` | `null`, the host name | `/ship`: the main checkout of the NixOS configuration, and the host whose deploy check (`deploy-<host>`) confirms a ship |
 | `watcher.enable` | `true` | The systemd user timer `pi-git-watcher` |
 | `watcher.interval` | `"1min"` | How often the watcher runs |

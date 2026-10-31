@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
+import { type Backend, isBackend, toBackends } from "./backend.ts";
 import { type RepoSettings, toSettings } from "./switch.ts";
 
 export const CONFIG_FILE = "pi-git.json";
@@ -36,6 +37,10 @@ export interface Config {
   repos: RepoSettings;
   /** Locks and session heartbeats: gone after a reboot, unlike `stateDir`. */
   runtimeDir: string;
+  /** How git_start makes new worktrees: git worktrees, or colocated jj workspaces. */
+  backend: Backend;
+  /** Backends per repository pattern; /git backend for a repository wins over them. */
+  backends: Record<string, Backend>;
   /** /ship: the main checkout of the NixOS configuration whose flake.lock locks the releases. */
   shipNixos: string | undefined;
   /** /ship: the host whose deploy check (`deploy-<host>`) confirms the ship. */
@@ -80,6 +85,8 @@ export function defaults(path: string, env: NodeJS.ProcessEnv, home: string): Co
     delivery: "turn",
     locked: true,
     repos: {},
+    backend: "git",
+    backends: {},
     runtimeDir: env.XDG_RUNTIME_DIR
       ? join(expandHome(env.XDG_RUNTIME_DIR, home), "pi-git")
       : join(state, "pi-git", "run"),
@@ -123,8 +130,27 @@ const STRINGS: readonly Field[] = [
 const PATHS: ReadonlySet<Field> = new Set(["skill", "worktrees", "stateDir", "runtimeDir", "shipNixos"]);
 const NUMBERS = ["attempts", "checkTimeout", "helperTimeout"] as const;
 
+/** Apply `backend` or `backends`; a string is the error, undefined for another key. */
+function applyBackend(config: Config, key: string, value: unknown): string | undefined | false {
+  if (key === "backend") {
+    if (!isBackend(value)) return '"backend" must be "git" or "jj"';
+    config.backend = value;
+    return undefined;
+  }
+  if (key !== "backends") return false;
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return '"backends" must be an object of patterns';
+  const backends = toBackends(value);
+  if (Object.keys(backends).length !== Object.keys(value).length)
+    return '"backends": every pattern needs "git" or "jj"';
+  config.backends = backends;
+  return undefined;
+}
+
 /** Apply `locked` or `delivery`; a string is the error. */
 function applyChoice(config: Config, key: string, value: unknown): string | undefined {
+  const backend = applyBackend(config, key, value);
+  if (backend !== false) return backend;
   if (key === "repos") {
     const repos = toSettings(value);
     if (typeof value !== "object" || value === null || Array.isArray(value))

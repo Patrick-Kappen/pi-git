@@ -2,6 +2,6 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": ["extensions/*/index.ts", "test/nix/home-manager-smoke.ts", "extensions/*/watcher.ts"],
   "project": ["extensions/**/*.ts", "test/**/*.ts"],
-  "ignoreBinaries": ["biome"],
+  "ignoreBinaries": ["biome", "jj"],
   "ignoreExportsUsedInFile": true
 }

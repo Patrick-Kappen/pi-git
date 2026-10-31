@@ -100,6 +100,26 @@ export function messagePrompt(conventional: boolean): string {
   ].join("\n");
 }
 
+/** The work in progress of a jj workspace as logical commits, as JSON. */
+export function splitPrompt(conventional: boolean, problem?: string): string {
+  const style = conventional
+    ? "This repository uses Conventional Commits: type(scope): subject, see references/commits.md of the git skill."
+    : "This repository does not use Conventional Commits: follow the style of the recent subjects in the input.";
+  return [
+    "You are the helper of pi-git. The input has a change an agent made over several turns. Split it into logical commits:",
+    "each commit is one coherent step (a feature, a fix, a refactoring, with its tests and docs) that a reviewer can read on its own.",
+    "Split by file: every changed file in the input goes into exactly one commit. One commit is right when the change is one step.",
+    "Order the commits so that each one builds on the ones before it.",
+    style,
+    "Subject: imperative, at most 72 characters, no period. Body: why the change is needed, wrapped at 72;",
+    "empty when the subject says enough.",
+    'Reply with JSON only: {"commits": [{"files": ["path", ...], "subject": "...", "body": "..."}]}',
+    problem ? `\nThe commit-msg hook rejected a message of the previous answer:\n${problem}` : "",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
 /** A rejected message: write a new one. */
 export function messageRetryPrompt(conventional: boolean, problem: string): string {
   return `${messagePrompt(conventional)}\n\nThe commit-msg hook rejected the previous message:\n${problem}`;

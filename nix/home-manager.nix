@@ -32,6 +32,7 @@ let
     (lib.makeBinPath (
       [
         pkgs.git
+        pkgs.jujutsu
         pkgs.gh
         pkgs.nodejs_24
         pkgs.openssh
@@ -159,6 +160,37 @@ in
       '';
     };
 
+    backend = lib.mkOption {
+      type = lib.types.enum [
+        "git"
+        "jj"
+      ];
+      default = "git";
+      description = ''
+        How git_start makes new worktrees: `git` worktrees, or colocated `jj` workspaces, where every
+        agent turn is a work-in-progress commit and git_commit splits the work into logical commits.
+        In a repository without jj, pi-git runs `jj git init --colocate` first. Worktrees that exist
+        keep their kind. /git backend git|jj|reset sets one repository in pi.
+      '';
+    };
+
+    backends = lib.mkOption {
+      type = lib.types.attrsOf (
+        lib.types.enum [
+          "git"
+          "jj"
+        ]
+      );
+      default = { };
+      example = {
+        "my-org/sandbox" = "jj";
+      };
+      description = ''
+        Backends per repository pattern, matched as in `repos`. /git backend for one repository wins
+        over these settings; they win over `backend`.
+      '';
+    };
+
     delivery = lib.mkOption {
       type = lib.types.enum [
         "turn"
@@ -268,6 +300,8 @@ in
             helperTimeout
             delivery
             locked
+            backend
+            backends
             ;
           repos = lib.mapAttrs (
             _: setting:

@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type {
   BeforeAgentStartEvent,
@@ -8,12 +9,14 @@ import type {
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { type Attention, addAttention, clearAttention, listAttention, notifyTerminals } from "./attention.ts";
+import { type Backend, backendOf, describeBackend, setBackend } from "./backend.ts";
 import { gitCheck } from "./check.ts";
 import { type Config, loadConfig } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
 import { repoSlug } from "./git.ts";
-import { blockedForHelper, gitChanges } from "./guard.ts";
+import { blockedForHelper, commandsOf, gitChanges } from "./guard.ts";
 import { HELPER_ENV } from "./helper.ts";
+import { isWorkspace, jjRootOf, wipSnapshot } from "./jj.ts";
 import {
   describeLock,
   type GitCommand,
@@ -80,7 +83,7 @@ function isWatchRequest(data: unknown): data is WatchRequest {
 export const PROMPT_SECTION = "pi_git";
 
 const GIT_USAGE =
-  "pi-git: /git, /git unlock|lock|reset [worktree commit push pr], /git global unlock|lock|reset [steps], /git worktree <topic> [type], /git commit|push|pr [intent], /git clear";
+  "pi-git: /git, /git unlock|lock|reset [worktree commit push pr], /git global unlock|lock|reset [steps], /git worktree <topic> [type], /git commit|push|pr [intent], /git clear, /git backend git|jj|reset";
 
 /** How often a session sends its heartbeat and looks for summaries. */
 export const POLL_MS = 20_000;
@@ -266,6 +269,8 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
 
   let config: Config = loadConfig(env, home);
   const fallback = (): Lock => (config.locked ? "locked" : "unlocked");
+  const chosenBackend = (slug: string | undefined) => backendOf(config.stateDir, slug, config.backends, config.backend);
+  const backendFor = (slug: string): Backend => chosenBackend(slug).backend;
   const slugs = new Map<string, string | undefined>();
   const slugOf = async (dir: string): Promise<string | undefined> => {
     if (!slugs.has(dir)) {
@@ -391,7 +396,39 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     }
   });
 
+  /** The jj workspaces the agent worked in during this run, and what the run is about. */
+  const touched = new Set<string>();
+  let turnLabel = "";
+  const touch = (path: string | undefined, cwd: string) => {
+    if (!path) return;
+    const root = jjRootOf(resolve(cwd, path.replace(/^~(?=\/|$)/, home)));
+    if (root && isWorkspace(root)) touched.add(root);
+  };
+
+  /** Remember the jj workspaces a tool call works in: files it edits, the directory of bash and its cd. */
+  const trackWorkspaces = (event: ToolCallEvent, cwd: string) => {
+    const input = event.input as { path?: unknown; command?: unknown };
+    if (typeof input.path === "string") touch(input.path, cwd);
+    if (event.toolName !== "bash" || typeof input.command !== "string") return;
+    touch(".", cwd);
+    for (const words of commandsOf(input.command)) if (words[0] === "cd") touch(words[1], cwd);
+  };
+
+  // Every agent run in a jj workspace becomes one wip: commit; git_commit turns them into logical commits.
+  pi.on("agent_end", async () => {
+    const roots = [...touched];
+    touched.clear();
+    for (const root of roots) {
+      try {
+        await wipSnapshot(runner, root, turnLabel);
+      } catch {
+        // The workspace may be gone; the next turn tries again.
+      }
+    }
+  });
+
   pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
+    turnLabel = event.messageType === "user" ? event.prompt : "a message from pi-git";
     event.systemPromptOptions.sections[PROMPT_SECTION] = lockPrompt(
       statesOf(config.stateDir, slug, fallback(), config.repos),
       slug,
@@ -399,6 +436,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx): Promise<ToolCallEventResult | undefined> => {
+    trackWorkspaces(event, ctx.cwd);
     if (event.toolName !== "bash" || typeof event.input.command !== "string") return undefined;
     for (const change of gitChanges(event.input.command, ctx.cwd, home)) {
       const target = change.slug ?? (await slugOf(change.dir));
@@ -417,7 +455,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     const steps: Record<Step, () => Promise<{ ok: boolean; summary: string }>> = {
       worktree: () => {
         const [topic = "", type] = args.split(/\s+/);
-        return gitStart({ repo: ctx.cwd, topic, ...(type ? { type } : {}) }, { ...deps, home });
+        return gitStart({ repo: ctx.cwd, topic, ...(type ? { type } : {}) }, { ...deps, home, backendOf: backendFor });
       },
       commit: () => gitCommit({ path: ctx.cwd, intent }, deps),
       push: () => gitPush({ path: ctx.cwd, intent }, deps),
@@ -443,6 +481,16 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     if (command.lock === "unlocked") answered(command.scope === "global" ? undefined : here, command.steps);
   };
 
+  /** /git backend [git|jj|reset]: how git_start makes new worktrees of this repository. */
+  const backendCommand = (choice: Backend | "reset" | undefined, here: string | undefined, ctx: ExtensionContext) => {
+    if (!here) {
+      ctx.ui.notify('pi-git: not in a repository with an origin; set "backend" in the config instead', "warning");
+      return;
+    }
+    if (choice !== undefined) setBackend(config.stateDir, here, choice === "reset" ? undefined : choice);
+    ctx.ui.notify(`pi-git: ${here}: ${describeBackend(chosenBackend(here))}`, "info");
+  };
+
   /** The attention list, for /git. */
   const waitingText = (): string => {
     const items = listAttention(config.stateDir);
@@ -460,6 +508,8 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         ctx.ui.notify(GIT_USAGE, "warning");
       } else if (command.kind === "run") {
         await runOnce(command.step, command.args, ctx);
+      } else if (command.kind === "backend") {
+        backendCommand(command.choice, here, ctx);
       } else if (command.kind === "clear") {
         const count = clearAttention(config.stateDir, () => true);
         showStatus(ctx, here);
@@ -469,7 +519,11 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       } else {
         if (command.kind === "set") applySet(command, here);
         showStatus(ctx, here);
-        ctx.ui.notify(`${describeLock(config.stateDir, here, fallback(), config.repos)}${waitingText()}`, "info");
+        const backend = describeBackend(chosenBackend(here));
+        ctx.ui.notify(
+          `${describeLock(config.stateDir, here, fallback(), config.repos)}\n${backend}${waitingText()}`,
+          "info",
+        );
       }
     },
   });
@@ -576,7 +630,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     ],
     parameters: startParameters,
     async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
-      const deps = { run: runner, config, home, progress: progressOf(onUpdate), signal };
+      const deps = { run: runner, config, home, progress: progressOf(onUpdate), signal, backendOf: backendFor };
       const repo = params.repo ?? ctx.cwd;
       const main = await findMainCheckout(deps, repo);
       if (typeof main !== "string") throw new Error(main.error);

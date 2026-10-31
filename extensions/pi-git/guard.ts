@@ -84,9 +84,78 @@ export function blockedForHelper(line: string): string | undefined {
       const sub = gitSubcommand(words);
       if (sub && BLOCKED_GIT.has(sub)) return `git ${sub}`;
     }
+    if (program === "jj") {
+      const change = jjCommand(words);
+      if (change) return change.what;
+    }
     if (program === "gh") return "gh";
   }
   return undefined;
+}
+
+/** Options of jj that take a value before the subcommand. */
+const JJ_OPTIONS_WITH_VALUE = new Set([
+  "-R",
+  "--repository",
+  "--at-operation",
+  "--at-op",
+  "--color",
+  "--config",
+  "--config-toml",
+  "--config-file",
+]);
+
+/** jj commands that only read (every jj command snapshots the working copy, which changes no history). */
+const READ_JJ = new Set([
+  "diff",
+  "evolog",
+  "help",
+  "interdiff",
+  "log",
+  "obslog",
+  "root",
+  "show",
+  "st",
+  "status",
+  "version",
+]);
+
+/** jj commands that read with some subcommands, and the subcommands that read. */
+const READ_JJ_SUBCOMMANDS: Record<string, ReadonlySet<string>> = {
+  bookmark: new Set(["list", "l"]),
+  b: new Set(["list", "l"]),
+  config: new Set(["get", "list", "path"]),
+  file: new Set(["annotate", "list", "show"]),
+  git: new Set(["fetch"]),
+  op: new Set(["diff", "log", "show"]),
+  operation: new Set(["diff", "log", "show"]),
+  tag: new Set(["list", "l"]),
+  workspace: new Set(["list", "root"]),
+};
+
+/** The step of a jj command that changes something: push, worktree (workspaces, bookmarks), or commit. */
+function jjStep(sub: string, action: string): Step {
+  if (sub === "git" && action === "push") return "push";
+  if (sub === "workspace" || sub === "bookmark" || sub === "b") return "worktree";
+  return "commit";
+}
+
+/** A jj command that changes something: what it is, its step, and the directory of `-R`. */
+function jjCommand(words: readonly string[]): { what: string; step: Step; repository?: string } | undefined {
+  let repository: string | undefined;
+  const rest: string[] = [];
+  for (let i = 1; i < words.length; i++) {
+    const word = words[i] as string;
+    if (word === "-R" || word === "--repository") repository = words[++i];
+    else if (JJ_OPTIONS_WITH_VALUE.has(word)) i++;
+    else if (!word.startsWith("-")) rest.push(word);
+  }
+  const [sub, action = ""] = rest;
+  if (sub === undefined || READ_JJ.has(sub)) return undefined;
+  const reads = READ_JJ_SUBCOMMANDS[sub];
+  if (reads?.has(action) || (sub === "git" && action === "remote" && rest[2] === "list")) return undefined;
+  const what = `jj ${sub}${reads ? ` ${action}` : ""}`.trim();
+  return { what, step: jjStep(sub, action), ...(repository ? { repository } : {}) };
 }
 
 /** git subcommands that only read. */
@@ -262,6 +331,14 @@ function gitChange(words: readonly string[], dir: string, home: string): GitChan
   return undefined;
 }
 
+/** jj runs no git hooks, so this is the only stop for jj in a locked repository. */
+function jjChange(words: readonly string[], dir: string, home: string): GitChange | undefined {
+  const command = jjCommand(words);
+  if (!command) return undefined;
+  const where = command.repository ? resolveDir(command.repository, dir, home) : dir;
+  return { what: command.what, step: command.step, dir: where };
+}
+
 function ghChange(words: readonly string[], dir: string): GitChange | undefined {
   const args = words.slice(1);
   if (!ghWrites(args)) return undefined;
@@ -283,7 +360,13 @@ export function gitChanges(line: string, cwd: string, home: string): GitChange[]
     const program = (words[0] as string).replace(/^.*\//, "");
     if (program === "cd") dir = resolveDir(words[1] ?? home, dir, home);
     const change =
-      program === "git" ? gitChange(words, dir, home) : program === "gh" ? ghChange(words, dir) : undefined;
+      program === "git"
+        ? gitChange(words, dir, home)
+        : program === "gh"
+          ? ghChange(words, dir)
+          : program === "jj"
+            ? jjChange(words, dir, home)
+            : undefined;
     if (change) changes.push(change);
   }
   return changes;

@@ -94,7 +94,7 @@ function patternRegExp(pattern: string): RegExp {
 }
 
 /** The patterns that match a repository, the most specific first: without `*`, then with fewer, then longer. */
-export function matchingPatterns(settings: RepoSettings, slug: string): string[] {
+export function matchingPatterns(settings: Readonly<Record<string, unknown>>, slug: string): string[] {
   const stars = (pattern: string) => pattern.split("*").length - 1;
   return Object.keys(settings)
     .filter((pattern) => patternRegExp(pattern).test(slug.toLowerCase()))

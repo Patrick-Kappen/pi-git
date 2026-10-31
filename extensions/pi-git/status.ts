@@ -4,6 +4,7 @@ import { listAttention } from "./attention.ts";
 import type { Config } from "./config.ts";
 import type { Runner } from "./exec.ts";
 import { repoSlug } from "./git.ts";
+import { isWorkspace, jjBranch, jjSummary } from "./jj.ts";
 import { type Entry, entryId, loadEntries, saveEntry } from "./state.ts";
 
 /** At most this many worktree lines, so the result stays small. */
@@ -34,20 +35,40 @@ function directories(path: string): string[] {
   }
 }
 
-/** One line about a worktree: branch, uncommitted files, unpushed commits, and whether the watcher has it. */
-async function describeWorktree(run: Runner, path: string, watched: Map<string, Entry>): Promise<string | undefined> {
-  if (!existsSync(join(path, ".git"))) return undefined;
+/** The branch and the state of a git worktree: uncommitted files, unpushed commits. */
+async function gitState(run: Runner, path: string): Promise<{ branch: string; parts: string[] }> {
   const branch = (await git(run, path, "symbolic-ref", "--short", "-q", "HEAD")) ?? "detached";
   const dirty = ((await git(run, path, "status", "--porcelain")) ?? "").split("\n").filter(Boolean).length;
   const upstream = await git(run, path, "rev-parse", "--abbrev-ref", "@{u}");
   const ahead = upstream ? Number((await git(run, path, "rev-list", "--count", "@{u}..HEAD")) ?? 0) : undefined;
+  return {
+    branch,
+    parts: [
+      dirty > 0 ? `${dirty} uncommitted` : "",
+      ahead === undefined ? "not pushed" : ahead > 0 ? `${ahead} unpushed` : "",
+    ],
+  };
+}
+
+/** The branch and the state of a jj workspace: commits in progress, logical commits not on GitHub. */
+async function jjState(run: Runner, path: string): Promise<{ branch: string; parts: string[] }> {
+  const state = await jjSummary(run, path);
+  return {
+    branch: `${state.branch}, jj`,
+    parts: [
+      state.wip > 0 ? `${state.wip} in progress` : "",
+      !state.pushed ? "not pushed" : state.unpushed > 0 ? `${state.unpushed} unpushed` : "",
+    ],
+  };
+}
+
+/** One line about a worktree: branch, uncommitted files, unpushed commits, and whether the watcher has it. */
+async function describeWorktree(run: Runner, path: string, watched: Map<string, Entry>): Promise<string | undefined> {
+  if (!existsSync(join(path, ".git"))) return undefined;
+  const { branch, parts } = isWorkspace(path) ? await jjState(run, path) : await gitState(run, path);
   const entry = watched.get(path);
-  const parts = [
-    dirty > 0 ? `${dirty} uncommitted` : "",
-    ahead === undefined ? "not pushed" : ahead > 0 ? `${ahead} unpushed` : "",
-    entry ? `PR #${entry.number} ${entry.status}` : "no PR in the watcher",
-  ].filter(Boolean);
-  return `- ${basename(dirname(path))}/${basename(path)} (${branch}): ${parts.join(", ")}`;
+  parts.push(entry ? `PR #${entry.number} ${entry.status}` : "no PR in the watcher");
+  return `- ${basename(dirname(path))}/${basename(path)} (${branch}): ${parts.filter(Boolean).join(", ")}`;
 }
 
 /** Everything in progress: watched PRs, what needs the user, and the worktrees. Reads only. */
@@ -105,10 +126,12 @@ export async function worktreeOf(
   const blocks = list.split("\n\n").filter(Boolean);
   const main = /^worktree (.+)$/m.exec(blocks[0] ?? "")?.[1];
   for (const block of blocks.slice(1)) {
-    if (new RegExp(`^branch refs/heads/${branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m").test(block)) {
-      const path = /^worktree (.+)$/m.exec(block)?.[1];
-      if (path && main) return { path, main };
-    }
+    const path = /^worktree (.+)$/m.exec(block)?.[1];
+    if (!path || !main) continue;
+    if (new RegExp(`^branch refs/heads/${branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m").test(block))
+      return { path, main };
+    // A jj workspace has a detached HEAD; its branch is a bookmark.
+    if (/^detached$/m.test(block) && isWorkspace(path) && (await jjBranch(run, path)) === branch) return { path, main };
   }
   return undefined;
 }
