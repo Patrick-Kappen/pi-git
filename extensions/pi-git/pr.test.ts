@@ -154,6 +154,28 @@ describe("gitPr", () => {
     expect(helper).toMatch(/^answer\|/m);
   });
 
+  test("with a title: committed and opened without the helper", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await pr({ title: "feat: own title", intent: "Because the test says so." });
+    expect(result.ok).toBe(true);
+    expect(result.commit?.subject).toBe("feat: own title");
+    const branch = `feat/topic-${counter}`;
+    expect(sh(origin, "log", "-1", "--format=%s%n%b", branch)).toBe("feat: own title\nBecause the test says so.");
+    expect(readFileSync(ghLog, "utf8")).toContain(
+      `pr create --base main --head ${branch} --title feat: own title --body-file`,
+    );
+    // No helper ran: no fixes were needed, and the text came from the title and the intent.
+    expect(readFileSync(helperLog, "utf8")).toBe("");
+  });
+
+  test("a title the commit-msg hook rejects: the helper writes one that passes", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await pr({ title: "added stuff" });
+    expect(result.commit?.subject).toBe("feat: add the thing");
+    expect(readFileSync(ghLog, "utf8")).not.toContain("--title added stuff");
+    expect(readFileSync(helperLog, "utf8")).toMatch(/^answer\|/m);
+  });
+
   test("a draft PR", async () => {
     writeFileSync(join(worktree, "a.txt"), "a\n");
     const result = await pr({ draft: true });

@@ -14,6 +14,11 @@ export interface PrInput {
   path: string;
   /** What the change is for, in the main agent's words. */
   intent: string;
+  /**
+   * The commit subject and PR title, in the repository's style. With it, pi-git commits and opens the
+   * PR itself (the intent is the body); the helper only writes them when it is missing or rejected.
+   */
+  title?: string;
   /** The base branch; default: the base of the open PR, else the default branch. */
   base?: string;
   draft?: boolean;
@@ -168,6 +173,9 @@ class Flow {
     }
   }
 
+  /** The main agent's title did not pass the commit-msg hook: the helper writes the PR text too. */
+  private titleRejected = false;
+
   stageAll = async (): Promise<void> => {
     await this.git(["add", "-A"]);
   };
@@ -184,6 +192,15 @@ class Flow {
       `Staged diff:\n${clipStart(diff, MAX_DIFF)}`,
     ].join("\n\n");
     let prompt = messagePrompt(this.conventional);
+    if (this.input.title) {
+      const own = { subject: this.input.title.trim(), body: this.input.intent.trim() };
+      const file = this.file("COMMIT_MSG", messageText(own));
+      const hook = await this.git(["hook", "run", "--ignore-missing", "commit-msg", "--", file]);
+      if (hook.code === 0) return own;
+      this.titleRejected = true;
+      // The title does not pass the repository's commit-msg hook: the helper writes one that does.
+      prompt = messageRetryPrompt(this.conventional, clipEnd(outputOf(hook), 4000));
+    }
     for (let attempt = 0; attempt <= this.deps.config.attempts; attempt++) {
       this.deps.progress("the helper writes the commit message");
       const message = await askJson(
@@ -303,8 +320,24 @@ class Flow {
     ]
       .filter((part) => part !== "")
       .join("\n\n");
+    const text = this.input.title && !this.titleRejected ? this.ownText() : await this.helperText(existing, input);
+    if (text instanceof Error) return `No PR text: ${text.message}`;
+    return this.publish(existing, text);
+  }
+
+  /** The PR text from the main agent's title and intent: no helper. */
+  private ownText(): { title: string; body: string } {
+    const notes =
+      this.notes.length > 0 ? `\n\nFixed by the helper on the way:\n${this.notes.map((n) => `- ${n}`).join("\n")}` : "";
+    return {
+      title: (this.input.title ?? "").trim(),
+      body: `${this.input.intent.trim()}\n\n## Testing\nThe pre-commit and pre-push hooks of the repository passed locally.${notes}\n`,
+    };
+  }
+
+  private async helperText(existing: PullRequest | undefined, input: string) {
     this.deps.progress(existing ? `the helper updates PR #${existing.number}` : "the helper writes the PR");
-    const text = await askJson(
+    return askJson(
       this.deps.run,
       this.deps.config,
       {
@@ -315,7 +348,9 @@ class Flow {
       },
       parseTitle,
     );
-    if (text instanceof Error) return `No PR text: ${text.message}`;
+  }
+
+  private async publish(existing: PullRequest | undefined, text: { title: string; body: string }) {
     const bodyFile = this.file("PR_BODY.md", text.body);
     if (existing) {
       const edit = await this.deps.run(

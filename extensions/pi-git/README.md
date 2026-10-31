@@ -8,7 +8,8 @@ failing checks and writes the commit message and the PR. The main agent only see
 
 | Parameter | Meaning |
 |---|---|
-| `intent` | What the change is for and why: the basis of the commit message and the PR. |
+| `intent` | What the change is for and why: the body of the commit and the PR. |
+| `title` | The commit subject and PR title in the repository's style. With it, pi-git writes the commit and the PR itself; without it, or when the `commit-msg` hook rejects it, the helper writes them. |
 | `path` | A directory in the worktree; default: the working directory. |
 | `base` | The base branch; default: that of the open PR, else the default branch. |
 | `draft` | Open the PR as a draft. |
@@ -104,8 +105,9 @@ and looks for summaries every 20 seconds:
 
 Delivered summaries stay in `<stateDir>/delivered` for seven days, then the watcher deletes them.
 
-`delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
-adds it to the context for your next prompt, `notify` only shows it to you.
+Each summary goes into the history once. `delivery` decides how: with `turn` (default), a PR that
+needs the agent (the watcher gave up) starts a turn; green, merged and closed PRs are added quietly
+for the next prompt. `message` adds every summary quietly, `notify` only shows it to you.
 
 ## `git_start`
 
@@ -141,7 +143,8 @@ the helper does not fix. Uncommitted changes stay in the worktree.
 
 | Parameter | Meaning |
 |---|---|
-| `intent` | What the change is for and why: the basis of the commit message. |
+| `intent` | What the change is for and why: the body of the commit message. |
+| `title` | The commit subject; without it, or when the `commit-msg` hook rejects it, the helper writes the message. |
 | `path` | A directory in the worktree; default: the working directory. |
 
 Commits all changes of the worktree, as `git_pr` does in its first step: stage everything, run the
@@ -267,7 +270,9 @@ notifications off.
 
 ## The helper
 
-The helper is `pi -p` with its own model, started in the worktree:
+The helper is `pi -p` with its own model, started in the worktree, and only when something needs it:
+failing checks or CI, a conflict, or a commit message and PR text that the main agent did not give
+(no `title`, or one the `commit-msg` hook rejects). Everything else is plain commands.
 
 - answers (commit message, PR) run with `--no-extensions` and only the `read` tool, so it can read
   the references of the git skill;
