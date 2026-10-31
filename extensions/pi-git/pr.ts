@@ -33,6 +33,8 @@ export interface PrResult {
   pr?: { number: number; url: string; created: boolean };
   /** What the helper did, per step. */
   notes: string[];
+  /** The locked step the run stopped before. */
+  stopped?: Step;
 }
 
 export interface Deps {
@@ -430,9 +432,17 @@ type Commit = PrResult["commit"];
 
 /** Stop before a locked step: an error when nothing was done yet, else what was done. */
 function stop(step: Step, flow: Flow, wt: Worktree, commit: Commit): PrResult {
-  if (!commit) return failed(stoppedAt(step, ""), flow, { worktree: wt });
+  if (!commit) return failed(stoppedAt(step, ""), flow, { worktree: wt, stopped: step });
   const done = `Committed ${commit.sha} "${commit.subject}" on ${wt.branch}. `;
-  return { ok: true, summary: stoppedAt(step, done), worktree: wt, base: flow.base, commit, notes: flow.notes };
+  return {
+    ok: true,
+    summary: stoppedAt(step, done),
+    worktree: wt,
+    base: flow.base,
+    commit,
+    notes: flow.notes,
+    stopped: step,
+  };
 }
 
 /** Commit the changes, when there are any and committing is allowed. */
@@ -488,7 +498,15 @@ async function prStep(
     };
   if (!(deps.allowed ?? (() => true))("pr")) {
     const done = `${commit ? `Committed ${commit.sha} "${commit.subject}"; ` : ""}pushed ${wt.branch}. `;
-    return { ok: true, summary: stoppedAt("pr", done), worktree: wt, base: flow.base, ...committed, notes: flow.notes };
+    return {
+      ok: true,
+      summary: stoppedAt("pr", done),
+      worktree: wt,
+      base: flow.base,
+      ...committed,
+      notes: flow.notes,
+      stopped: "pr",
+    };
   }
   const pr = await flow.pullRequest(existing);
   if (typeof pr === "string") return failed(`${pr}\n\nThe branch ${wt.branch} is pushed.`, flow, { worktree: wt });

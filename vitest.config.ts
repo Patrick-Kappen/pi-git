@@ -3,7 +3,8 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     // Hooks run inside git; its variables would point git calls in tests at this repository.
-    env: { GIT_DIR: "", GIT_INDEX_FILE: "", GIT_WORK_TREE: "" },
+    // No test may notify the terminals of the person running them.
+    env: { GIT_DIR: "", GIT_INDEX_FILE: "", GIT_WORK_TREE: "", PI_GIT_NO_NOTIFY: "1" },
     projects: [
       { test: { name: "unit", include: ["extensions/**/*.test.ts"] } },
       {

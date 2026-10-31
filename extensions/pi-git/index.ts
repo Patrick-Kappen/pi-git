@@ -7,6 +7,7 @@ import type {
   ToolCallEvent,
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
+import { type Attention, addAttention, clearAttention, listAttention, notifyTerminals } from "./attention.ts";
 import { gitCheck } from "./check.ts";
 import { type Config, loadConfig } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
@@ -36,7 +37,7 @@ import {
   saveEntry,
   sessionAlive,
 } from "./state.ts";
-import { effective, type Lock, loadSwitch, type Step, setGlobal, setRepo, switchPath } from "./switch.ts";
+import { effective, type Lock, loadSwitch, STEPS, type Step, setGlobal, setRepo, switchPath } from "./switch.ts";
 
 export interface Options {
   env?: NodeJS.ProcessEnv;
@@ -128,6 +129,17 @@ const commitParameters = Type.Object({
   path: Type.Optional(Type.String({ description: "A directory in the worktree; default: the working directory." })),
 });
 
+const requestParameters = Type.Object({
+  reason: Type.String({ description: "What you need from the user and why, in one or two sentences." }),
+  step: Type.Optional(
+    Type.Union(
+      STEPS.map((step) => Type.Literal(step)),
+      { description: "The locked step the work needs, if any." },
+    ),
+  ),
+  path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
+});
+
 const checkParameters = Type.Object({
   path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
   command: Type.Optional(
@@ -177,7 +189,39 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
   const lockOf = (target: string | undefined, step: Step): Lock =>
     effective(loadSwitch(config.stateDir), target, step, fallback()).lock;
   const showStatus = (ctx: ExtensionContext, target: string | undefined): void => {
-    if (ctx.hasUI) ctx.ui.setStatus("pi-git", statusText(statesOf(config.stateDir, target, fallback())));
+    const waiting = listAttention(config.stateDir).length;
+    const text = statusText(statesOf(config.stateDir, target, fallback()));
+    if (ctx.hasUI) ctx.ui.setStatus("pi-git", waiting > 0 ? `${text} ● ${waiting}` : text);
+  };
+  /** Something needs the user: remember it (the tmux sign shows it) and notify once. */
+  const needYou = (ctx: ExtensionContext, item: Omit<Attention, "id" | "created">): void => {
+    try {
+      const { fresh } = addAttention(config.stateDir, item);
+      if (!fresh) return;
+      if (ctx.hasUI) ctx.ui.notify(item.text, "warning");
+      void notifyTerminals(runner, "pi-git", item.text).catch(() => 0);
+      showStatus(ctx, slug);
+    } catch {
+      // A state directory that cannot be written: the agent still gets the reason.
+    }
+  };
+  const blocked = (ctx: ExtensionContext, step: Step, what: string, target: string | undefined): void =>
+    needYou(ctx, {
+      kind: "blocked",
+      ...(target ? { repo: target } : {}),
+      step,
+      text: `The agent wanted ${what} ${target ? `in ${target}` : "here"}, but ${step} is locked: /git unlock ${step}, or /git ${step} once.`,
+    });
+  /** Forget what an unlock or a one-time action answered: items about those steps, not questions. */
+  const answered = (repo: string | undefined, steps: readonly Step[]): void => {
+    clearAttention(
+      config.stateDir,
+      (item) =>
+        item.kind !== "watcher" &&
+        (repo === undefined || item.repo?.toLowerCase() === repo.toLowerCase()) &&
+        item.step !== undefined &&
+        (steps.length === 0 || steps.includes(item.step)),
+    );
   };
   const progressOf = (
     onUpdate: ((update: { content: Array<{ type: "text"; text: string }>; details: undefined }) => void) | undefined,
@@ -257,6 +301,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     for (const change of gitChanges(event.input.command, ctx.cwd, home)) {
       const target = change.slug ?? (await slugOf(change.dir));
       if (lockOf(target, change.step) === "locked") {
+        blocked(ctx, change.step, change.what, target);
         return { block: true, reason: lockedReason(change.step, change.what, target) };
       }
     }
@@ -269,12 +314,20 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       { path: ctx.cwd, intent: intent || "(no intent given: describe the change from the diff)" },
       { run: runner, config, progress: () => {} },
     );
+    if (result.ok) answered(await slugOf(ctx.cwd), ["commit"]);
     ctx.ui.notify(result.summary, result.ok ? "info" : "error");
   };
 
   const applySet = (command: Extract<GitCommand, { kind: "set" }>, here: string | undefined): void => {
     if (command.scope === "global") setGlobal(config.stateDir, command.steps, command.lock);
     else setRepo(config.stateDir, here as string, command.steps, command.lock);
+    if (command.lock === "unlocked") answered(command.scope === "global" ? undefined : here, command.steps);
+  };
+
+  /** The attention list, for /git. */
+  const waitingText = (): string => {
+    const items = listAttention(config.stateDir);
+    return items.length === 0 ? "" : `\nneeds you:\n${items.map((item) => `- ${item.text}`).join("\n")}`;
   };
 
   pi.registerCommand("git", {
@@ -288,13 +341,48 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         ctx.ui.notify(GIT_USAGE, "warning");
       } else if (command.kind === "run") {
         await commitOnce(command.intent, ctx);
+      } else if (command.kind === "clear") {
+        const count = clearAttention(config.stateDir, () => true);
+        showStatus(ctx, here);
+        ctx.ui.notify(`pi-git: forgot ${count} item(s) that needed you`, "info");
       } else if (command.kind === "set" && command.scope === "repo" && !here) {
         ctx.ui.notify("pi-git: not in a repository with an origin; use /git global unlock|lock|reset", "warning");
       } else {
         if (command.kind === "set") applySet(command, here);
         showStatus(ctx, here);
-        ctx.ui.notify(describeLock(config.stateDir, here, fallback()), "info");
+        ctx.ui.notify(`${describeLock(config.stateDir, here, fallback())}${waitingText()}`, "info");
       }
+    },
+  });
+
+  pi.registerTool({
+    name: "git_request",
+    label: "Git request",
+    description: [
+      "Tell the user that the work needs them: a locked step (commit, push, pr, worktree) that a real change needs, or",
+      "a decision only they can make. The user gets a notification; do not work around the lock, and wait for them.",
+    ].join(" "),
+    promptSnippet: "Tell the user the work needs them (a locked step, a decision)",
+    promptGuidelines: [
+      "Use git_request when a locked git step or a decision of the user blocks the task; then stop and wait.",
+    ],
+    parameters: requestParameters,
+    async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext) {
+      const target = await slugOf(params.path ?? ctx.cwd);
+      const step = params.step as Step | undefined;
+      const how = step ? ` /git unlock ${step}, or /git ${step} once.` : "";
+      needYou(ctx, {
+        kind: "request",
+        ...(target ? { repo: target } : {}),
+        ...(step ? { step } : {}),
+        text: `${target ? `${target}: ` : ""}${params.reason}${how}`,
+      });
+      return {
+        content: [
+          { type: "text", text: "The user is notified. Do not work around it; stop here until the user answers." },
+        ],
+        details: undefined,
+      };
     },
   });
 
@@ -311,7 +399,10 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
       const path = params.path ?? ctx.cwd;
       const target = await slugOf(path);
-      if (lockOf(target, "commit") === "locked") throw new Error(lockedReason("commit", "git_commit", target));
+      if (lockOf(target, "commit") === "locked") {
+        blocked(ctx, "commit", "git_commit", target);
+        throw new Error(lockedReason("commit", "git_commit", target));
+      }
       const result = await gitCommit(
         { path, intent: params.intent },
         { run: runner, config, progress: progressOf(onUpdate), signal },
@@ -346,6 +437,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         },
         { run: runner, config, progress, signal, allowed },
       );
+      if (result.stopped) blocked(ctx, result.stopped, "git_pr", target);
       if (!result.ok) throw new Error(result.summary);
       let text = result.summary;
       try {

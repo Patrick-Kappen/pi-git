@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { addAttention, attentionId, clearAttention, notifyTerminals } from "./attention.ts";
 import type { Config } from "./config.ts";
 import { clipEnd, outputOf, type Runner } from "./exec.ts";
 import { runHelper } from "./helper.ts";
@@ -127,11 +128,29 @@ class Watch {
     });
   }
 
-  /** Report a final state and stop watching. */
-  private finish(status: FinalStatus, text: string): void {
+  /** Report a final state and stop watching. A failure needs the user; anything else answers it. */
+  private async finish(status: FinalStatus, text: string): Promise<void> {
     this.entry.status = status;
-    this.report(`pi-git: PR #${this.entry.number} (${this.entry.repo}) ${text}${this.notesText()}`);
+    const full = `pi-git: PR #${this.entry.number} (${this.entry.repo}) ${text}${this.notesText()}`;
+    this.report(full);
     removeEntry(this.config.stateDir, this.entry.id);
+    if (status === "failed") await this.needYou(full);
+    else this.answered();
+  }
+
+  /** Remember that the PR needs the user (the tmux sign shows it), and notify once. */
+  private async needYou(text: string): Promise<void> {
+    const { fresh } = addAttention(
+      this.config.stateDir,
+      { kind: "watcher", repo: this.entry.repo, text },
+      this.entry.id,
+    );
+    if (fresh) await notifyTerminals(this.deps.run, "pi-git", text);
+  }
+
+  private answered(): void {
+    const id = attentionId("watcher", this.entry.repo, this.entry.id);
+    clearAttention(this.config.stateDir, (item) => item.id === id);
   }
 
   private async view(): Promise<PrView | undefined> {
@@ -172,6 +191,7 @@ class Watch {
       this.entry.status = "green";
       this.entry.greenSha = pr.headRefOid;
       this.save();
+      this.answered();
       return this.report(
         `pi-git: PR #${this.entry.number} (${this.entry.repo}) is green and ready to merge: ${this.entry.url}${this.notesText()}`,
       );
@@ -279,15 +299,15 @@ class Watch {
   }
 
   /** Report once per head that a fix waits for /git unlock. */
-  private waitForUnlock(pr: PrView, kind: "ci" | "conflict"): void {
+  private async waitForUnlock(pr: PrView, kind: "ci" | "conflict"): Promise<void> {
     const reported = this.entry.lockedSha === pr.headRefOid;
     this.entry.lockedSha = pr.headRefOid;
     this.save();
     if (reported) return;
     const what = kind === "ci" ? "CI fails" : "it conflicts with the base";
-    this.report(
-      `pi-git: PR #${this.entry.number} (${this.entry.repo}): ${what}, but git changes are locked in ${this.entry.repo}. Unlock commit and push (/git unlock commit push) to let the helper fix it. ${this.entry.url}`,
-    );
+    const text = `pi-git: PR #${this.entry.number} (${this.entry.repo}): ${what}, but git changes are locked in ${this.entry.repo}. Unlock commit and push (/git unlock commit push) to let the helper fix it. ${this.entry.url}`;
+    this.report(text);
+    await this.needYou(text);
   }
 
   private async failedLogs(pr: PrView): Promise<string> {

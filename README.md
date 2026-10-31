@@ -19,6 +19,11 @@ Agents may not change git repositories until you allow it, per step (`worktree`,
 as your own action. See
 [the lock](extensions/pi-git/README.md#the-lock).
 
+When the work needs you (a locked step, a request of the agent with `git_request`, a PR the watcher
+cannot finish), pi-git sends a notification to your terminals (WezTerm shows it) and `pi-git-status`
+puts a red `●` in the tmux status line. See
+[when the work needs you](extensions/pi-git/README.md#when-the-work-needs-you).
+
 It works with the `git` skill of [pi-skills](https://github.com/Patrick-Kappen/pi-skills), which
 both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on the default branch.
 
@@ -61,6 +66,7 @@ both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on
 | `watcher.interval` | `"1min"` | How often the watcher runs |
 | `watcher.environment` | `{ }` | Extra environment, for example `SSH_AUTH_SOCK = "%t/ssh-agent";` for `git push` |
 | `watcher.packages` | `[ ]` | Extra tools on the watcher's PATH, for the hooks of your repositories |
+| `statusPackage` | `packages.<system>.pi-git-status` | Installed in your profile: `#(pi-git-status)` in the tmux status line shows a red `●` with what needs you |
 | `package`, `agentDir` | this flake, `.pi/agent` | The extension, and pi's agent directory |
 
 ## A hard stop in git hooks

@@ -30,6 +30,7 @@
     {
       packages = forAllSystems (pkgs: rec {
         pi-git = pkgs.callPackage ./nix/package.nix { inherit version; };
+        pi-git-status = pkgs.callPackage ./nix/status.nix { };
         default = pi-git;
       });
 

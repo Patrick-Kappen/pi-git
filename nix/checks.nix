@@ -27,7 +27,20 @@ let
   };
 in
 {
-  inherit (packages) pi-git;
+  inherit (packages) pi-git pi-git-status;
+
+  # pi-git-status prints nothing without items, and a red mark with the count with items.
+  status =
+    pkgs.runCommand "pi-git-status-check" { nativeBuildInputs = [ packages.pi-git-status ]; }
+      ''
+        export PI_GIT_STATE_DIR=$TMPDIR/state
+        test -z "$(pi-git-status)"
+        mkdir -p $PI_GIT_STATE_DIR/attention
+        echo '{}' > $PI_GIT_STATE_DIR/attention/a.json
+        echo '{}' > $PI_GIT_STATE_DIR/attention/b.json
+        test "$(pi-git-status)" = '#[fg=red]● 2#[default] '
+        touch $out
+      '';
 
   # Builds a Home Manager configuration with the module and reads the generated files with node.
   home-manager =
@@ -51,6 +64,7 @@ in
         grep -q "SSH_AUTH_SOCK=%t/ssh-agent" "$unit"
         grep -q "PI_GIT_CONFIG=/home/check/.pi/agent/pi-git.json" "$unit"
         test -f "$homeFiles/.config/systemd/user/pi-git-watcher.timer"
+        test -x "${hm.config.home.path}/bin/pi-git-status"
         # One round of the watcher with an empty queue.
         PI_GIT_CONFIG="$homeFiles/$agent/pi-git.json" node "$homeFiles/$agent/extensions/pi-git/watcher.ts" | grep -q "0 PR(s) checked"
         test -f "$(jq -r .skill "$homeFiles/$agent/pi-git.json")/SKILL.md"

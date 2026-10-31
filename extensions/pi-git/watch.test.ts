@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { listAttention } from "./attention.ts";
 import { type Config, defaults } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
 import type { gitPr as GitPr } from "./pr.ts";
@@ -439,5 +440,28 @@ describe("tick", () => {
     saveEntry(config.stateDir, { ...entry, working: "ci", worktree: join(root, "gone") });
     await once();
     expect(texts().join("\n")).toContain("has no worktree any more");
+  });
+
+  test("a PR that needs the user is on the attention list until it is answered", async () => {
+    saveEntry(config.stateDir, { ...entry, attempts: 2 });
+    view({ statusCheckRollup: [red] });
+    await once();
+    expect(listAttention(config.stateDir).map((item) => [item.kind, item.repo])).toEqual([["watcher", "o/r"]]);
+    expect(listAttention(config.stateDir)[0]?.text).toContain("needs you: CI still fails after 2 fixes");
+    // The PR is queued again (git_pr after a fix by hand) and turns green: answered.
+    saveEntry(config.stateDir, { ...entry, attempts: 0 });
+    view({ statusCheckRollup: [{ status: "COMPLETED", conclusion: "SUCCESS" }] });
+    await once();
+    expect(listAttention(config.stateDir)).toEqual([]);
+  });
+
+  test("a lock that holds back a fix needs the user too", async () => {
+    config = { ...config, locked: true };
+    view({ statusCheckRollup: [red] });
+    await once();
+    expect(listAttention(config.stateDir)[0]?.text).toContain("but git changes are locked in o/r");
+    view({ state: "MERGED" });
+    await once();
+    expect(listAttention(config.stateDir)).toEqual([]);
   });
 });
