@@ -158,7 +158,8 @@ beforeEach(() => {
     worktrees: join(root, `trees${n}`),
     shipNixos: nixos,
   };
-  clock = new Date("2026-01-01T00:00:00Z");
+  // A clock of its own per test: the ship's id, and so its branch in the shared repository, differs.
+  clock = new Date(Date.UTC(2026, 0, 1, 0, n));
   calls.length = 0;
   world = {
     prs: {
@@ -385,6 +386,45 @@ describe("shipTick", () => {
     };
     const ship = await tick();
     expect(ship?.nixos).toMatchObject({ state: "failed", error: "#77: checks fail" });
+  });
+
+  test("the flake.lock PR conflicts after main moved: made again on the fresh main, at most 3 times", async () => {
+    world.prs["o/pi-git"] = [];
+    world.prs["o/Nixos"] = [];
+    await plan([]);
+    await tick();
+    await tick();
+    let ship = await tick();
+    expect(ship?.nixos.state).toBe("check");
+    const worktree = ship?.nixos.worktree ?? "";
+    // Someone merged into main meanwhile; the PR now conflicts.
+    world.nixosPr = { ...pr(77, "flake: lock", { mergeable: "CONFLICTING", headRefOid: "lock1" }), state: "OPEN" };
+    calls.length = 0;
+    ship = await tick();
+    expect(calls).toContain("git fetch origin --prune");
+    expect(calls).toContain("git reset --hard origin/main");
+    expect(calls).toContain("nix flake update pi-skills");
+    expect(gitPr.mock.calls.at(-1)?.[0]).toMatchObject({ path: worktree, forceWithLease: "lock1", updatePr: false });
+    expect(ship?.nixos).toMatchObject({ state: "check", refreshes: 1 });
+    await tick();
+    await tick();
+    ship = await tick();
+    expect(ship?.nixos).toMatchObject({
+      state: "failed",
+      error: "PR #77 still conflicts after 3 new locks on the default branch",
+    });
+  });
+
+  test("a failing push of the new lock", async () => {
+    world.prs["o/pi-git"] = [];
+    world.prs["o/Nixos"] = [];
+    await plan([]);
+    await tick();
+    await tick();
+    await tick();
+    world.nixosPr = { ...pr(77, "flake: lock", { mergeable: "CONFLICTING" }), state: "OPEN" };
+    gitPr.mockResolvedValueOnce({ ok: false, summary: "rejected", notes: [] } as never);
+    expect((await tick())?.nixos.error).toBe("the new flake.lock could not be pushed: rejected");
   });
 
   test("nothing running: no ship, nothing done", async () => {

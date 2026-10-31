@@ -11,6 +11,8 @@ import { type Check, rollup } from "./watch.ts";
 // configuration, merge that, and wait until the host is deployed. The owner's command: it runs in the
 // watcher, out of the agents' sight, and only notifies the owner when something needs them.
 
+/** How often the flake.lock PR is made again on a newer default branch before the ship gives up. */
+export const MAX_REFRESHES = 3;
 /** How long one stage may wait (for CI, a release PR, a tag, a deploy) before the ship gives up on it. */
 export const STAGE_TIMEOUT_MS = 90 * 60 * 1000;
 const RELEASE_LABEL = "autorelease: pending";
@@ -55,6 +57,8 @@ export interface NixItem extends Stage {
   branch?: string;
   pr?: number;
   mergeSha?: string;
+  /** How often the flake.lock PR was made again on a newer default branch, after a conflict. */
+  refreshes?: number;
 }
 
 export interface Ship {
@@ -490,42 +494,77 @@ class Shipping {
     return this.deps.run("git", args, { cwd, ...(timeoutMs ? { timeoutMs } : {}) });
   }
 
-  private async nixUpdate(n: NixItem): Promise<void> {
+  /**
+   * The ship's worktree of the NixOS configuration on the fresh default branch, with the inputs
+   * updated: fetch, start from (or reset to) origin's default branch, nix flake update. The branch
+   * holds only the ship's flake.lock change, so a reset loses nothing. A string is the error.
+   */
+  private async freshLock(n: NixItem): Promise<string | undefined> {
     const { config } = this.deps;
-    const inputs = n.inputs ?? [];
-    const branch = `flake/ship-${this.ship.id.slice(0, 16).toLowerCase()}`;
-    const worktree = join(config.worktrees, repoName(n.repo), `ship-${this.ship.id.slice(0, 16).toLowerCase()}`);
-    if (!existsSync(worktree)) {
-      await this.git(n.root, ["fetch", "origin", "--prune"]);
-      const head = await this.git(n.root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
-      const base = head.code === 0 ? head.stdout.trim() : "origin/main";
-      const added = await this.git(n.root, ["worktree", "add", "--no-track", "-b", branch, worktree, base]);
-      if (added.code !== 0) return this.fail(n, `git worktree add failed: ${clipStart(outputOf(added).trim(), 300)}`);
-    }
-    n.worktree = worktree;
-    n.branch = branch;
-    const update = await this.deps.run("nix", ["flake", "update", ...inputs], {
-      cwd: worktree,
+    const id = this.ship.id.slice(0, 16).toLowerCase();
+    n.branch = `flake/ship-${id}`;
+    n.worktree = join(config.worktrees, repoName(n.repo), `ship-${id}`);
+    await this.git(n.root, ["fetch", "origin", "--prune"]);
+    const head = await this.git(n.root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    const base = head.code === 0 ? head.stdout.trim() : "origin/main";
+    const placed = existsSync(n.worktree)
+      ? await this.git(n.worktree, ["reset", "--hard", base])
+      : await this.git(n.root, ["worktree", "add", "--no-track", "-b", n.branch, n.worktree, base]);
+    if (placed.code !== 0) return `could not put the worktree on ${base}: ${clipStart(outputOf(placed).trim(), 300)}`;
+    const update = await this.deps.run("nix", ["flake", "update", ...(n.inputs ?? [])], {
+      cwd: n.worktree,
       timeoutMs: config.checkTimeout * 1000,
     });
-    if (update.code !== 0) return this.fail(n, `nix flake update failed: ${clipStart(outputOf(update).trim(), 300)}`);
+    return update.code === 0 ? undefined : `nix flake update failed: ${clipStart(outputOf(update).trim(), 300)}`;
+  }
+
+  private lockIntent(n: NixItem): string {
     const tags = this.ship.libs
-      .filter((lib) => inputs.includes(lib.input))
+      .filter((lib) => (n.inputs ?? []).includes(lib.input))
       .map((lib) => `${lib.input} ${lib.tag ?? "latest"}`);
+    return `Lock the new releases in flake.lock: ${tags.join(", ")}. Only flake.lock changes; shipped with pi-git /ship.`;
+  }
+
+  private async nixUpdate(n: NixItem): Promise<void> {
+    const error = await this.freshLock(n);
+    if (error) return this.fail(n, error);
     const result = await this.deps.gitPr(
-      {
-        path: worktree,
-        intent: `Lock the new releases in flake.lock: ${tags.join(", ")}. Only flake.lock changes; shipped with pi-git /ship.`,
-      },
-      { run: this.deps.run, config, progress: () => {} },
+      { path: n.worktree as string, intent: this.lockIntent(n) },
+      { run: this.deps.run, config: this.deps.config, progress: () => {} },
     );
     if (!result.ok || !result.pr) return this.fail(n, `the flake.lock PR failed: ${clipStart(result.summary, 300)}`);
     n.pr = result.pr.number;
     this.move(n, "check");
   }
 
+  /** The default branch moved and the flake.lock PR conflicts: make it again on the fresh branch. */
+  private async refresh(n: NixItem, head: string): Promise<void> {
+    if ((n.refreshes ?? 0) >= MAX_REFRESHES) {
+      return this.fail(n, `PR #${n.pr} still conflicts after ${MAX_REFRESHES} new locks on the default branch`);
+    }
+    n.refreshes = (n.refreshes ?? 0) + 1;
+    const error = await this.freshLock(n);
+    if (error) return this.fail(n, error);
+    const result = await this.deps.gitPr(
+      { path: n.worktree as string, intent: this.lockIntent(n), forceWithLease: head, updatePr: false },
+      { run: this.deps.run, config: this.deps.config, progress: () => {} },
+    );
+    if (!result.ok) return this.fail(n, `the new flake.lock could not be pushed: ${clipStart(result.summary, 300)}`);
+    this.move(n, "check");
+  }
+
   private async nixCheck(n: NixItem): Promise<void> {
     if (n.pr === undefined) return this.fail(n, "no flake.lock PR");
+    const view = await this.ghJson<{ mergeable: string; headRefOid: string; state: string }>([
+      "pr",
+      "view",
+      String(n.pr),
+      "-R",
+      n.repo,
+      "--json",
+      "mergeable,headRefOid,state",
+    ]);
+    if (view?.state === "OPEN" && view.mergeable === "CONFLICTING") return this.refresh(n, view.headRefOid);
     const merged = await this.mergeWhenReady(n.repo, n.pr, await this.mergeMethod(n.repo));
     if (merged === "wait") return this.wait(n, `the checks of PR #${n.pr}`);
     if (merged !== "merged") return this.fail(n, merged);

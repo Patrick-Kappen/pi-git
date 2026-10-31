@@ -165,7 +165,10 @@ from open PRs to a deployed host:
    - for a picked release: waits for the release workflow, merges the release PR when its CI is
      green, and waits until the tag and `latest` match;
    - in the NixOS configuration: merges its ready PRs, opens a PR that runs `nix flake update` for
-     the released inputs (the helper writes the commit and PR), merges it when its checks pass;
+     the released inputs on the freshly fetched default branch (the helper writes the commit and
+     PR), merges it when its checks pass. When the default branch moves and the PR conflicts, it
+     makes the lock again on the fresh default branch and force-pushes with a lease, at most 3
+     times;
    - waits for the check run `…deploy-<host>` on that merge commit.
 4. **Done** when `deploy-<host>` succeeds: one notification with the released versions.
 
