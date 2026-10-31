@@ -870,7 +870,11 @@ class Shipping {
     const verdicts = await askJson(
       this.deps.run,
       agent,
-      { cwd: this.ship.nixos.root, prompt: PREFLIGHT_PROMPT, input: preflightInput(repo, withBodies, simulated) },
+      {
+        cwd: this.ship.nixos.root,
+        prompt: PREFLIGHT_PROMPT,
+        input: `${preflightInput(repo, withBodies, simulated)}${await this.mergedInput(repo)}`,
+      },
       parseVerdicts(prs.map((pr) => pr.number)),
     );
     if (verdicts instanceof Error) {
@@ -889,6 +893,24 @@ class Shipping {
       ),
       order: order(),
     };
+  }
+
+  /** The PRs merged lately (on the default branch already), so the agent does not take them for missing. */
+  private async mergedInput(repo: string): Promise<string> {
+    const list = await this.ghJson<{ number: number; title: string }[]>([
+      "pr",
+      "list",
+      "-R",
+      repo,
+      "--state",
+      "merged",
+      "--limit",
+      "30",
+      "--json",
+      "number,title",
+    ]);
+    if (!list || list.length === 0) return "";
+    return `\n\n## Merged already (on the default branch)\n${list.map((pr) => `- #${pr.number} ${pr.title}`).join("\n")}`;
   }
 
   /**

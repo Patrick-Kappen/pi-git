@@ -523,8 +523,12 @@ describe("shipTick", () => {
     world.merged.push("o/pi-git#1");
     world.prs["o/pi-git"].push(pr(9, "feat: still open"));
     config = { ...config, pi: "pi-fake" };
-    const agent: Runner = async (command, args, options) =>
-      command === "pi-fake"
+    const inputs: string[] = [];
+    const agent: Runner = async (command, args, options) => {
+      if (command === "pi-fake") inputs.push(options.input ?? "");
+      if (command === "gh" && args[1] === "list" && args.includes("merged"))
+        return ok([{ number: 1, title: "feat: base" }]);
+      return command === "pi-fake"
         ? ok({
             verdicts: [
               { pr: 1, action: "ship", reason: "merged" },
@@ -533,7 +537,10 @@ describe("shipTick", () => {
             ],
           })
         : fake(command, args, options);
+    };
     const ship = await shipTick({ run: agent, config, gitPr, now: () => clock, watchPr, fixNow }, 1);
+    // The agent was told which PRs are merged already.
+    expect(inputs[0]).toContain("## Merged already (on the default branch)\n- #1 feat: base");
     expect(ship?.skipped).toEqual(["o/pi-git#3 feat: other: It depends on #9, which is not shipped."]);
     expect(ship?.libs[0]?.prs.map((item) => item.number)).toEqual([1, 2]);
   });
