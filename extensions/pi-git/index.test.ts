@@ -196,8 +196,8 @@ describe("enqueue", () => {
 
 describe("summaries", () => {
   test("own summaries start a turn; others of a running session stay", async () => {
-    const { handlers, ctx, sendMessage, stateDir } = load();
-    state.heartbeat(stateDir, "s2");
+    const { handlers, ctx, sendMessage, stateDir, config } = load();
+    state.heartbeat(config.runtimeDir, "s2");
     state.addSummary(stateDir, summary("s1"));
     state.addSummary(stateDir, summary("s2"));
     await handlers.get("session_start")?.({}, ctx("s1"));
@@ -211,9 +211,9 @@ describe("summaries", () => {
   });
 
   test("a gone session's summary goes to a session of the same repository", async () => {
-    const { handlers, ctx, sendMessage, stateDir } = load({ delivery: "message" });
-    state.heartbeat(stateDir, "old");
-    utimesSync(join(state.dirs(stateDir).sessions, "old"), new Date(0), new Date(0));
+    const { handlers, ctx, sendMessage, stateDir, config } = load({ delivery: "message" });
+    state.heartbeat(config.runtimeDir, "old");
+    utimesSync(join(state.dirs(config.runtimeDir).sessions, "old"), new Date(0), new Date(0));
     state.addSummary(stateDir, summary("old"));
     state.addSummary(stateDir, summary("gone", "other/repo"));
     await handlers.get("session_start")?.({}, ctx("s1"));
@@ -227,20 +227,20 @@ describe("summaries", () => {
 
   test("notify delivery, the poll timer, and shutdown", async () => {
     vi.useFakeTimers();
-    const { handlers, ctx, sendMessage, notify, stateDir } = load({ delivery: "notify" });
+    const { handlers, ctx, sendMessage, notify, stateDir, config } = load({ delivery: "notify" });
     await handlers.get("session_start")?.({}, ctx("s1"));
     state.addSummary(stateDir, summary("s1"));
     vi.advanceTimersByTime(POLL_MS);
     expect(notify).toHaveBeenCalledWith("green for s1", "info");
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(state.sessionAlive(stateDir, "s1", 60_000)).toBe(true);
+    expect(state.sessionAlive(config.runtimeDir, "s1", 60_000)).toBe(true);
     await handlers.get("session_start")?.({}, ctx("s1", false));
     state.addSummary(stateDir, { ...summary("s1"), entryId: "second" });
     vi.advanceTimersByTime(POLL_MS);
     expect(notify).toHaveBeenCalledTimes(1);
     handlers.get("session_shutdown")?.({}, ctx());
     handlers.get("session_shutdown")?.({}, ctx());
-    expect(state.sessionAlive(stateDir, "s1", 60_000)).toBe(false);
+    expect(state.sessionAlive(config.runtimeDir, "s1", 60_000)).toBe(false);
   });
 
   test("a state directory that cannot be written does not break the session", async () => {
@@ -373,7 +373,7 @@ describe("the lock", () => {
     await handlers.get("session_start")?.({}, ctx());
     await commands.get("git")?.handler("unlock commit", ctx());
     expect(setStatus).toHaveBeenLastCalledWith("pi-git", "git: commit unlocked");
-    expect(notify.mock.lastCall?.[0]).toContain("  commit   unlocked (this repository)");
+    expect(notify.mock.lastCall?.[0]).toContain("  commit   unlocked (/git, this repository)");
     expect(prompt(handlers, ctx())).toMatch(/^git: commit unlocked in o\/r\.\nAllowed: commit\./);
     expect(
       await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git commit -m x" } }, ctx()),
@@ -394,7 +394,7 @@ describe("the lock", () => {
     await commands.get("git")?.handler("reset", ctx());
     await commands.get("git")?.handler("global reset", ctx());
     await commands.get("git")?.handler("", ctx());
-    expect(notify.mock.lastCall?.[0]).toMatch(/^git in o\/r:\n {2}worktree locked {3}\(default\)/);
+    expect(notify.mock.lastCall?.[0]).toMatch(/^git in o\/r:\n {2}worktree locked {3}\(default of the settings\)/);
     await commands.get("git")?.handler("maybe", ctx());
     expect(notify).toHaveBeenLastCalledWith(
       expect.stringContaining("/git unlock|lock|reset [worktree commit push pr]"),
@@ -460,10 +460,11 @@ describe("the lock", () => {
     await handlers.get("session_start")?.({}, ctx);
     expect(env.PI_GIT_SWITCH).toBe(join(dir, "state", "switch.json"));
     expect(env.PI_GIT_DEFAULT).toBe("unlocked");
+    expect(env.PI_GIT_REPOS).toBe("{}");
     await commands.get("git")?.handler("unlock", ctx);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("not in a repository with an origin"), "warning");
     await commands.get("git")?.handler("global lock", ctx);
-    expect(notify.mock.lastCall?.[0]).toContain("  commit   locked   (global)");
+    expect(notify.mock.lastCall?.[0]).toContain("  commit   locked   (/git global)");
     expect(await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git init" } }, ctx)).toMatchObject({
       reason: expect.stringContaining("commit is locked outside a repository with an origin (git init)"),
     });

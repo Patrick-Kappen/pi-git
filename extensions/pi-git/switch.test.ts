@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { effective, loadSwitch, setGlobal, setRepo, switchPath } from "./switch.ts";
+import { effective, loadSwitch, matchingPatterns, setGlobal, setRepo, switchPath, toSettings } from "./switch.ts";
 
 const fresh = () => mkdtempSync(join(tmpdir(), "pi-git-switch-"));
 
@@ -59,5 +59,51 @@ describe("switch", () => {
     });
     writeFileSync(switchPath(dir), "null");
     expect(loadSwitch(dir)).toEqual({ global: {}, repos: {} });
+  });
+});
+
+describe("settings of the config", () => {
+  const settings = toSettings({
+    "patrick-kappen/*": "unlocked",
+    "Patrick-Kappen/Nixos": { push: "locked", pr: "locked" },
+    "*/scratch": { commit: "unlocked", x: "locked" },
+    "": "unlocked",
+    "bad/one": 3,
+  });
+
+  test("toSettings keeps the valid patterns", () => {
+    expect(Object.keys(settings)).toEqual(["patrick-kappen/*", "Patrick-Kappen/Nixos", "*/scratch"]);
+    expect(settings["*/scratch"]).toEqual({ commit: "unlocked" });
+    expect(toSettings(null)).toEqual({});
+  });
+
+  test("the most specific pattern first; case does not matter", () => {
+    expect(matchingPatterns(settings, "Patrick-Kappen/nixos")).toEqual(["Patrick-Kappen/Nixos", "patrick-kappen/*"]);
+    expect(matchingPatterns(settings, "someone/scratch")).toEqual(["*/scratch"]);
+    expect(matchingPatterns(settings, "someone/else")).toEqual([]);
+    expect(matchingPatterns(toSettings({ "a.b/c": "locked" }), "axb/c")).toEqual([]);
+  });
+
+  test("order: /git for the repository, the settings, /git global, the default", () => {
+    const dir = fresh();
+    const lock = (slug: string | undefined, step: "commit" | "push") =>
+      effective(loadSwitch(dir), slug, step, "unlocked", settings);
+    expect(lock("Patrick-Kappen/Nixos", "push")).toEqual({
+      lock: "locked",
+      source: "settings",
+      pattern: "Patrick-Kappen/Nixos",
+    });
+    // A step the specific pattern does not set comes from the next pattern.
+    expect(lock("Patrick-Kappen/Nixos", "commit")).toEqual({
+      lock: "unlocked",
+      source: "settings",
+      pattern: "patrick-kappen/*",
+    });
+    setGlobal(dir, [], "locked");
+    expect(lock("Patrick-Kappen/pi-git", "push").source).toBe("settings");
+    expect(lock("someone/else", "push")).toEqual({ lock: "locked", source: "global" });
+    setRepo(dir, "Patrick-Kappen/Nixos", ["push"], "unlocked");
+    expect(lock("Patrick-Kappen/Nixos", "push")).toEqual({ lock: "unlocked", source: "repo" });
+    expect(lock(undefined, "push")).toEqual({ lock: "locked", source: "global" });
   });
 });

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { type RepoSettings, toSettings } from "./switch.ts";
 
 export const CONFIG_FILE = "pi-git.json";
 
@@ -29,8 +30,12 @@ export interface Config {
   /** State of the watcher: queued PRs and summaries. */
   stateDir: string;
   delivery: Delivery;
-  /** Whether git changes by agents are locked where the switch says nothing (/git). */
+  /** Whether git changes by agents are locked where neither /git nor `repos` says anything. */
   locked: boolean;
+  /** Steps per repository pattern; /git for a repository wins over them, they win over /git global. */
+  repos: RepoSettings;
+  /** Locks and session heartbeats: gone after a reboot, unlike `stateDir`. */
+  runtimeDir: string;
   errors: string[];
 }
 
@@ -67,6 +72,10 @@ export function defaults(path: string, env: NodeJS.ProcessEnv, home: string): Co
     stateDir: join(state, "pi-git"),
     delivery: "turn",
     locked: true,
+    repos: {},
+    runtimeDir: env.XDG_RUNTIME_DIR
+      ? join(expandHome(env.XDG_RUNTIME_DIR, home), "pi-git")
+      : join(state, "pi-git", "run"),
     errors: [],
   };
 }
@@ -75,14 +84,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-type Field = "model" | "thinking" | "skill" | "pi" | "worktrees" | "stateDir";
-const STRINGS: readonly Field[] = ["model", "thinking", "skill", "pi", "worktrees", "stateDir"];
-const PATHS: ReadonlySet<Field> = new Set(["skill", "worktrees", "stateDir"]);
+type Field = "model" | "thinking" | "skill" | "pi" | "worktrees" | "stateDir" | "runtimeDir";
+const STRINGS: readonly Field[] = ["model", "thinking", "skill", "pi", "worktrees", "stateDir", "runtimeDir"];
+const PATHS: ReadonlySet<Field> = new Set(["skill", "worktrees", "stateDir", "runtimeDir"]);
 const NUMBERS = ["attempts", "checkTimeout", "helperTimeout"] as const;
 
 /** Apply `locked` or `delivery`; a string is the error. */
 function applyChoice(config: Config, key: string, value: unknown): string | undefined {
-  if (key === "locked") {
+  if (key === "repos") {
+    const repos = toSettings(value);
+    if (typeof value !== "object" || value === null || Array.isArray(value))
+      return '"repos" must be an object of patterns';
+    if (Object.keys(repos).length !== Object.keys(value).length)
+      return '"repos": every pattern needs "locked", "unlocked" or steps';
+    config.repos = repos;
+  } else if (key === "locked") {
     if (typeof value !== "boolean") return '"locked" must be true or false';
     config.locked = value;
   } else if (key === "delivery") {

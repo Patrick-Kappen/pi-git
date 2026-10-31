@@ -106,7 +106,7 @@ class Watch {
   private locked(...steps: Step[]): boolean {
     const fallback = this.config.locked ? "locked" : "unlocked";
     const value = loadSwitch(this.config.stateDir);
-    return steps.some((step) => effective(value, this.entry.repo, step, fallback).lock === "locked");
+    return steps.some((step) => effective(value, this.entry.repo, step, fallback, this.config.repos).lock === "locked");
   }
 
   private notesText(): string {
@@ -427,7 +427,7 @@ class Watch {
 
 /** One round of the watcher: every queued PR once. Returns how many it looked at. */
 export async function tick(deps: WatchDeps): Promise<number> {
-  const release = lock(deps.config.stateDir, "watcher", LOCK_MAX_AGE_MS);
+  const release = lock(deps.config.runtimeDir, "watcher", LOCK_MAX_AGE_MS);
   if (!release) {
     deps.log?.("another watcher is running");
     return 0;

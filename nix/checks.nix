@@ -21,6 +21,10 @@ let
           skill = ../test/nix/git-skill;
           delivery = "message";
           watcher.environment.SSH_AUTH_SOCK = "%t/ssh-agent";
+          repos = {
+            "my-org/*" = "locked";
+            "my-org/sandbox".commit = "unlocked";
+          };
         };
       }
     ];
@@ -58,7 +62,7 @@ in
         agent=.pi/agent
         test -f "$homeFiles/$agent/extensions/pi-git/index.ts"
         test ! -e "$homeFiles/$agent/extensions/pi-git/index.test.ts"
-        jq -e '.model == "anthropic/claude-haiku-4-5" and .thinking == "xhigh" and .attempts == 3 and .delivery == "message" and .locked == true' "$homeFiles/$agent/pi-git.json"
+        jq -e '.model == "anthropic/claude-haiku-4-5" and .thinking == "xhigh" and .attempts == 3 and .delivery == "message" and .locked == true and .repos == { "my-org/*": "locked", "my-org/sandbox": { commit: "unlocked" } }' "$homeFiles/$agent/pi-git.json"
         unit="$homeFiles/.config/systemd/user/pi-git-watcher.service"
         grep -q "ExecStart=.*/bin/node .*/watcher.ts" "$unit"
         grep -q "SSH_AUTH_SOCK=%t/ssh-agent" "$unit"

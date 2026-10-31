@@ -61,7 +61,8 @@ both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on
 | `checkTimeout`, `helperTimeout` | `1800`, `900` | Seconds for one hook run and one helper run |
 | `pi` | `"pi"` | The pi command for the helper |
 | `delivery` | `"turn"` | How the watcher's summary reaches the main agent: `turn`, `message` or `notify` |
-| `locked` | `true` | Git changes by agents are locked until you run `/git unlock [worktree commit push pr]` in a repository (remembered) |
+| `locked` | `true` | Git changes by agents are locked until you run `/git unlock [worktree commit push pr]` in a repository (remembered); `false` unlocks by default |
+| `repos` | `{ }` | Locks per repository pattern, e.g. `{ "my-org/infra" = "locked"; "my-org/*".push = "locked"; }`; they win over `/git global` and `locked` |
 | `watcher.enable` | `true` | The systemd user timer `pi-git-watcher` |
 | `watcher.interval` | `"1min"` | How often the watcher runs |
 | `watcher.environment` | `{ }` | Extra environment, for example `SSH_AUTH_SOCK = "%t/ssh-agent";` for `git push` |
@@ -72,19 +73,35 @@ both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on
 ## A hard stop in git hooks
 
 pi-git blocks the agents' git commands before they run. To also stop git itself, for example when a
-script of the agent runs `git commit`, a global hook can check the switch; the agents' processes
-have `PI_GIT_SWITCH` and `PI_GIT_DEFAULT`, your terminal does not:
+script of the agent runs `git commit`, a global hook can check the lock. The agents' processes have
+`PI_GIT_SWITCH`, `PI_GIT_DEFAULT` and `PI_GIT_REPOS`; your terminal does not, so you are never
+blocked. This function follows the same order as pi-git; call it as `pi_git_lock pre-commit commit`
+in pre-commit and `pi_git_lock pre-push push` in pre-push (it needs `jq` and `sed`):
 
 ```sh
-if [ -n "${PI_GIT_SWITCH:-}" ]; then
-  slug="$(git remote get-url origin 2>/dev/null | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')"
-  step=commit   # push in the pre-push hook
-  state="$(jq -r --arg s "${slug,,}" --arg step "$step" --arg d "${PI_GIT_DEFAULT:-locked}" '
+pi_git_lock() {
+  [[ -n ${PI_GIT_SWITCH:-} ]] || return 0
+  local name="$1" step="$2" url slug switch repos state
+  url="$(git remote get-url origin 2>/dev/null || true)"
+  slug="$(sed -E 's#\.git$##; s#/+$##; s#.*[:/]([^/:]+/[^/]+)$#\1#' <<<"${url}")"
+  switch="$(cat "${PI_GIT_SWITCH}" 2>/dev/null || echo '{}')"
+  repos="${PI_GIT_REPOS:-}"
+  [[ -n ${repos} ]] || repos='{}'
+  state="$(jq -n -r --arg slug "${slug,,}" --arg step "${step}" --arg fallback "${PI_GIT_DEFAULT:-locked}" \
+    --argjson switch "${switch}" --argjson repos "${repos}" '
     def pick: if type == "string" then . elif type == "object" then .[$step] else null end;
-    ((.repos // {}) | to_entries | map(select(.key | ascii_downcase == $s)) | first | .value | pick)
-      // (.global | pick) // $d' "$PI_GIT_SWITCH" 2>/dev/null || echo locked)"
-  [ "$state" = unlocked ] || { echo "git changes by pi agents are locked in ${slug:-this repository}" >&2; exit 1; }
-fi
+    def rx: ascii_downcase | gsub("(?<c>[.+?^${}()|\\[\\]\\\\])"; "\\\(.c)") | gsub("\\*"; "[^/]*") | "(^|/)" + . + "$";
+    def stars: [scan("\\*")] | length;
+    (($switch.repos // {}) | to_entries | map(select(.key | ascii_downcase == $slug)) | first | .value | pick)
+      // ($repos | to_entries | map(select(.key as $k | $slug | test($k | rx))) | map(select(.value | pick != null))
+           | sort_by([(.key | stars), -(.key | length)]) | first | .value | pick)
+      // ($switch.global | pick) // $fallback' 2>/dev/null || true)"
+  [[ -n ${state} ]] || state="${PI_GIT_DEFAULT:-locked}"
+  if [[ ${state} != unlocked ]]; then
+    echo "${name}: ${step} by pi agents is locked in ${slug:-this repository}; unlock with /git unlock ${step} in pi" >&2
+    exit 1
+  fi
+}
 ```
 
 ## Layout

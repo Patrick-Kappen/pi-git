@@ -74,15 +74,62 @@ function repoKey(value: Switch, slug: string): string | undefined {
 
 export interface Effective {
   lock: Lock;
-  /** Where the state comes from. */
-  source: "repo" | "global" | "default";
+  /** Where the state comes from: /git for the repository, the settings, /git global, or the default. */
+  source: "repo" | "settings" | "global" | "default";
+  /** The pattern of the settings that decided. */
+  pattern?: string;
 }
 
-/** The state of a step in a repository: its override, else the global setting, else the default. */
-export function effective(value: Switch, slug: string | undefined, step: Step, fallback: Lock): Effective {
+/** Settings per repository from the config: a pattern (owner/name, with `*` within a part) and its steps. */
+export type RepoSettings = Record<string, Setting>;
+
+function patternRegExp(pattern: string): RegExp {
+  const body = pattern
+    .trim()
+    .toLowerCase()
+    .split("*")
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[^/]*");
+  return new RegExp(`(^|/)${body}$`);
+}
+
+/** The patterns that match a repository, the most specific first: without `*`, then with fewer, then longer. */
+export function matchingPatterns(settings: RepoSettings, slug: string): string[] {
+  const stars = (pattern: string) => pattern.split("*").length - 1;
+  return Object.keys(settings)
+    .filter((pattern) => patternRegExp(pattern).test(slug.toLowerCase()))
+    .sort((a, b) => stars(a) - stars(b) || b.length - a.length);
+}
+
+/** Read the settings of the config: `"locked"`, `"unlocked"`, or an object of steps; the rest is dropped. */
+export function toSettings(raw: unknown): RepoSettings {
+  const settings: RepoSettings = {};
+  if (typeof raw !== "object" || raw === null) return settings;
+  for (const [pattern, value] of Object.entries(raw)) {
+    const setting = toSetting(value);
+    if (pattern.trim() !== "" && Object.keys(setting).length > 0) settings[pattern] = setting;
+  }
+  return settings;
+}
+
+/**
+ * The state of a step in a repository: /git for the repository, else the settings of the config,
+ * else /git global, else the default.
+ */
+export function effective(
+  value: Switch,
+  slug: string | undefined,
+  step: Step,
+  fallback: Lock,
+  settings: RepoSettings = {},
+): Effective {
   const key = slug === undefined ? undefined : repoKey(value, slug);
   const repo = key === undefined ? undefined : value.repos[key]?.[step];
   if (repo !== undefined) return { lock: repo, source: "repo" };
+  for (const pattern of slug === undefined ? [] : matchingPatterns(settings, slug)) {
+    const lock = settings[pattern]?.[step];
+    if (lock !== undefined) return { lock, source: "settings", pattern };
+  }
   const global = value.global[step];
   if (global !== undefined) return { lock: global, source: "global" };
   return { lock: fallback, source: "default" };

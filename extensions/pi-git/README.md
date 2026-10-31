@@ -131,7 +131,16 @@ You switch it in pi; the model cannot:
 | `/git global unlock\|lock\|reset [steps]` | The global state; `reset` goes back to the default of the settings (`locked`) |
 | `/git commit [intent]` | Commits once, as `git_commit` does, also when `commit` is locked: your own action |
 
-A repository's override wins over the global state, which wins over the default. The state is in
+What decides a step, the first that says something:
+
+1. `/git unlock|lock` for this repository (remembered);
+2. `repos` of the settings: patterns such as `my-org/*` or `my-org/infra` with `"locked"`,
+   `"unlocked"` or single steps; the most specific pattern that sets the step decides;
+3. `/git global unlock|lock`;
+4. `locked` of the settings (default `true`).
+
+So a repository in `repos` keeps its setting when you lock or unlock globally, and `/git reset`
+brings it back to `repos`. The state is in
 `<stateDir>/switch.json`, so every pi session and the watcher see a change at once. The footer shows
 `git: locked`, `git: unlocked`, or the unlocked steps (`git: commit unlocked`).
 
@@ -146,7 +155,7 @@ watcher fixes CI only with `commit` and `push` unlocked, and cleans up after a m
 `worktree` unlocked.
 
 **Hard stop.** pi-git sets `PI_GIT_SWITCH` (the switch file) and `PI_GIT_DEFAULT` in pi's process, so
-the agents' commands inherit them. A git hook can read them and refuse a commit (`commit` step) or a
+the agents' commands inherit them, and `PI_GIT_REPOS` (the `repos` settings as JSON). A git hook can read them and refuse a commit (`commit` step) or a
 push (`push` step) in a locked repository, also when a script runs git; see the main README. pi-git
 runs its own git commands without `PI_GIT_SWITCH`: it checked the lock itself, and `/git commit`
 must work while `commit` is locked.
@@ -201,8 +210,10 @@ The helper is `pi -p` with its own model, started in the worktree:
 | `checkTimeout` | `1800` | Seconds for one hook run |
 | `helperTimeout` | `900` | Seconds for one helper run |
 | `delivery` | `turn` | How a summary reaches the main agent: `turn`, `message` or `notify` |
-| `locked` | `true` | Whether git changes are locked where `/git` says nothing |
-| `stateDir` | `~/.local/state/pi-git` | The queue, the summaries and the heartbeats |
+| `locked` | `true` | Whether git changes are locked where neither `/git` nor `repos` says anything |
+| `repos` | `{}` | Locks per repository pattern: `{ "my-org/*": "locked", "my-org/app": { "push": "locked" } }` |
+| `runtimeDir` | `$XDG_RUNTIME_DIR/pi-git` | Locks and session heartbeats; they must not survive a reboot |
+| `stateDir` | `~/.local/state/pi-git` | The queue, the summaries, the attention list and the switch: keep it across reboots (impermanence: persist it) |
 
 | What | Default | Override |
 |---|---|---|

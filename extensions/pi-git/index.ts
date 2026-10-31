@@ -102,7 +102,7 @@ export function takes(
   now = Date.now(),
 ): boolean {
   if (summary.sessionId === sessionId) return true;
-  if (sessionAlive(config.stateDir, summary.sessionId, SESSION_MAX_AGE_MS, now)) return false;
+  if (sessionAlive(config.runtimeDir, summary.sessionId, SESSION_MAX_AGE_MS, now)) return false;
   return slug !== undefined && summary.repo.toLowerCase() === slug.toLowerCase();
 }
 
@@ -187,10 +187,10 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     return slugs.get(dir);
   };
   const lockOf = (target: string | undefined, step: Step): Lock =>
-    effective(loadSwitch(config.stateDir), target, step, fallback()).lock;
+    effective(loadSwitch(config.stateDir), target, step, fallback(), config.repos).lock;
   const showStatus = (ctx: ExtensionContext, target: string | undefined): void => {
     const waiting = listAttention(config.stateDir).length;
-    const text = statusText(statesOf(config.stateDir, target, fallback()));
+    const text = statusText(statesOf(config.stateDir, target, fallback(), config.repos));
     if (ctx.hasUI) ctx.ui.setStatus("pi-git", waiting > 0 ? `${text} ● ${waiting}` : text);
   };
   /** Something needs the user: remember it (the tmux sign shows it) and notify once. */
@@ -259,7 +259,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
 
   const poll = (ctx: ExtensionContext): void => {
     try {
-      heartbeat(config.stateDir, sessionId);
+      heartbeat(config.runtimeDir, sessionId);
       deliver(ctx);
     } catch {
       // The state directory may not be writable; git_pr still works.
@@ -275,6 +275,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     // The global git hooks read these in the agents' processes: a hard stop for locked repositories.
     env.PI_GIT_SWITCH = switchPath(config.stateDir);
     env.PI_GIT_DEFAULT = fallback();
+    env.PI_GIT_REPOS = JSON.stringify(config.repos);
     showStatus(ctx, slug);
     if (timer) clearInterval(timer);
     poll(ctx);
@@ -286,14 +287,17 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     if (timer) clearInterval(timer);
     timer = undefined;
     try {
-      if (sessionId) endSession(config.stateDir, sessionId);
+      if (sessionId) endSession(config.runtimeDir, sessionId);
     } catch {
       // Nothing to clean up in a state directory that cannot be written.
     }
   });
 
   pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-    event.systemPromptOptions.sections[PROMPT_SECTION] = lockPrompt(statesOf(config.stateDir, slug, fallback()), slug);
+    event.systemPromptOptions.sections[PROMPT_SECTION] = lockPrompt(
+      statesOf(config.stateDir, slug, fallback(), config.repos),
+      slug,
+    );
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx): Promise<ToolCallEventResult | undefined> => {
@@ -350,7 +354,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       } else {
         if (command.kind === "set") applySet(command, here);
         showStatus(ctx, here);
-        ctx.ui.notify(`${describeLock(config.stateDir, here, fallback())}${waitingText()}`, "info");
+        ctx.ui.notify(`${describeLock(config.stateDir, here, fallback(), config.repos)}${waitingText()}`, "info");
       }
     },
   });

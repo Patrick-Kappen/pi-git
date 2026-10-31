@@ -57,10 +57,13 @@ describe("texts", () => {
     });
     const text = describeLock(dir, "o/r", "locked");
     expect(text).toContain(
-      "git in o/r:\n  worktree locked   (default)\n  commit   unlocked (global)\n  push     unlocked (this repository)",
+      "git in o/r:\n  worktree locked   (default of the settings)\n  commit   unlocked (/git global)\n  push     unlocked (/git, this repository)",
     );
     expect(text).toContain('overrides:\n  o/r: {"push":"unlocked"}');
     expect(describeLock(mkdtempSync(join(tmpdir(), "pi-git-lock-")), undefined, "locked")).toMatch(/^git here:/);
+    const settings = { "o/*": { worktree: "unlocked" as const } };
+    expect(statesOf(dir, "o/r", "locked", settings).worktree).toBe("unlocked");
+    expect(describeLock(dir, "o/r", "locked", settings)).toContain("  worktree unlocked (settings, o/*)");
   });
 });
 

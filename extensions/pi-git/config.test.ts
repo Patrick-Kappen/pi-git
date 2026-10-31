@@ -29,9 +29,12 @@ describe("defaults", () => {
       stateDir: "/home/u/.local/state/pi-git",
       delivery: "turn",
       locked: true,
+      repos: {},
+      runtimeDir: "/home/u/.local/state/pi-git/run",
       errors: [],
     });
     expect(defaults("p", { XDG_STATE_HOME: "/state" }, home).stateDir).toBe("/state/pi-git");
+    expect(defaults("p", { XDG_RUNTIME_DIR: "/run/user/1" }, home).runtimeDir).toBe("/run/user/1/pi-git");
   });
 });
 
@@ -70,6 +73,26 @@ describe("parseConfig", () => {
       locked: false,
       errors: [],
     });
+  });
+
+  test("repos and runtimeDir", () => {
+    const config = parseConfig(
+      { repos: { "o/*": "locked", "o/r": { push: "unlocked" } }, runtimeDir: "~/run" },
+      base,
+      home,
+    );
+    expect(config).toMatchObject({
+      repos: {
+        "o/*": { worktree: "locked", commit: "locked", push: "locked", pr: "locked" },
+        "o/r": { push: "unlocked" },
+      },
+      runtimeDir: "/home/u/run",
+      errors: [],
+    });
+    expect(parseConfig({ repos: [] }, base, home).errors).toEqual(['cfg: "repos" must be an object of patterns']);
+    expect(parseConfig({ repos: { "o/r": "maybe" } }, base, home).errors).toEqual([
+      'cfg: "repos": every pattern needs "locked", "unlocked" or steps',
+    ]);
   });
 
   test("errors keep the defaults", () => {

@@ -8,6 +8,24 @@
 }:
 let
   cfg = config.programs.pi-git;
+  steps = [
+    "worktree"
+    "commit"
+    "push"
+    "pr"
+  ];
+  stepOption =
+    step:
+    lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.enum [
+          "locked"
+          "unlocked"
+        ]
+      );
+      default = null;
+      description = "The lock of ${step}; null follows the next level.";
+    };
   json = pkgs.formats.json { };
   configFile = "${config.home.homeDirectory}/${cfg.agentDir}/pi-git.json";
   watcherPath = lib.concatStringsSep ":" [
@@ -111,10 +129,33 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Whether git changes by agents are locked where /git says nothing. The lock has four steps:
-        worktree, commit, push and pr. Unlock steps of one repository with /git unlock [steps] in pi;
+        Whether git changes by agents are locked where neither /git nor `repos` says anything. The
+        lock has four steps: worktree, commit, push and pr. Unlock steps of one repository with /git unlock [steps] in pi;
         that is remembered. /git global unlock [steps] changes the global state, and /git commit
         commits once.
+      '';
+    };
+
+    repos = lib.mkOption {
+      type = lib.types.attrsOf (
+        lib.types.either (lib.types.enum [
+          "locked"
+          "unlocked"
+        ]) (lib.types.submodule { options = lib.genAttrs steps stepOption; })
+      );
+      default = { };
+      example = lib.literalExpression ''
+        {
+          "my-org/infra" = "locked";                 # every step
+          "my-org/*" = { push = "locked"; pr = "locked"; };
+          "my-org/sandbox" = "unlocked";
+        }
+      '';
+      description = ''
+        Locks per repository: a pattern (owner/name; `*` matches within a part) and `"locked"`,
+        `"unlocked"`, or the steps (worktree, commit, push, pr). The most specific pattern that sets a
+        step decides. /git for one repository wins over these settings; they win over /git global and
+        over `locked`.
       '';
     };
 
@@ -203,6 +244,10 @@ in
             delivery
             locked
             ;
+          repos = lib.mapAttrs (
+            _: setting:
+            if builtins.isString setting then setting else lib.filterAttrs (_: lock: lock != null) setting
+          ) cfg.repos;
         }
         // lib.optionalAttrs (cfg.skill != null) { skill = "${cfg.skill}"; }
       );
