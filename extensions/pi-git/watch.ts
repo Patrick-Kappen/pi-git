@@ -4,7 +4,19 @@ import { addAttention, attentionId, clearAttention, notifyTerminals } from "./at
 import type { Config } from "./config.ts";
 import { clipEnd, outputOf, type Runner } from "./exec.ts";
 import { runHelper } from "./helper.ts";
-import { hasWork, isWorkspace, jjAtHead, jjForget } from "./jj.ts";
+import {
+  backToBranch,
+  hasWork,
+  isWorkspace,
+  jjAtHead,
+  jjForget,
+  nextConflict,
+  openConflict,
+  operation,
+  rebaseOnBase,
+  restoreOperation,
+  settleConflict,
+} from "./jj.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { ciFixPrompt, conflictPrompt } from "./prompts.ts";
 import {
@@ -18,10 +30,6 @@ import {
   saveEntry,
 } from "./state.ts";
 import { effective, loadSwitch, type Step } from "./switch.ts";
-
-/** A conflict in a jj workspace: the watcher does not rebase with jj yet. */
-const JJ_REBASE = (base: string) =>
-  `the PR conflicts with ${base}, and the worktree is a jj workspace, which the watcher does not rebase yet: rebase it with jj (jj git fetch; jj rebase -d ${base}@origin), resolve the conflicts, and push with git_push.`;
 
 /** gh's view of a PR, as far as the watcher needs it. */
 export interface PrView {
@@ -311,7 +319,6 @@ class Watch {
    */
   private async restack(pr: PrView, to: string): Promise<void> {
     if (this.locked("commit", "push")) return this.waitForUnlock(pr, "conflict");
-    if (this.jj) return this.finish("failed", `needs you: ${JJ_REBASE(to)} ${this.entry.url}`);
     const from = this.entry.base;
     const upstream = this.entry.baseSha;
     this.entry.base = to;
@@ -339,8 +346,6 @@ class Watch {
         `needs you: ${what} after ${this.entry.attempts} fixes by the helper. ${this.entry.url}`,
       );
     }
-    if (kind === "conflict" && this.jj)
-      return this.finish("failed", `needs you: ${JJ_REBASE(this.entry.base)} ${this.entry.url}`);
     const problem = await this.atHead(pr.headRefOid);
     if (problem) return this.finish("failed", `needs you: ${problem}. ${this.entry.url}`);
     this.entry.attempts++;
@@ -477,6 +482,7 @@ class Watch {
 
   /** Rebase on the base and let the helper resolve conflicts; `upstream` limits it to commits after that one. */
   private async fixConflict(pr: PrView, upstream?: string): Promise<string | undefined> {
+    if (this.jj) return this.fixJjConflict(pr, upstream);
     const env = { GIT_EDITOR: "true" };
     const target = `origin/${this.entry.base}`;
     const args = upstream ? ["rebase", "--onto", target, upstream] : ["rebase", target];
@@ -510,6 +516,61 @@ class Watch {
       return `the rebase on ${this.entry.base} did not finish`;
     }
     return this.pushRebased(pr);
+  }
+
+  /**
+   * The jj route: rebase with jj, which records conflicts in the commits; open them one by one, oldest
+   * first, let the helper resolve each, and move the resolution into its commit. On a failure
+   * everything is put back (`jj op restore`).
+   */
+  private async fixJjConflict(pr: PrView, upstream?: string): Promise<string | undefined> {
+    const { run } = this.deps;
+    const { worktree: root, base, branch } = this.entry;
+    const before = await operation(run, root);
+    const fail = async (why: string): Promise<string> => {
+      if (before) await restoreOperation(run, root, before);
+      return why;
+    };
+    const rebased = await rebaseOnBase(run, root, base, upstream);
+    if (rebased) return fail(rebased);
+    for (let round = 0; round < 20; round++) {
+      const commit = await nextConflict(run, root, base);
+      if (commit === undefined) {
+        const back = await backToBranch(run, root, branch);
+        return back ? fail(back) : this.pushRebased(pr);
+      }
+      const failure = await this.resolveJjConflict(commit);
+      if (failure) return fail(failure);
+    }
+    return fail(`the rebase on ${base} did not finish`);
+  }
+
+  /** One conflicted commit of a jj rebase: the helper resolves it, then it goes into the commit. */
+  private async resolveJjConflict(commit: string): Promise<string | undefined> {
+    const { run } = this.deps;
+    const { worktree: root, base } = this.entry;
+    const files = await openConflict(run, root, commit);
+    if (typeof files === "string") return files;
+    const contents = files
+      .map((file) => {
+        try {
+          return `### ${file}\n${readFileSync(join(root, file), "utf8")}`;
+        } catch {
+          return `### ${file}\n(deleted on one side)`;
+        }
+      })
+      .join("\n\n");
+    const fix = await runHelper(run, this.config, {
+      cwd: root,
+      prompt: conflictPrompt(base),
+      input: `What the PR is for:\n${this.entry.intent}\n\nFiles with conflicts:\n${files.join("\n")}\n\nThe conflicts:\n${clipEnd(contents, 30_000)}\n`,
+      fix: true,
+    });
+    if (!fix.ok || /^CANNOT FIX:/m.test(fix.text) || this.hasMarkers(files.join("\n"))) {
+      return `the helper could not resolve the conflict with ${base}${fix.ok ? `: ${fix.text}` : `: ${fix.failure}`}`;
+    }
+    this.entry.notes.push(`conflict with ${base} in ${files.join(", ")}: ${fix.text.split("\n")[0]?.slice(0, 300)}`);
+    return settleConflict(run, root);
   }
 
   /** Push a rebased branch with a lease on the head the watcher saw; nothing when the rebase changed nothing. */

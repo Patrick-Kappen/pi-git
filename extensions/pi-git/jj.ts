@@ -319,3 +319,67 @@ export async function jjSummary(
     (await logLines(run, root, `remote_bookmarks(exact:${quote(branch)}, exact:"origin")`, `"x"`)).length > 0;
   return { branch, wip, unpushed, pushed };
 }
+
+/** jj writes conflicts with git's markers, so the helper sees what it knows from a git rebase. */
+const GIT_MARKERS = ["--config", "ui.conflict-marker-style=git"];
+
+/** The current operation, to put everything back with `jj op restore`. */
+export async function operation(run: Runner, root: string): Promise<string | undefined> {
+  return jjText(run, root, ["op", "log", "-n", "1", "--no-graph", "-T", "id"]);
+}
+
+export async function restoreOperation(run: Runner, root: string, id: string): Promise<void> {
+  await jj(run, root, ["op", "restore", id]);
+}
+
+function baseOnGitHub(base: string): string {
+  return `remote_bookmarks(exact:${quote(base)}, exact:"origin")`;
+}
+
+/**
+ * Rebase the workspace's own commits on the base on GitHub: all commits after the base, or, for a
+ * stacked PR whose base was squash-merged, only those after `upstream` (the old base's tip). jj
+ * records conflicts in the commits instead of stopping. A string is why it failed.
+ */
+export async function rebaseOnBase(
+  run: Runner,
+  root: string,
+  base: string,
+  upstream?: string,
+): Promise<string | undefined> {
+  const fetch = await jj(run, root, ["git", "fetch", "--branch", base]);
+  if (fetch.code !== 0) return `jj git fetch failed:\n${outputOf(fetch)}`;
+  const destination = baseOnGitHub(base);
+  const source = upstream ? `roots(${upstream}..@)` : `roots(${destination}..@)`;
+  const rebase = await jj(run, root, [...GIT_MARKERS, "rebase", "-s", source, "-d", destination]);
+  return rebase.code === 0 ? undefined : `jj rebase failed:\n${outputOf(rebase)}`;
+}
+
+/** The oldest commit of the workspace that has a conflict after the rebase. */
+export async function nextConflict(run: Runner, root: string, base: string): Promise<string | undefined> {
+  const [commit] = await logLines(run, root, `roots((${baseOnGitHub(base)}..@) & conflicts())`, "commit_id");
+  return commit;
+}
+
+/** Open a conflicted commit in the working copy: the files with conflicts, now with markers. */
+export async function openConflict(run: Runner, root: string, commit: string): Promise<string[] | string> {
+  const opened = await jj(run, root, [...GIT_MARKERS, "new", commit]);
+  if (opened.code !== 0) return `jj new failed:\n${outputOf(opened)}`;
+  const list = await jj(run, root, ["resolve", "--list"]);
+  return list.stdout
+    .split("\n")
+    .map((line) => /^(.+?)\s{2,}\S/.exec(line)?.[1])
+    .filter((file): file is string => file !== undefined);
+}
+
+/** Move the helper's resolution into the conflicted commit; jj rebases the later commits on it. */
+export async function settleConflict(run: Runner, root: string): Promise<string | undefined> {
+  const squash = await jj(run, root, [...GIT_MARKERS, "squash", "--use-destination-message"]);
+  return squash.code === 0 ? undefined : `jj squash failed:\n${outputOf(squash)}`;
+}
+
+/** Put the working copy back on the tip of the branch. */
+export async function backToBranch(run: Runner, root: string, branch: string): Promise<string | undefined> {
+  const moved = await jj(run, root, ["new", `bookmarks(exact:${quote(branch)})`]);
+  return moved.code === 0 ? undefined : `jj new failed:\n${outputOf(moved)}`;
+}
