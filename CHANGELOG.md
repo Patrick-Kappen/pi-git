@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.5.0...v0.6.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** defer agent turns until work needs them ([#25](https://github.com/Patrick-Kappen/pi-git/issues/25)) ([976645c](https://github.com/Patrick-Kappen/pi-git/commit/976645c80d06a3518557cff15e97864c61150565))
+
 ## [0.5.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.4.0...v0.5.0) (2026-10-31)
 
 
