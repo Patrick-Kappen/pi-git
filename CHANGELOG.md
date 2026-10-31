@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/Patrick-Kappen/pi-git/compare/v0.9.2...v0.9.3) (2026-10-31)
+
+
+### Bug Fixes
+
+* **pi-git:** find a main checkout by its origin when the directory has another name ([#45](https://github.com/Patrick-Kappen/pi-git/issues/45)) ([bc042c2](https://github.com/Patrick-Kappen/pi-git/commit/bc042c2a039c07ea2a181f44cb0ef8cfc475f4e8))
+
 ## [0.9.2](https://github.com/Patrick-Kappen/pi-git/compare/v0.9.1...v0.9.2) (2026-10-31)
 
 
