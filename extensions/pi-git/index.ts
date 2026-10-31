@@ -6,6 +6,7 @@ import type {
   ToolCallEvent,
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
+import { gitCheck } from "./check.ts";
 import { type Config, loadConfig } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
 import { repoSlug } from "./git.ts";
@@ -102,6 +103,21 @@ const prParameters = Type.Object({
     Type.String({ description: "Base branch; default: that of the open PR, else the default branch." }),
   ),
   draft: Type.Optional(Type.Boolean({ description: "Open the PR as a draft." })),
+});
+
+const checkParameters = Type.Object({
+  path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
+  command: Type.Optional(
+    Type.String({
+      description:
+        "The check command, run with sh -c; default: detected (devenv check, npm test, nix flake check, make).",
+    }),
+  ),
+  fix: Type.Optional(
+    Type.Boolean({
+      description: "Let the helper fix failures; default: true. With false, only a summary of the failures.",
+    }),
+  ),
 });
 
 /** In a helper process: block git and gh commands that pi-git runs itself. */
@@ -218,6 +234,41 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       return {
         content: [{ type: "text", text }],
         details: { pr: result.pr, commit: result.commit, notes: result.notes },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "git_check",
+    label: "Git check",
+    description: [
+      "Run the checks of a repository (lint, types, tests) without reading their output yourself.",
+      'A helper agent fixes failures; you get "passed", or a short summary of what still fails.',
+    ].join(" "),
+    promptSnippet: "Run the checks of a repository; a helper fixes failures",
+    promptGuidelines: ["Use git_check to run a repository's checks or tests instead of running them in bash."],
+    parameters: checkParameters,
+    async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
+      const steps: string[] = [];
+      const progress = (text: string) => {
+        steps.push(text);
+        onUpdate?.({
+          content: [{ type: "text", text: steps.map((step) => `- ${step}`).join("\n") }],
+          details: undefined,
+        });
+      };
+      const result = await gitCheck(
+        {
+          path: params.path ?? ctx.cwd,
+          ...(params.command === undefined ? {} : { command: params.command }),
+          ...(params.fix === undefined ? {} : { fix: params.fix }),
+        },
+        { run: runner, config, progress, signal },
+      );
+      if (!result.ok) throw new Error(result.summary);
+      return {
+        content: [{ type: "text", text: result.summary }],
+        details: { command: result.command, notes: result.notes },
       };
     },
   });

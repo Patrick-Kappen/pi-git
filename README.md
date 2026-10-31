@@ -1,12 +1,14 @@
 # pi-git
 
-pi extension that commits, pushes and opens PRs with a helper agent, and watches CI until the PR is
-green.
+pi extension that commits, pushes and opens PRs with a helper agent, watches CI until the PR is
+green, and runs checks without flooding the main agent.
 
 The main agent of pi is good at making a change and expensive at the rest: running the hooks, reading
 their output, fixing lint, writing the commit message and the PR. With pi-git, the main agent calls
 `git_pr` with what the change is for. A cheap helper agent (`pi -p` with another model) fixes failing
-checks and writes the commit message and the PR; pi-git runs every git and GitHub step itself. A
+checks and writes the commit message and the PR; pi-git runs every git and GitHub step itself.
+`git_check` runs the checks of a repository the same way: the helper fixes failures, and the main
+agent gets "passed" or a short summary instead of the full output. A
 watcher (a systemd user timer) then follows the PR: the helper fixes red CI and conflicts, and the
 main agent gets a summary when the PR is green, merged, or needs you. See the
 [extension README](extensions/pi-git/README.md).

@@ -55,6 +55,31 @@ export function conflictPrompt(base: string): string {
   ].join("\n");
 }
 
+/** Fix failing checks that git_check ran. */
+export function checkFixPrompt(command: string, attempt: number, attempts: number): string {
+  return [
+    `You are the helper of pi-git, attempt ${attempt} of ${attempts}. The checks of this repository fail: \`${command}\`.`,
+    "The input has their output.",
+    "",
+    "Fix the cause in the files, in the way the code is meant to work:",
+    "- Run the failing part yourself to see the problem and to confirm your fix.",
+    "- Do not stage, commit, push, switch branches, or call gh.",
+    "- Never weaken or skip a check, a test or a threshold; never delete a failing test to make it pass.",
+    '- When the fix needs a decision about behavior, do not guess: answer "CANNOT FIX:" and what has to be decided.',
+    "",
+    "End with one or two sentences on what you changed.",
+  ].join("\n");
+}
+
+/** Summarize failing checks for the main agent. */
+export function summaryPrompt(command: string): string {
+  return [
+    `You are the helper of pi-git. The checks \`${command}\` fail; the input has their output.`,
+    "Summarize the failures for a developer who will fix them: per failure the check, the file and line, and the error,",
+    "in at most 15 lines. Leave out passing checks, progress output and noise. Plain text, no preamble.",
+  ].join("\n");
+}
+
 /** A commit message as JSON. */
 export function messagePrompt(conventional: boolean): string {
   const style = conventional
