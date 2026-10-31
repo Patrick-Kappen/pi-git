@@ -553,6 +553,43 @@ describe("shipTick", () => {
     expect(ship?.libs[0]).toMatchObject({ state: "tag", tag: "v0.3.0" });
   });
 
+  test("a stacked PR is never merged into its base's branch: it waits until GitHub moves it to main", async () => {
+    world.prs["o/pi-git"] = [pr(8, "feat: top", { baseRefName: "feat/base" }), pr(7, "feat: base")];
+    const index = await indexShip(fake, nixos);
+    // Base first, the stacked one after it, with a note.
+    expect(index.libs[0]?.ready.map((item) => [item.number, item.note])).toEqual([
+      [7, undefined],
+      [8, "stacked on feat/base: after it"],
+    ]);
+    saveShip(config.stateDir, createShip(index, [], "gaia", clock));
+    let ship = await tick();
+    expect(world.merged).toEqual(["o/pi-git#7"]);
+    expect(calls.some((line) => line.startsWith("gh pr merge 8"))).toBe(false);
+    expect(ship?.libs[0]?.state).toBe("merge");
+    // GitHub moved #8 to main after #7 was merged.
+    world.prs["o/pi-git"] = [pr(7, "feat: base"), pr(8, "feat: top", { baseRefName: "main" })];
+    ship = await tick();
+    expect(world.merged).toEqual(["o/pi-git#7", "o/pi-git#8"]);
+    expect(ship?.libs[0]?.state).toBe("done");
+  });
+
+  test("a merge refused because the branch just moved: wait and try again", async () => {
+    world.prs["o/pi-git"] = [pr(1, "feat: start")];
+    await plan([]);
+    world.fail = ["pr merge 1"];
+    const realFake = fake;
+    const moved: Runner = async (command, args, options) =>
+      command === "gh" && args[1] === "merge"
+        ? { code: 1, stdout: "", stderr: "GraphQL: Head branch was modified. Review and try the merge again." }
+        : realFake(command, args, options);
+    let ship = await shipTick({ run: moved, config, gitPr, now: () => clock, watchPr });
+    expect(ship?.libs[0]).toMatchObject({ state: "merge" });
+    expect(ship?.libs[0]?.error).toBeUndefined();
+    world.fail = [];
+    ship = await tick();
+    expect(ship?.libs[0]?.state).toBe("done");
+  });
+
   test("no release PR after the merges", async () => {
     world.prs["o/pi-git"] = [pr(1, "feat: start")];
     await plan(["o/pi-git"]);

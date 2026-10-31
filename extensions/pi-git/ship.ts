@@ -36,6 +36,8 @@ export interface ShipPr {
   url: string;
   /** Not ready yet when indexed: it waits for its checks, or the watcher fixes it first. */
   note?: string;
+  /** The PR's base when it is not the default branch: stacked, merged after its base. */
+  stackedOn?: string;
 }
 
 interface Stage {
@@ -133,9 +135,13 @@ interface ListedPr {
   headRefOid: string;
   labels?: { name: string }[];
   author?: { login: string };
+  baseRefName?: string;
 }
 
-const PR_FIELDS = "number,title,url,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,labels,author";
+const PR_FIELDS =
+  "number,title,url,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,labels,author,baseRefName";
+/** GitHub refuses a merge while the branch moves under it: wait and try again. */
+const MOVED = /Head branch was modified|Base branch was modified|is not mergeable|try the merge again/i;
 
 async function gh(run: Runner, cwd: string, args: string[]): Promise<string | undefined> {
   const result = await run("gh", args, { cwd });
@@ -195,7 +201,7 @@ export function latestInputs(lockText: string): LockedInput[] {
   return result.sort((a, b) => a.input.localeCompare(b.input));
 }
 
-function addListedPr(index: RepoIndex, pr: ListedPr): void {
+function addListedPr(index: RepoIndex, pr: ListedPr, defaultBranch: string): void {
   if (pr.labels?.some((label) => label.name === RELEASE_LABEL)) {
     index.releasePr = { number: pr.number, title: pr.title };
     return;
@@ -205,14 +211,21 @@ function addListedPr(index: RepoIndex, pr: ListedPr): void {
     index.problems.push(`#${pr.number} ${pr.title}: ${why}`);
     return;
   }
-  const note =
-    why === undefined ? undefined : FIXABLE.has(why) ? `the watcher fixes it: ${why}` : "waits for its checks";
+  const stacked = pr.baseRefName !== undefined && pr.baseRefName !== defaultBranch ? pr.baseRefName : undefined;
+  const note = stacked
+    ? `stacked on ${stacked}: after it`
+    : why === undefined
+      ? undefined
+      : FIXABLE.has(why)
+        ? `the watcher fixes it: ${why}`
+        : "waits for its checks";
   index.ready.push({
     number: pr.number,
     title: pr.title,
     sha: pr.headRefOid,
     url: pr.url,
     ...(note ? { note } : {}),
+    ...(stacked ? { stackedOn: stacked } : {}),
   });
 }
 
@@ -223,7 +236,13 @@ async function indexRepo(run: Runner, cwd: string, repo: string): Promise<RepoIn
     index.problems.push("could not list the PRs (gh failed)");
     return index;
   }
-  for (const pr of list) addListedPr(index, pr);
+  const defaultBranch =
+    (await gh(run, cwd, ["repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"])) ??
+    "main";
+  // Oldest first, and stacked PRs after the others: a stacked PR ships once its base is merged.
+  const sorted = [...list].sort((a, b) => a.number - b.number);
+  for (const pr of sorted) addListedPr(index, pr, defaultBranch);
+  index.ready.sort((a, b) => Number(a.stackedOn !== undefined) - Number(b.stackedOn !== undefined));
   index.releasable = index.releasePr !== undefined || index.ready.some((pr) => RELEASING.test(pr.title));
   const first = index.ready[0];
   if (!index.releasable && first) index.noRelease = first.number;
@@ -494,6 +513,8 @@ class Shipping {
     if (!pr) return "wait";
     if (pr.state === "MERGED") return "merged";
     if (pr.state !== "OPEN") return `#${number} is ${pr.state.toLowerCase()}`;
+    // Never merge into another PR's branch: wait until its base is merged and GitHub moves it.
+    if (pr.baseRefName && pr.baseRefName !== (await this.defaultBranch(repo))) return "wait";
     const why = notReady(pr);
     if (why && WAITS.has(why)) return "wait";
     if (why && FIXABLE.has(why) && item) return this.handToWatcher(item, repo, pr, why);
@@ -503,7 +524,27 @@ class Shipping {
       ["pr", "merge", String(number), "-R", repo, method, "--match-head-commit", pr.headRefOid],
       { cwd: this.ship.nixos.root },
     );
-    return result.code === 0 ? "merged" : `merging #${number} failed: ${clipStart(outputOf(result).trim(), 300)}`;
+    if (result.code === 0) return "merged";
+    if (MOVED.test(outputOf(result))) return "wait";
+    return `merging #${number} failed: ${clipStart(outputOf(result).trim(), 300)}`;
+  }
+
+  private readonly defaults = new Map<string, string>();
+
+  private async defaultBranch(repo: string): Promise<string> {
+    if (!this.defaults.has(repo)) {
+      const name = await this.gh([
+        "repo",
+        "view",
+        repo,
+        "--json",
+        "defaultBranchRef",
+        "--jq",
+        ".defaultBranchRef.name",
+      ]);
+      this.defaults.set(repo, name ?? "main");
+    }
+    return this.defaults.get(repo) as string;
   }
 
   /**
