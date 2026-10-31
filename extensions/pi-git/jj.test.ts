@@ -188,8 +188,14 @@ const deps = () => ({ run: runner, config, progress: () => {} });
 describe("git_start with the jj backend", () => {
   test("colocates jj in the main checkout and adds a workspace with the branch as a bookmark", async () => {
     expect(isJj(main)).toBe(false);
+    // What the user has in the main checkout stays as it is: staged, unstaged, untracked.
+    writeFileSync(join(main, "README.md"), "# repo\nstaged\n");
+    git(main, "add", "README.md");
+    writeFileSync(join(main, "untracked.txt"), "mine\n");
+    const before = git(main, "status", "--short");
     const path = await start("first");
     expect(isJj(main)).toBe(true);
+    expect(git(main, "status", "--short")).toBe(before);
     expect(isWorkspace(path)).toBe(true);
     expect(isWorkspace(main)).toBe(false);
     expect(jjRootOf(join(path, "sub", "file.txt"))).toBe(path);
@@ -238,6 +244,15 @@ describe("work in progress", () => {
       unpushed: 0,
       pushed: false,
     });
+  });
+
+  test("git_push with only work in progress says it is not committed yet", async () => {
+    const path = await start();
+    writeFileSync(join(path, "a.txt"), "a\n");
+    await wipSnapshot(runner, path, "a");
+    const pushed = await gitPush({ path, intent: "A." }, deps());
+    expect(pushed.ok).toBe(false);
+    expect(pushed.summary).toContain("nothing to push yet: the changes in");
   });
 
   test("described commits on top of work in progress stop git_commit", async () => {
@@ -350,10 +365,13 @@ describe("git_pr in a jj workspace", () => {
     expect(await jjAtHead(runner, path, branch, head)).toContain("work in progress");
     execFileSync("rm", ["x.txt"], { cwd: path });
 
-    git(main, "worktree", "remove", "--force", path);
-    await jjForget(runner, main, path, branch);
-    expect(existsSync(path)).toBe(false);
-    expect(jj(main, "workspace", "list", "-T", 'name ++ "\\n"')).not.toContain(`topic-${counter}`);
+    await jjForget(runner, path, branch);
+    rmSync(path, { recursive: true, force: true });
+    git(main, "worktree", "prune");
+    expect(git(main, "worktree", "list")).not.toContain(path);
+    expect(jj(main, "--ignore-working-copy", "workspace", "list", "-T", 'name ++ "\\n"')).not.toContain(
+      `topic-${counter}`,
+    );
     expect(git(main, "branch", "--list", branch)).toBe("");
   });
 });
@@ -598,9 +616,16 @@ describe("the watcher with a jj workspace", () => {
   test("merged: removes the workspace, forgets it in jj and deletes the bookmark", async () => {
     const { path, branch } = await opened();
     view(branch, { state: "MERGED" });
+    const before = git(main, "status", "--short");
     await once();
+    // The main checkout keeps what the user staged.
+    expect(git(main, "status", "--short")).toBe(before);
+    expect(git(main, "symbolic-ref", "--short", "HEAD")).toBe("main");
+    expect(git(main, "worktree", "list")).not.toContain(path);
     expect(existsSync(path)).toBe(false);
-    expect(jj(main, "workspace", "list", "-T", 'name ++ "\\n"')).not.toContain(`topic-${counter}`);
+    expect(jj(main, "--ignore-working-copy", "workspace", "list", "-T", 'name ++ "\\n"')).not.toContain(
+      `topic-${counter}`,
+    );
     expect(git(main, "branch", "--list", branch)).toBe("");
     expect(texts()[0]).toContain(`is merged; removed the worktree ${path} and the branch ${branch}`);
   });
@@ -687,7 +712,7 @@ describe("when jj fails", () => {
     expect(await jjAtHead(scripted({ log: { code: 0 }, "git fetch": { code: 0 } }), "/w", "b", "h")).toContain(
       "could not move the workspace",
     );
-    await jjForget(failing, "/m", "/w/x", "b");
+    await jjForget(failing, "/w/x", "b");
     expect(await jjSummary(failing, "/w")).toEqual({ branch: "no branch", wip: 0, unpushed: 0, pushed: false });
   });
 

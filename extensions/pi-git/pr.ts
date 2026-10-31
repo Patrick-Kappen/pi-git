@@ -724,9 +724,10 @@ async function pushStep(flow: Flow, wt: Worktree, commit: Commit, deps: Deps): P
   const ahead = await flow.ahead();
   if (typeof ahead === "string") return failed(ahead, flow, { worktree: wt });
   if (ahead === 0) {
-    return failed(`nothing to do: no changes in ${wt.root} and no commits ahead of origin/${base}`, flow, {
-      worktree: wt,
-    });
+    const why = (await flow.hasChanges())
+      ? `nothing to push yet: the changes in ${wt.root} are not committed (git_commit or git_pr commits them)`
+      : `nothing to do: no changes in ${wt.root} and no commits ahead of origin/${base}`;
+    return failed(why, flow, { worktree: wt });
   }
   if (!(deps.allowed ?? (() => true))("push")) return stop("push", flow, wt, commit);
   deps.progress("pre-push: pushing (the hook runs the checks)");

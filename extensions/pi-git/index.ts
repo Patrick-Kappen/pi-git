@@ -420,6 +420,8 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     touched.clear();
     for (const root of roots) {
       try {
+        // With commit locked, pi-git makes no commits for the agent either; the turns stay together.
+        if (lockOf(await slugOf(root), "commit") === "locked") continue;
         await wipSnapshot(runner, root, turnLabel);
       } catch {
         // The workspace may be gone; the next turn tries again.

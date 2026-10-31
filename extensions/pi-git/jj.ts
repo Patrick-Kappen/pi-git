@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { outputOf, type Runner, type RunResult } from "./exec.ts";
 
@@ -278,6 +278,20 @@ export async function jjAtHead(run: Runner, root: string, branch: string, head: 
   return moved.code === 0 ? undefined : `could not move the workspace to ${head.slice(0, 8)}: ${outputOf(moved)}`;
 }
 
+/**
+ * Run jj in the main checkout and put its git index back afterwards: jj's snapshot there rewrites
+ * the index, and what the user staged must stay staged.
+ */
+export async function keepingIndex<T>(main: string, action: () => Promise<T>): Promise<T> {
+  const index = join(main, ".git", "index");
+  const saved = existsSync(index) ? readFileSync(index) : undefined;
+  try {
+    return await action();
+  } finally {
+    if (saved) writeFileSync(index, saved);
+  }
+}
+
 /** A new workspace for a change: a git worktree from the base, with the branch as a bookmark. */
 export async function jjStart(
   run: Runner,
@@ -288,23 +302,19 @@ export async function jjStart(
   const from = remote ? `remote_bookmarks(exact:${quote(name)}, exact:"origin")` : `bookmarks(exact:${quote(name)})`;
   // Unlike git worktree add, jj does not create the parent directories.
   mkdirSync(dirname(input.path), { recursive: true });
-  const added = await jj(
-    run,
-    input.main,
-    ["workspace", "add", "--colocate", "--name", input.topic, "-r", from, input.path],
-    signal,
+  const added = await keepingIndex(input.main, () =>
+    jj(run, input.main, ["workspace", "add", "--colocate", "--name", input.topic, "-r", from, input.path], signal),
   );
   if (added.code !== 0) return `jj workspace add failed:\n${outputOf(added)}`;
   const bookmark = await jj(run, input.path, ["bookmark", "create", input.branch, "-r", "@-"], signal);
   return bookmark.code === 0 ? undefined : `jj bookmark create failed:\n${outputOf(bookmark)}`;
 }
 
-/** After the merge: forget the workspace and delete the bookmark (the directory is removed with git). */
-export async function jjForget(run: Runner, main: string, worktree: string, branch: string): Promise<void> {
-  const names = await jjText(run, main, ["workspace", "list", "-T", `name ++ "\\n"`]);
-  const name = basename(worktree);
-  if ((names ?? "").split("\n").includes(name)) await jj(run, main, ["workspace", "forget", name]);
-  await jj(run, main, ["bookmark", "delete", branch]);
+/** After the merge: delete the bookmark and forget the workspace; the caller removes the directory. */
+export async function jjForget(run: Runner, worktree: string, branch: string): Promise<void> {
+  // From inside the workspace: jj in the main checkout would reset the git index there (yours).
+  await jj(run, worktree, ["bookmark", "delete", branch]);
+  await jj(run, worktree, ["workspace", "forget"]);
 }
 
 /** For git_status: the branch, the commits in progress, and the logical commits not on GitHub. */
