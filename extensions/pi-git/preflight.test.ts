@@ -116,12 +116,12 @@ describe("the agent's part", () => {
       parse({
         verdicts: [
           { pr: 1, action: "ship", reason: "clean" },
-          { pr: 2, action: "skip", reason: "behavior" },
+          { pr: 2, action: "skip", reason: "behavior", after: [1] },
         ],
       }),
     ).toEqual([
       { pr: 1, action: "ship", reason: "clean" },
-      { pr: 2, action: "skip", reason: "behavior" },
+      { pr: 2, action: "skip", reason: "behavior", after: [1] },
     ]);
   });
 

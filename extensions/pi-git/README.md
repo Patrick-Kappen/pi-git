@@ -197,11 +197,12 @@ from open PRs to a deployed host:
      that conflicts after an earlier merge waits for the watcher's rebase);
    - for a picked release: waits for the release workflow, merges the release PR when its CI is
      green, and waits until the tag and `latest` match;
-   - in the NixOS configuration: merges its ready PRs, opens a PR that runs `nix flake update` for
-     the released inputs on the freshly fetched default branch (the helper writes the commit and
-     PR), merges it when its checks pass. When the default branch moves and the PR conflicts, it
-     makes the lock again on the fresh default branch and force-pushes with a lease, at most 3
-     times;
+   - then one flake.lock update for every released library in the NixOS configuration, on the
+     freshly fetched default branch (a fixed title, no helper), merged when its checks pass; a
+     conflict makes the lock again on the fresh default branch, at most 3 times;
+   - then every NixOS configuration PR: brought up to date with the new lock first (`gh pr
+     update-branch`, so its checks run with it), merged when green, oldest first; with nothing
+     released, straight to these PRs;
    - waits for the check run `…deploy-<host>` on that merge commit.
 5. **Done** when `deploy-<host>` succeeds: one notification with the released versions, and the
    same text once, quietly, in the history of the session that started the ship. A problem goes there

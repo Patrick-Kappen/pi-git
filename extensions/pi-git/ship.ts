@@ -93,6 +93,10 @@ export interface NixItem extends Stage {
   mergeSha?: string;
   /** How often the flake.lock PR was made again on a newer default branch, after a conflict. */
   refreshes?: number;
+  /** The merge commit of the flake.lock PR, once it landed. */
+  lockSha?: string;
+  /** Configuration PRs already brought up to date with the new lock. */
+  updated?: number[];
 }
 
 export interface Ship {
@@ -405,7 +409,7 @@ export function createShip(
         state: "merge" as const,
         since,
       })),
-    nixos: { repo: index.nixos.repo, root: index.nixos.root, prs: index.nixos.ready, state: "merge", since },
+    nixos: { repo: index.nixos.repo, root: index.nixos.root, prs: index.nixos.ready, state: "libs", since },
   };
 }
 
@@ -974,35 +978,52 @@ class Shipping {
     if (n.state === "deploy") return this.nixDeploy(n);
   }
 
-  /** The configuration's own PRs do not wait for the libraries: merged at once. */
-  private async nixMerge(n: NixItem): Promise<void> {
-    const method = await this.mergeMethod(n.repo);
-    if (!(await this.mergeAll(n, n.prs, method))) return;
-    this.move(n, "libs");
-  }
-
-  /** Once every library is done or failed: lock the releases, or deploy the merged PRs, or nothing. */
+  /**
+   * The order of a ship: the libraries merge and release, then one flake.lock update for all of
+   * them, then every configuration PR. Once every library is done or failed: the lock, or straight
+   * to the configuration PRs when nothing was released.
+   */
   private async nixLibs(n: NixItem): Promise<void> {
     if (this.ship.libs.some((lib) => lib.state !== "done" && lib.state !== "failed")) return;
     n.inputs = this.ship.libs
       .filter((lib) => !lib.outside && lib.state === "done" && ((lib.release && lib.tag) || lib.behind))
       .map((lib) => lib.input);
-    if (n.inputs.length > 0) return this.move(n, "update");
-    const last = n.prs.at(-1);
-    if (!last) return this.move(n, "done");
-    const sha = await this.gh([
-      "pr",
-      "view",
-      String(last.number),
-      "-R",
-      n.repo,
-      "--json",
-      "mergeCommit",
-      "--jq",
-      ".mergeCommit.oid",
-    ]);
-    if (sha) n.mergeSha = sha;
-    this.move(n, "deploy");
+    this.move(n, n.inputs.length > 0 ? "update" : "merge");
+  }
+
+  /**
+   * Every configuration PR, after the lock: brought up to date with the default branch first (so its
+   * checks run with the new lock), then merged when green, oldest first. Then the deploy of the last
+   * merge (or of the lock, when there are no PRs).
+   */
+  private async nixMerge(n: NixItem): Promise<void> {
+    if (n.lockSha) {
+      for (const pr of n.prs.filter((item) => !item.merged && !n.updated?.includes(item.number))) {
+        await this.deps.run("gh", ["pr", "update-branch", String(pr.number), "-R", n.repo], { cwd: n.root });
+        n.updated = [...(n.updated ?? []), pr.number];
+      }
+    }
+    const method = await this.mergeMethod(n.repo);
+    if (!(await this.mergeAll(n, n.prs, method))) return;
+    const last = [...n.prs].reverse().find((pr) => pr.merged);
+    if (last) {
+      const sha = await this.gh([
+        "pr",
+        "view",
+        String(last.number),
+        "-R",
+        n.repo,
+        "--json",
+        "mergeCommit",
+        "--jq",
+        ".mergeCommit.oid",
+      ]);
+      if (!sha) return this.wait(n, `the merge commit of #${last.number}`);
+      n.mergeSha = sha;
+    } else if (n.lockSha) {
+      n.mergeSha = n.lockSha;
+    }
+    this.move(n, n.mergeSha ? "deploy" : "done");
   }
 
   private async git(cwd: string, args: string[], timeoutMs?: number) {
@@ -1109,8 +1130,9 @@ class Shipping {
       ".mergeCommit.oid",
     ]);
     if (!sha) return this.wait(n, `the merge commit of PR #${n.pr}`);
-    n.mergeSha = sha;
-    this.move(n, "deploy");
+    // The lock landed: now every configuration PR, on top of it.
+    n.lockSha = sha;
+    this.move(n, "merge");
   }
 
   private async nixDeploy(n: NixItem): Promise<void> {
@@ -1185,9 +1207,9 @@ export async function shipTick(deps: ShipDeps, passes = MAX_PASSES): Promise<Shi
     const before = JSON.stringify(ship);
     // The configuration merges its own PRs at the same time as the libraries; its later steps look
     // at the libraries, so they come after them in the pass.
-    const nixFirst = ship.nixos.state === "merge";
-    await Promise.all([...ship.libs.map((lib) => shipping.lib(lib)), ...(nixFirst ? [shipping.nixos()] : [])]);
-    if (!nixFirst) await shipping.nixos();
+    // The libraries move at the same time; the configuration comes after them (lock, then its PRs).
+    await Promise.all(ship.libs.map((lib) => shipping.lib(lib)));
+    await shipping.nixos();
     await shipping.finishIfDone();
     saveShip(deps.config.stateDir, ship);
     if (JSON.stringify(ship) === before) break;
