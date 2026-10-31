@@ -1,9 +1,10 @@
-import { existsSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   addSummary,
+  bootId,
   claimSummary,
   dirs,
   type Entry,
@@ -103,5 +104,30 @@ describe("lock", () => {
     again?.();
     expect(existsSync(path)).toBe(false);
     expect(lock(dir, "w", 1000, Date.now())).toBeDefined();
+  });
+});
+
+describe("lock after a reboot or a crash", () => {
+  test("a lock of another boot, or of a process that is gone, is taken over", () => {
+    const dir = fresh();
+    const path = join(dirs(dir).locks, "w");
+    const release = lock(dir, "w", 60_000, Date.now(), "boot-1");
+    expect(lock(dir, "w", 60_000, Date.now(), "boot-1")).toBeUndefined();
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ pid: process.pid, boot: "boot-1" });
+    expect(lock(dir, "w", 60_000, Date.now(), "boot-2")).toBeDefined();
+    release?.();
+    writeFileSync(path, JSON.stringify({ pid: 2 ** 22 + 12345, boot: "boot-1" }));
+    expect(lock(dir, "w", 60_000, Date.now(), "boot-1")).toBeDefined();
+  });
+
+  test("a lock without an owner waits for its age; without a boot id the process decides", () => {
+    const dir = fresh();
+    const path = join(dirs(dir).locks, "w");
+    mkdirSync(dirs(dir).locks, { recursive: true });
+    writeFileSync(path, "");
+    expect(lock(dir, "w", 60_000)).toBeUndefined();
+    writeFileSync(path, JSON.stringify({ pid: process.pid }));
+    expect(lock(dir, "w", 60_000, Date.now(), undefined)).toBeUndefined();
+    expect(bootId()).toMatch(/^[0-9a-f-]{36}$|^$/);
   });
 });

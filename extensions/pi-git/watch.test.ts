@@ -382,4 +382,62 @@ describe("tick", () => {
     expect(existsSync(entry.worktree)).toBe(true);
     expect(texts().join("\n")).toContain("are kept: worktree is locked in o/r.");
   });
+
+  test("after an interrupted conflict fix: the watcher aborts its rebase, then fixes again", async () => {
+    writeFileSync(join(main, "a.txt"), `base reboot ${n}\n`);
+    sh(main, "commit", "-q", "-am", "base moved for reboot");
+    sh(main, "push", "-q", "origin", "HEAD:main");
+    const before = head();
+    sh(entry.worktree, "fetch", "-q", "origin");
+    // A rebase that stopped at a conflict, as if the machine went down during the fix.
+    try {
+      execFileSync("git", ["rebase", "origin/main"], {
+        cwd: entry.worktree,
+        stdio: "ignore",
+        env: { ...process.env, GIT_EDITOR: "true" },
+      });
+    } catch {
+      // The conflict is the point.
+    }
+    saveEntry(config.stateDir, { ...entry, working: "conflict", attempts: 1 });
+    view({ mergeable: "CONFLICTING", headRefOid: before });
+    await once();
+    expect(saved()?.notes[0]).toBe("after an interruption: aborted its rebase");
+    expect(saved()).toMatchObject({ attempts: 2, fixedSha: before });
+    expect(saved()?.working).toBeUndefined();
+    expect(gitPr.mock.calls[0]?.[0]).toMatchObject({ forceWithLease: before });
+  });
+
+  test("after an interrupted CI fix: its changes are stashed, not lost", async () => {
+    writeFileSync(join(entry.worktree, "half.txt"), "half a fix\n");
+    saveEntry(config.stateDir, { ...entry, working: "ci" });
+    view({ statusCheckRollup: [{ status: "IN_PROGRESS" }] });
+    await once();
+    expect(sh(entry.worktree, "status", "--porcelain")).toBe("");
+    expect(sh(entry.worktree, "stash", "list")).toContain(`pi-git: interrupted ci fix of PR #${n}`);
+    expect(saved()?.notes).toEqual(["after an interruption: stashed the changes of its fix (git stash list)"]);
+  });
+
+  test("a fix that breaks off is not counted for its head, and is tried again", async () => {
+    gitPr.mockRejectedValueOnce(new Error("boom"));
+    view({ statusCheckRollup: [red] });
+    await once();
+    expect(logs).toContain(`o__r__${n}: boom`);
+    expect(saved()).toMatchObject({ attempts: 1, working: "ci" });
+    expect(saved()?.fixedSha).toBeUndefined();
+    await once();
+    expect(saved()?.notes).toContain("after an interruption: stashed the changes of its fix (git stash list)");
+    expect(saved()).toMatchObject({ attempts: 2, fixedSha: head() });
+    expect(gitPr).toHaveBeenCalledTimes(2);
+  });
+
+  test("an interruption with a clean worktree, or without a worktree", async () => {
+    saveEntry(config.stateDir, { ...entry, working: "ci" });
+    view({ statusCheckRollup: [{ status: "IN_PROGRESS" }] });
+    await once();
+    expect(saved()?.notes).toEqual(["after an interruption: nothing to clean up"]);
+    saveEntry(config.stateDir, { ...entry, working: "ci", worktree: join(root, "gone") });
+    await once();
+    expect(texts().join("\n")).toContain("has no worktree any more");
+  });
 });

@@ -40,6 +40,8 @@ export interface Entry {
   greenSha?: string;
   /** The head that was reported as waiting for an unlock. */
   lockedSha?: string;
+  /** What the watcher is doing in the worktree; still set after an interruption (a reboot). */
+  working?: "ci" | "conflict";
   /** Polls in a row where gh failed. */
   errors: number;
   /** What the helper did. */
@@ -163,20 +165,61 @@ export function sessionAlive(stateDir: string, sessionId: string, maxAgeMs: numb
   }
 }
 
-/** Take a lock file; undefined when another process holds it. Stale locks (older than \`maxAgeMs\`) are taken over. */
-export function lock(stateDir: string, name: string, maxAgeMs: number, now = Date.now()): (() => void) | undefined {
+/** The id of this boot (Linux), so a lock from before a reboot is recognised; undefined elsewhere. */
+export function bootId(): string | undefined {
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Whether a lock may be taken over: too old, from another boot, or its process is gone. */
+function staleLock(path: string, maxAgeMs: number, now: number, boot: string | undefined): boolean {
+  let mtime: number;
+  try {
+    mtime = statSync(path).mtimeMs;
+  } catch {
+    return false;
+  }
+  if (now - mtime > maxAgeMs) return true;
+  const owner = readJson<{ pid?: unknown; boot?: unknown }>(path);
+  if (typeof owner?.pid !== "number") return false;
+  if (boot !== undefined && typeof owner.boot === "string" && owner.boot !== boot) return true;
+  return !processAlive(owner.pid);
+}
+
+/**
+ * Take a lock file; undefined when another process holds it. A lock is taken over when it is older
+ * than \`maxAgeMs\`, when it is from before a reboot, or when its process is gone.
+ */
+export function lock(
+  stateDir: string,
+  name: string,
+  maxAgeMs: number,
+  now = Date.now(),
+  boot = bootId(),
+): (() => void) | undefined {
   const { locks } = dirs(stateDir);
   mkdirSync(locks, { recursive: true });
   const path = join(locks, name);
+  const owner = JSON.stringify({ pid: process.pid, ...(boot === undefined ? {} : { boot }) });
   try {
-    closeSync(openSync(path, "wx"));
+    const fd = openSync(path, "wx");
+    writeFileSync(fd, owner);
+    closeSync(fd);
   } catch {
-    try {
-      if (now - statSync(path).mtimeMs <= maxAgeMs) return undefined;
-    } catch {
-      return undefined;
-    }
-    writeFileSync(path, "");
+    if (!staleLock(path, maxAgeMs, now, boot)) return undefined;
+    writeFileSync(path, owner);
   }
   return () => rmSync(path, { force: true });
 }

@@ -151,6 +151,7 @@ class Watch {
   }
 
   async step(): Promise<void> {
+    await this.recover();
     const pr = await this.view();
     if (!pr) {
       this.entry.errors++;
@@ -231,12 +232,49 @@ class Watch {
     const problem = await this.atHead(pr.headRefOid);
     if (problem) return this.finish("failed", `needs you: ${problem}. ${this.entry.url}`);
     this.entry.attempts++;
-    this.entry.fixedSha = pr.headRefOid;
+    this.entry.working = kind;
     this.entry.status = "watching";
     this.save();
     this.deps.log?.(`${this.entry.id}: fixing ${kind} (attempt ${this.entry.attempts})`);
     const failure = kind === "ci" ? await this.fixCi(pr) : await this.fixConflict(pr);
+    // Only a finished fix counts for this head; an interrupted one is cleaned up and tried again.
+    this.entry.fixedSha = pr.headRefOid;
+    delete this.entry.working;
     if (failure) return this.finish("failed", `needs you: ${failure}. ${this.entry.url}`);
+    this.save();
+  }
+
+  /**
+   * After an interruption (a reboot during a fix): abort the watcher's own rebase, and stash the
+   * changes of its fix, so the worktree is clean again. Nothing is thrown away.
+   */
+  private async recover(): Promise<void> {
+    const { working } = this.entry;
+    if (working === undefined) return;
+    delete this.entry.working;
+    const done: string[] = [];
+    if (existsSync(this.entry.worktree)) {
+      const rebaseDirs = await Promise.all(
+        ["rebase-merge", "rebase-apply"].map((name) =>
+          this.gitText("rev-parse", "--path-format=absolute", "--git-path", name),
+        ),
+      );
+      if (rebaseDirs.some((dir) => dir !== "" && existsSync(dir))) {
+        await this.git(["rebase", "--abort"]);
+        done.push("aborted its rebase");
+      }
+      if ((await this.gitText("status", "--porcelain")) !== "") {
+        await this.git([
+          "stash",
+          "push",
+          "--include-untracked",
+          "-m",
+          `pi-git: interrupted ${working} fix of PR #${this.entry.number}`,
+        ]);
+        done.push("stashed the changes of its fix (git stash list)");
+      }
+    }
+    this.entry.notes.push(`after an interruption: ${done.length > 0 ? done.join(", ") : "nothing to clean up"}`);
     this.save();
   }
 
