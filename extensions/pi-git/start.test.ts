@@ -49,6 +49,20 @@ describe("findMainCheckout", () => {
     expect(await findMainCheckout(deps(), "o/demo")).toBe(main);
     expect(await findMainCheckout(deps(), "~/private/demo")).toBe(main);
   });
+  test("owner/name also finds a checkout whose directory has another name", async () => {
+    const other = join(home, "private", "demo-config");
+    execFileSync("git", ["clone", "-q", origin, other]);
+    // The directory is demo-config, the repository o/demo: found by its origin, when demo is not there.
+    expect(await findMainCheckout({ ...deps(), home }, "o/demo")).toBe(main);
+    const renamed = join(home, "private", "demo");
+    execFileSync("mv", [renamed, join(home, "private", "demo-moved")]);
+    try {
+      expect(await findMainCheckout(deps(), "o/demo")).toMatch(/demo-(config|moved)$/);
+    } finally {
+      execFileSync("mv", [join(home, "private", "demo-moved"), renamed]);
+    }
+  });
+
   test("a wrong owner or an unknown name is an error", async () => {
     expect(await findMainCheckout(deps(), "other/demo")).toMatchObject({ error: /no main checkout of other\/demo/ });
     expect(await findMainCheckout(deps(), "/nonexistent/dir")).toMatchObject({ error: /not in a git repository/ });

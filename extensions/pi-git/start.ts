@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Backend } from "./backend.ts";
 import { detectCommand } from "./check.ts";
@@ -67,6 +67,26 @@ async function matches(deps: StartDeps, candidate: string, slug: string | undefi
   return origin !== undefined && (slug === undefined || repoSlug(origin).toLowerCase() === slug.toLowerCase());
 }
 
+/** The directories directly under `root` that hold a git checkout. */
+function checkouts(root: string): string[] {
+  try {
+    return readdirSync(root)
+      .map((entry) => join(root, entry))
+      .filter((dir) => existsSync(join(dir, ".git")));
+  } catch {
+    return [];
+  }
+}
+
+async function findByOrigin(deps: StartDeps, home: string, slug: string): Promise<string | undefined> {
+  for (const root of ROOTS) {
+    for (const candidate of checkouts(join(home, root))) {
+      if (await matches(deps, candidate, slug)) return candidate;
+    }
+  }
+  return undefined;
+}
+
 /** The main checkout of `repo`, or why it cannot be found. */
 export async function findMainCheckout(deps: StartDeps, repo: string): Promise<string | { error: string }> {
   const path = expand(repo, deps.home);
@@ -76,6 +96,12 @@ export async function findMainCheckout(deps: StartDeps, repo: string): Promise<s
   for (const root of ROOTS) {
     const candidate = join(deps.home, root, name);
     if (await matches(deps, candidate, slug)) return candidate;
+  }
+  // The directory may have another name than the repository (Nixos in ~/private/nixos-config):
+  // with owner/name, look at the origin of every checkout in the roots.
+  if (slug) {
+    const byOrigin = await findByOrigin(deps, deps.home, slug);
+    if (byOrigin) return byOrigin;
   }
   return {
     error: `no main checkout of ${repo} in ${ROOTS.map((root) => `~/${root}`).join(", ")}; clone it first (gh repo clone ${repo})`,
