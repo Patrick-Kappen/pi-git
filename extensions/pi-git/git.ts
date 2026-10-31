@@ -1,4 +1,4 @@
-import { basename } from "node:path";
+import { basename, dirname } from "node:path";
 import type { Runner } from "./exec.ts";
 
 /** What git_pr needs to know about the worktree. */
@@ -6,13 +6,31 @@ export interface Worktree {
   root: string;
   branch: string;
   defaultBranch: string;
-  /** The repository name: the last part of the origin URL, else of the main checkout. */
+  /** The repository name: the last part of the origin URL. */
   repo: string;
+  /** owner/name from the origin URL. */
+  slug: string;
+  /** The main checkout that owns the worktree. */
+  mainRoot: string;
 }
 
 async function git(run: Runner, cwd: string, ...args: string[]): Promise<string | undefined> {
   const result = await run("git", args, { cwd });
   return result.code === 0 ? result.stdout.trim() : undefined;
+}
+
+/** owner/name from a remote URL: `git@github.com:o/name.git` is `o/name`. */
+export function repoSlug(url: string): string {
+  const path = url
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\.git$/, "")
+    .replace(/^[^:]+:(?!\/\/)/, "/");
+  return path
+    .split("/")
+    .filter((part) => part !== "")
+    .slice(-2)
+    .join("/");
 }
 
 /** The repository name from a remote URL: `git@github.com:o/name.git` is `name`. */
@@ -53,7 +71,8 @@ export async function inspectWorktree(run: Runner, path: string): Promise<Worktr
   if (!branch) return `${root} has a detached HEAD; switch to a branch first`;
   const main = await defaultBranch(run, root);
   if (branch === main) return `${root} is on the default branch ${main}; changes go on a <type>/<topic> branch`;
-  return { root, branch, defaultBranch: main, repo };
+  const mainRoot = basename(commonDir ?? "") === ".git" ? dirname(commonDir as string) : (commonDir as string);
+  return { root, branch, defaultBranch: main, repo, slug: repoSlug(origin), mainRoot };
 }
 
 /** Whether the repository uses Conventional Commits (a checker or release-please), and recent subjects. */

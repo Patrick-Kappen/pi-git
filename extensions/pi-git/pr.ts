@@ -16,6 +16,10 @@ export interface PrInput {
   /** The base branch; default: the base of the open PR, else the default branch. */
   base?: string;
   draft?: boolean;
+  /** Open or update the PR; the watcher only pushes its fixes. Default: true. */
+  updatePr?: boolean;
+  /** After a rebase: force-push, only when GitHub still has this sha. */
+  forceWithLease?: string;
 }
 
 export interface PrResult {
@@ -229,6 +233,13 @@ class Flow {
 
   /** Push; when GitHub has commits the worktree lacks (the watcher pushed), rebase on them first. */
   push = async (): Promise<RunResult> => {
+    const lease = this.input.forceWithLease;
+    if (lease !== undefined) {
+      return this.git(
+        ["push", `--force-with-lease=${this.wt.branch}:${lease}`, "-u", "origin", `HEAD:${this.wt.branch}`],
+        this.checkTimeout,
+      );
+    }
     const push = await this.git(["push", "-u", "origin", "HEAD"], this.checkTimeout);
     if (push.code === 0 || !/\[rejected\]|non-fast-forward|fetch first/.test(push.stderr)) return push;
     this.deps.progress("the branch on GitHub moved; rebasing on it");
@@ -261,7 +272,12 @@ class Flow {
     existing: PullRequest | undefined,
   ): Promise<{ number: number; url: string; created: boolean } | string> {
     const range = `origin/${this.base}...HEAD`;
+    const stacked =
+      this.base === this.wt.defaultBranch ? undefined : await findPullRequest(this.deps.run, this.wt.root, this.base);
     const input = [
+      stacked
+        ? `This PR is stacked on PR #${stacked.number} (${this.base}). Start the body with: "Stacked on #${stacked.number}; merge that first."`
+        : "",
       `What the change is for:\n${this.input.intent}`,
       `Branch: ${this.wt.branch} into ${this.base}`,
       `Recent subjects on ${this.base}:\n${this.recent.join("\n")}`,
@@ -387,6 +403,16 @@ export async function gitPr(input: PrInput, deps: Deps): Promise<PrResult> {
         ...(commit ? { commit } : {}),
       });
 
+    if (input.updatePr === false) {
+      return {
+        ok: true,
+        summary: `Pushed ${wt.branch}.`,
+        worktree: wt,
+        base,
+        ...(commit ? { commit } : {}),
+        notes: flow.notes,
+      };
+    }
     const pr = await flow.pullRequest(existing);
     if (typeof pr === "string") return failed(`${pr}\n\nThe branch ${wt.branch} is pushed.`, flow, { worktree: wt });
     return success(flow, wt, commit, pr, input.draft === true);

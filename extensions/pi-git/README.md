@@ -33,6 +33,39 @@ What it does, in the worktree of `path`:
 When a step still fails, `git_pr` stops with an error: the output, what the helper tried, and what
 state the worktree is in (staged, or pushed). Progress shows in the tool call while it runs.
 
+After the PR is open, `git_pr` queues it for the watcher.
+
+## The watcher
+
+`watcher.ts` runs one round over the queued PRs; a systemd user timer starts it every minute (see the
+[main README](../../README.md)). For each PR it reads the state, the checks and the merge state with
+`gh pr view`:
+
+| The PR | The watcher |
+|---|---|
+| Checks pending | Waits. Checks that wait for an approval count as pending. |
+| Checks failed | The helper gets the failing checks with their logs (`gh run view --log-failed` for GitHub Actions) and fixes the files; pi-git commits and pushes the fix with the `git_pr` flow, checks included. When the helper changes nothing (the failure is not caused by the PR), the failed jobs run again once. |
+| Conflicts with the base | Rebases the worktree on the base; the helper resolves each conflict; pi-git continues the rebase and force-pushes with a lease on the head it saw. |
+| Green and mergeable | Reports it once per head. |
+| Merged | Removes the worktree and the local branch (when the worktree is clean), prunes, reports it, and stops. |
+| Closed | Reports it and stops; the worktree and the branch are kept. |
+
+The helper tries each red head once, and at most `attempts` times per PR; then the watcher reports
+that the PR needs you. It never merges. It refuses to touch a worktree with uncommitted changes or
+with commits that are not on GitHub, and reports that instead.
+
+## Summaries
+
+The watcher writes a summary for each report to `<stateDir>/inbox`. Each pi session sends a heartbeat
+and looks for summaries every 20 seconds:
+
+- a summary goes to the session that ran `git_pr`;
+- when that session is gone (no heartbeat for 90 seconds), the next session in the same repository
+  takes it, so nothing is lost when pi was closed.
+
+`delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
+adds it to the context for your next prompt, `notify` only shows it to you.
+
 ## The helper
 
 The helper is `pi -p` with its own model, started in the worktree:
@@ -57,6 +90,8 @@ The helper is `pi -p` with its own model, started in the worktree:
 | `attempts` | `3` | Fix attempts per failing step |
 | `checkTimeout` | `1800` | Seconds for one hook run |
 | `helperTimeout` | `900` | Seconds for one helper run |
+| `delivery` | `turn` | How a summary reaches the main agent: `turn`, `message` or `notify` |
+| `stateDir` | `~/.local/state/pi-git` | The queue, the summaries and the heartbeats |
 
 | What | Default | Override |
 |---|---|---|

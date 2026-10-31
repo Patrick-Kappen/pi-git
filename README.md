@@ -6,8 +6,10 @@ green.
 The main agent of pi is good at making a change and expensive at the rest: running the hooks, reading
 their output, fixing lint, writing the commit message and the PR. With pi-git, the main agent calls
 `git_pr` with what the change is for. A cheap helper agent (`pi -p` with another model) fixes failing
-checks and writes the commit message and the PR; pi-git runs every git and GitHub step itself. See
-the [extension README](extensions/pi-git/README.md).
+checks and writes the commit message and the PR; pi-git runs every git and GitHub step itself. A
+watcher (a systemd user timer) then follows the PR: the helper fixes red CI and conflicts, and the
+main agent gets a summary when the PR is green, merged, or needs you. See the
+[extension README](extensions/pi-git/README.md).
 
 It works with the `git` skill of [pi-skills](https://github.com/Patrick-Kappen/pi-skills), which
 both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on the default branch.
@@ -45,6 +47,11 @@ both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on
 | `attempts` | `3` | Fix attempts per failing step |
 | `checkTimeout`, `helperTimeout` | `1800`, `900` | Seconds for one hook run and one helper run |
 | `pi` | `"pi"` | The pi command for the helper |
+| `delivery` | `"turn"` | How the watcher's summary reaches the main agent: `turn`, `message` or `notify` |
+| `watcher.enable` | `true` | The systemd user timer `pi-git-watcher` |
+| `watcher.interval` | `"1min"` | How often the watcher runs |
+| `watcher.environment` | `{ }` | Extra environment, for example `SSH_AUTH_SOCK = "%t/ssh-agent";` for `git push` |
+| `watcher.packages` | `[ ]` | Extra tools on the watcher's PATH, for the hooks of your repositories |
 | `package`, `agentDir` | this flake, `.pi/agent` | The extension, and pi's agent directory |
 
 ## Layout
