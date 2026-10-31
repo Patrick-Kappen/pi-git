@@ -20,7 +20,7 @@ import {
   shipLines,
   shipTick,
 } from "./ship.ts";
-import { type Entry, entryId, loadSummaries, removeEntry, saveEntry } from "./state.ts";
+import { type Entry, entryId, loadEntries, loadSummaries, removeEntry, saveEntry } from "./state.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-git-ship-")));
 const nixos = join(root, "nixos");
@@ -84,6 +84,8 @@ let world: {
   deploy: { name: string; status: string; conclusion: string | null } | undefined;
   nixosPr: object | undefined;
   fail: string[];
+  repos?: string[];
+  releasing?: string[];
 };
 
 const calls: string[] = [];
@@ -114,6 +116,8 @@ function prView(repo: string, args: readonly string[]): Reply {
 }
 
 function api(path: string): Reply {
+  const config = /^repos\/([^/]+\/[^/]+)\/contents\/release-please-config\.json$/.exec(path);
+  if (config) return (world.releasing ?? []).includes(config[1] ?? "") ? ok("release-please-config.json") : no;
   if (path.endsWith("/check-runs")) return ok(world.deploy ? [world.deploy] : []);
   const commit = /^repos\/([^/]+\/[^/]+)\/commits\/(.+)$/.exec(path);
   if (!commit) return ok({ squash: false, merge: true });
@@ -127,6 +131,7 @@ function ghReply(args: readonly string[]): Reply {
   const repo = args[args.indexOf("-R") + 1] ?? "";
   const key = `${args[0]} ${args[1]}`;
   if (key === "pr list") return prList(repo, args);
+  if (key === "repo list") return ok((world.repos ?? []).map((nameWithOwner) => ({ nameWithOwner })));
   if (key === "pr view") return prView(repo, args);
   if (key === "pr edit") return ok("");
   if (key === "pr merge") {
@@ -322,6 +327,31 @@ describe("shipTick", () => {
     calls.length = 0;
     await tick();
     expect(calls).toEqual([]);
+  });
+
+  test("a repository with releases that NixOS does not use yet: shipped and released, not locked", async () => {
+    world.repos = ["o/pi-git", "o/pi-tweaks", "o/website", "o/Nixos"];
+    world.releasing = ["o/pi-git", "o/pi-tweaks"];
+    world.prs["o/pi-tweaks"] = [pr(2, "feat(prompt): replace it")];
+    const index = await indexShip(fake, nixos);
+    const tweaks = index.libs.find((lib) => lib.repo === "o/pi-tweaks");
+    expect(tweaks).toMatchObject({ outside: true, releasable: true });
+    expect(index.libs.map((lib) => lib.repo)).toEqual(["o/pi-git", "o/pi-skills", "o/pi-tweaks"]);
+    expect(planLines(index).filter((line) => line.startsWith("o/pi-tweaks"))).toEqual([
+      "o/pi-tweaks: merge #2; not in the NixOS configuration yet: released, not deployed; a release follows",
+    ]);
+    saveShip(config.stateDir, createShip(index, ["o/pi-tweaks"], "gaia", clock));
+    await tick();
+    expect(world.merged).toContain("o/pi-tweaks#2");
+  });
+
+  test("PRs the watcher follows go quiet once the ship takes them over", async () => {
+    saveEntry(config.stateDir, { id: entryId("o/pi-git", 1), repo: "o/pi-git", number: 1 } as Entry);
+    saveEntry(config.stateDir, { id: entryId("o/other", 3), repo: "o/other", number: 3 } as Entry);
+    await plan([]);
+    await tick();
+    const quiet = Object.fromEntries(loadEntries(config.stateDir).map((entry) => [entry.id, entry.quiet ?? false]));
+    expect(quiet).toEqual({ [entryId("o/pi-git", 1)]: true, [entryId("o/other", 3)]: false });
   });
 
   test("a round keeps going while something moves: from merge to the flake.lock PR in one round", async () => {

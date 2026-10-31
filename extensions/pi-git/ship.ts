@@ -8,7 +8,7 @@ import { repoName, repoSlug } from "./git.ts";
 import { askJson } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { findMainCheckout } from "./start.ts";
-import { addSummary, entryId, loadEntries } from "./state.ts";
+import { addSummary, entryId, loadEntries, saveEntry } from "./state.ts";
 import { gitWatch, worktreeOf } from "./status.ts";
 import { type Check, rollup } from "./watch.ts";
 
@@ -61,6 +61,8 @@ export interface LibItem extends Stage {
   review?: number[];
   /** PRs handed to the watcher to fix (red checks, conflicts). */
   adopted?: number[];
+  /** Not a flake input of the configuration: released, but nothing to lock. */
+  outside?: boolean;
   /** Whether the input needs a new lock even without a release here (an earlier release is not locked). */
   behind: boolean;
   state: LibState;
@@ -106,6 +108,8 @@ export interface RepoIndex {
   releasable: boolean;
   /** PRs ship merges, but none leads to a release (docs, chore, ...): the owner may make one a feat. */
   noRelease?: number;
+  /** A repository with releases that the NixOS configuration does not use yet: released, not deployed. */
+  outside?: boolean;
   behind: boolean;
 }
 
@@ -265,9 +269,48 @@ export async function indexShip(run: Runner, nixosRoot: string): Promise<ShipInd
       return { ...index, input, behind: latest !== undefined && latest !== rev };
     }),
   );
+  const outside = await outsideRepos(run, nixosRoot, nixosRepo, new Set(inputs.map((item) => item.repo.toLowerCase())));
   const nixos = await indexRepo(run, nixosRoot, nixosRepo);
   // The NixOS configuration is not released; its merges are deployed.
-  return { libs, nixos: { ...nixos, releasable: false, root: nixosRoot } };
+  const { noRelease: _none, ...plain } = nixos;
+  return { libs: [...libs, ...outside], nixos: { ...plain, releasable: false, root: nixosRoot } };
+}
+
+/**
+ * The owner's other repositories with release-please that the configuration does not use yet: their
+ * PRs and releases ship too, and the plan says they are not in NixOS (adding them changes the
+ * configuration, so /ship does not).
+ */
+async function outsideRepos(run: Runner, cwd: string, nixosRepo: string, known: Set<string>): Promise<RepoIndex[]> {
+  const owner = nixosRepo.split("/")[0];
+  if (!owner) return [];
+  const list = await ghJson<{ nameWithOwner: string }[]>(run, cwd, [
+    "repo",
+    "list",
+    owner,
+    "--no-archived",
+    "--source",
+    "--limit",
+    "500",
+    "--json",
+    "nameWithOwner",
+  ]);
+  const candidates = (list ?? [])
+    .map((repo) => repo.nameWithOwner)
+    .filter((repo) => repo.toLowerCase() !== nixosRepo.toLowerCase() && !known.has(repo.toLowerCase()));
+  const found = await Promise.all(
+    candidates.map(async (repo) =>
+      (await gh(run, cwd, ["api", `repos/${repo}/contents/release-please-config.json`, "--jq", ".name"]))
+        ? repo
+        : undefined,
+    ),
+  );
+  return Promise.all(
+    found
+      .filter((repo): repo is string => repo !== undefined)
+      .sort()
+      .map(async (repo) => ({ ...(await indexRepo(run, cwd, repo)), outside: true })),
+  );
 }
 
 /** The plan as lines for the owner: what ships, and what does not and why. */
@@ -276,7 +319,8 @@ function planLinesForRepo(lib: RepoIndex): string[] {
     lib.ready.length > 0
       ? `merge ${lib.ready.map((pr) => `#${pr.number}${pr.note ? ` (${pr.note})` : ""}`).join(", ")}`
       : "",
-    lib.noRelease !== undefined && lib.input !== undefined ? "no release follows (no feat or fix)" : "",
+    lib.noRelease !== undefined ? "no release follows (no feat or fix)" : "",
+    lib.outside ? "not in the NixOS configuration yet: released, not deployed" : "",
     lib.releasePr
       ? `release PR #${lib.releasePr.number} (${lib.releasePr.title})`
       : lib.releasable
@@ -312,6 +356,7 @@ export function createShip(
       .map((lib) => ({
         repo: lib.repo,
         input: lib.input ?? repoName(lib.repo),
+        ...(lib.outside ? { outside: true } : {}),
         prs: lib.ready,
         release: releases.includes(lib.repo),
         ...(retitles[lib.repo] !== undefined ? { retitle: [retitles[lib.repo] as number] } : {}),
@@ -738,7 +783,7 @@ class Shipping {
   private async nixLibs(n: NixItem): Promise<void> {
     if (this.ship.libs.some((lib) => lib.state !== "done" && lib.state !== "failed")) return;
     n.inputs = this.ship.libs
-      .filter((lib) => lib.state === "done" && ((lib.release && lib.tag) || lib.behind))
+      .filter((lib) => !lib.outside && lib.state === "done" && ((lib.release && lib.tag) || lib.behind))
       .map((lib) => lib.input);
     if (n.inputs.length > 0) return this.move(n, "update");
     const last = n.prs.at(-1);
@@ -908,6 +953,20 @@ export const SHIP_POLL_MS = 10_000;
 /** for at most this long, so it ends before the timer starts it again. */
 export const SHIP_WINDOW_MS = 45_000;
 
+/**
+ * The ship takes over the PRs it merges: the watcher keeps fixing them, but stops reporting them to
+ * the sessions that made them. Only the ship's end (and its problems) is reported.
+ */
+export function quietWatched(stateDir: string, ship: Ship): void {
+  const shipped = new Set([
+    ...ship.libs.flatMap((lib) => lib.prs.map((pr) => entryId(lib.repo, pr.number))),
+    ...ship.nixos.prs.map((pr) => entryId(ship.nixos.repo, pr.number)),
+  ]);
+  for (const entry of loadEntries(stateDir)) {
+    if (shipped.has(entry.id) && !entry.quiet) saveEntry(stateDir, { ...entry, quiet: true });
+  }
+}
+
 /** Passes per round: each moves every part as far as it can; a round stops early when nothing moved. */
 export const MAX_PASSES = 8;
 
@@ -920,6 +979,7 @@ export async function shipTick(deps: ShipDeps, passes = MAX_PASSES): Promise<Shi
   const ship = loadShip(deps.config.stateDir);
   if (ship?.status !== "running") return ship;
   const shipping = new Shipping(deps, ship);
+  quietWatched(deps.config.stateDir, ship);
   if (!ship.reviewed) {
     await shipping.review();
     saveShip(deps.config.stateDir, ship);
