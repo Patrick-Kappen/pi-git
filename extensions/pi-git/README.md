@@ -179,7 +179,17 @@ from open PRs to a deployed host:
    releases. For a library whose PRs have no feat or fix, an agent (`shipModel`, default
    `openai-codex/gpt-6-luna` at `medium`) reads the PRs and decides whether users get something new;
    then /ship gives one PR a feat or fix title before the merge, and it releases.
-3. **Run**: the watcher advances the ship every minute, out of the agents' sight:
+3. **Preflight**, before the first merge: per repository, every PR is merged locally in order (oldest
+   first, a stacked PR right after its base with only its own commits) with `git merge-tree`, onto
+   the fresh default branch and onto each other. Where anything is not clean and green, the agent
+   (`shipModel`) reads the PRs, the conflicts and their markers, and decides per PR: ship, fix (a
+   helper can resolve it without changing behavior) or skip (a behavior decision, superseded,
+   depends on a PR that is not shipped, unfinished). A stacked PR whose base is skipped is skipped
+   too. The skipped PRs are reported once, as a notification and in the history; the rest ships.
+   Stacked PRs go to the watcher before their base merges, so they are rebased at once afterwards.
+4. **Run**: the watcher advances the ship, out of the agents' sight (every 5 seconds, beside the PR
+   watcher): every PR oldest first, each round; green ones merge, conflicting ones get a helper at once
+   and at the same time;
    - merges the ready PRs (each when it is green and mergeable, on the head it just checked; a PR
      that conflicts after an earlier merge waits for the watcher's rebase);
    - for a picked release: waits for the release workflow, merges the release PR when its CI is
@@ -190,7 +200,7 @@ from open PRs to a deployed host:
      makes the lock again on the fresh default branch and force-pushes with a lease, at most 3
      times;
    - waits for the check run `…deploy-<host>` on that merge commit.
-4. **Done** when `deploy-<host>` succeeds: one notification with the released versions, and the
+5. **Done** when `deploy-<host>` succeeds: one notification with the released versions, and the
    same text once, quietly, in the history of the session that started the ship. A problem goes there
    too, as it happens.
 
