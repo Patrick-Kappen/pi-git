@@ -172,6 +172,21 @@ in
       '';
     };
 
+    ship = {
+      nixos = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "~/nixos-config";
+        description = "The main checkout of the NixOS configuration that /ship locks the releases in.";
+      };
+      host = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "gaia";
+        description = "The host whose deploy check (deploy-<host>) confirms a ship; default: this machine's host name.";
+      };
+    };
+
     watcher = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -250,6 +265,8 @@ in
           ) cfg.repos;
         }
         // lib.optionalAttrs (cfg.skill != null) { skill = "${cfg.skill}"; }
+        // lib.optionalAttrs (cfg.ship.nixos != null) { shipNixos = cfg.ship.nixos; }
+        // lib.optionalAttrs (cfg.ship.host != null) { shipHost = cfg.ship.host; }
       );
     };
   };

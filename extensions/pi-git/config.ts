@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { type RepoSettings, toSettings } from "./switch.ts";
 
@@ -36,6 +36,10 @@ export interface Config {
   repos: RepoSettings;
   /** Locks and session heartbeats: gone after a reboot, unlike `stateDir`. */
   runtimeDir: string;
+  /** /ship: the main checkout of the NixOS configuration whose flake.lock locks the releases. */
+  shipNixos: string | undefined;
+  /** /ship: the host whose deploy check (`deploy-<host>`) confirms the ship. */
+  shipHost: string;
   errors: string[];
 }
 
@@ -76,6 +80,8 @@ export function defaults(path: string, env: NodeJS.ProcessEnv, home: string): Co
     runtimeDir: env.XDG_RUNTIME_DIR
       ? join(expandHome(env.XDG_RUNTIME_DIR, home), "pi-git")
       : join(state, "pi-git", "run"),
+    shipNixos: undefined,
+    shipHost: hostname(),
     errors: [],
   };
 }
@@ -84,9 +90,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-type Field = "model" | "thinking" | "skill" | "pi" | "worktrees" | "stateDir" | "runtimeDir";
-const STRINGS: readonly Field[] = ["model", "thinking", "skill", "pi", "worktrees", "stateDir", "runtimeDir"];
-const PATHS: ReadonlySet<Field> = new Set(["skill", "worktrees", "stateDir", "runtimeDir"]);
+type Field = "model" | "thinking" | "skill" | "pi" | "worktrees" | "stateDir" | "runtimeDir" | "shipNixos" | "shipHost";
+const STRINGS: readonly Field[] = [
+  "model",
+  "thinking",
+  "skill",
+  "pi",
+  "worktrees",
+  "stateDir",
+  "runtimeDir",
+  "shipNixos",
+  "shipHost",
+];
+const PATHS: ReadonlySet<Field> = new Set(["skill", "worktrees", "stateDir", "runtimeDir", "shipNixos"]);
 const NUMBERS = ["attempts", "checkTimeout", "helperTimeout"] as const;
 
 /** Apply `locked` or `delivery`; a string is the error. */
