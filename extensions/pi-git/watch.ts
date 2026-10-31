@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { addAttention, attentionId, clearAttention, notifyTerminals } from "./attention.ts";
 import type { Config } from "./config.ts";
@@ -248,14 +248,16 @@ class Watch {
   /** Remove the worktree and its branch: with git, or for a jj workspace also with jj. */
   private async removeWorktree(): Promise<string | undefined> {
     const { worktree, mainRoot, branch } = this.entry;
-    const jj = this.jj;
-    const remove = await this.deps.run("git", ["worktree", "remove", ...(jj ? ["--force"] : []), worktree], {
-      cwd: mainRoot,
-    });
-    if (jj) {
-      if (remove.code === 0) await jjForget(this.deps.run, mainRoot, worktree, branch);
-      return remove.code === 0 ? undefined : outputOf(remove);
+    if (this.jj) {
+      // jj forgets the workspace (and, from 0.46, its git worktree); git and rm remove what is left.
+      // Nothing is lost: there is no work in progress, and every commit is in the merged PR.
+      await jjForget(this.deps.run, worktree, branch);
+      const remove = await this.deps.run("git", ["worktree", "remove", "--force", worktree], { cwd: mainRoot });
+      if (existsSync(worktree)) rmSync(worktree, { recursive: true, force: true });
+      await this.deps.run("git", ["worktree", "prune"], { cwd: mainRoot });
+      return existsSync(worktree) ? outputOf(remove) : undefined;
     }
+    const remove = await this.deps.run("git", ["worktree", "remove", worktree], { cwd: mainRoot });
     const deleted = await this.deps.run("git", ["branch", "-D", branch], { cwd: mainRoot });
     if (remove.code === 0 && deleted.code === 0) return undefined;
     return `${outputOf(remove)}\n${outputOf(deleted)}`;

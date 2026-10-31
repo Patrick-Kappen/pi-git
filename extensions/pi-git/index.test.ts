@@ -757,7 +757,7 @@ describe("work in progress in jj workspaces", () => {
     writeFileSync(join(workspace, ".git"), "gitdir: elsewhere\n");
     mkdirSync(join(dir, "main", ".jj"), { recursive: true });
     mkdirSync(join(dir, "main", ".git"));
-    writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir: join(dir, "state") }));
+    writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir: join(dir, "state"), locked: false }));
     const calls: string[] = [];
     const runner: Runner = async (command, args, options) => {
       calls.push(`${options.cwd}: ${command} ${args.filter((arg) => !arg.startsWith("--")).join(" ")}`);
@@ -780,7 +780,7 @@ describe("work in progress in jj workspaces", () => {
     await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "cd main && ls" } }, ctx);
     calls.length = 0;
     await handlers.get("agent_end")?.({ messages: [] }, ctx);
-    expect(calls.filter((call) => !call.includes(" log "))).toEqual([
+    expect(calls.filter((call) => call.includes(": jj ") && !call.includes(" log "))).toEqual([
       `${workspace}: jj describe -m wip: Add the thing`,
       `${workspace}: jj new`,
     ]);
@@ -788,5 +788,33 @@ describe("work in progress in jj workspaces", () => {
     calls.length = 0;
     await handlers.get("agent_end")?.({ messages: [] }, ctx);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("work in progress with commit locked", () => {
+  test("pi-git makes no wip: commit for the agent either", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-git-wiplock-"));
+    const workspace = join(dir, "ws");
+    mkdirSync(join(workspace, ".jj"), { recursive: true });
+    writeFileSync(join(workspace, ".git"), "gitdir: elsewhere\n");
+    writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir: join(dir, "state"), locked: true }));
+    const calls: string[] = [];
+    const runner: Runner = async (command, args) => {
+      calls.push(`${command} ${args.join(" ")}`);
+      return { code: 0, stdout: args.includes("log") ? "open\n" : "", stderr: "" };
+    };
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      on: (name: string, handler: never) => handlers.set(name, handler),
+      registerTool: vi.fn(),
+      registerCommand: vi.fn(),
+      sendMessage: vi.fn(),
+    };
+    createPiGit(pi as never, { env: { PI_GIT_CONFIG: join(dir, "pi-git.json") }, home: dir, run: runner });
+    const ctx = { cwd: dir, hasUI: false, ui: { notify: vi.fn(), setStatus: vi.fn() } };
+    await handlers.get("tool_call")?.({ toolName: "write", input: { path: "ws/a.ts" } }, ctx);
+    calls.length = 0;
+    await handlers.get("agent_end")?.({ messages: [] }, ctx);
+    expect(calls.filter((call) => call.startsWith("jj"))).toEqual([]);
   });
 });

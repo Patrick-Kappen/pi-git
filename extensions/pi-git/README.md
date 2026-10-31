@@ -310,9 +310,10 @@ keeps its kind.
 With jj, `git_start` makes a colocated jj workspace (`jj workspace add --colocate`): a git worktree
 as well, with the branch as a bookmark. In a repository without jj it runs `jj git init --colocate`
 in the main checkout first; git keeps working there as before, and the main checkout keeps its
-branch.
+branch and what you staged (pi-git puts the git index back, and runs every later jj command in the
+workspace, not in the main checkout).
 
-- **One commit per turn.** At the end of every agent run, pi-git names the working-copy commit of
+- **One commit per turn.** With `commit` unlocked, at the end of every agent run, pi-git names the working-copy commit of
   each jj workspace the agent worked in `wip: <the prompt>` and starts a new one. A run that changed
   nothing makes no commit. The history of a change is its turns, and `jj undo` or `jj restore` goes
   back to any of them.

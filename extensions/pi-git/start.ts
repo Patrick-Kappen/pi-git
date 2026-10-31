@@ -5,7 +5,7 @@ import { detectCommand } from "./check.ts";
 import type { Config } from "./config.ts";
 import { clipStart, outputOf, type Runner } from "./exec.ts";
 import { commitStyle, defaultBranch, repoName, repoSlug } from "./git.ts";
-import { isJj, jj, jjBranch, jjStart, track } from "./jj.ts";
+import { isJj, jj, jjBranch, jjStart, keepingIndex, track } from "./jj.ts";
 
 /** The commit types a branch may start with, as in the git skill. */
 export const TYPES = ["feat", "fix", "docs", "refactor", "test", "build", "ci", "chore", "perf"] as const;
@@ -229,7 +229,7 @@ async function addWorkspace(deps: StartDeps, plan: Plan): Promise<string | undef
   if (!isJj(main)) {
     // The backend is jj, but the repository has no jj yet: colocate it, git keeps working as before.
     deps.progress("jj git init --colocate: the backend of this repository is jj");
-    const init = await jj(deps.run, main, ["git", "init", "--colocate"], deps.signal);
+    const init = await keepingIndex(main, () => jj(deps.run, main, ["git", "init", "--colocate"], deps.signal));
     if (init.code !== 0) return `jj git init --colocate failed in ${main}:\n${clipStart(outputOf(init), 600)}`;
   }
   const topic = path.split("/").at(-1) ?? branch;
