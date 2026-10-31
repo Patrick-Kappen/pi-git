@@ -35,6 +35,27 @@ state the worktree is in (staged, or pushed). Progress shows in the tool call wh
 
 After the PR is open, `git_pr` queues it for the watcher.
 
+## `git_check`
+
+| Parameter | Meaning |
+|---|---|
+| `command` | The check command, run with `sh -c` in the root of the repository. Default: detected. |
+| `path` | A directory in the repository; default: the working directory. |
+| `fix` | Let the helper fix failures; default: `true`. |
+
+The command is detected in this order: a devenv `check` script (`devenv shell -- check`), the
+`check` or `test` script of `package.json`, `nix flake check` when there is a `flake.nix`, and the
+`check` or `test` target of a `Makefile`.
+
+While the checks fail, the helper gets the output and fixes the files, up to `attempts` times. The
+main agent never reads the output:
+
+- **green:** "Checks passed", the time, and what the helper fixed on the way;
+- **red** (after the attempts, or with `fix: false`): an error with the helper's summary of the
+  failures (check, file and line, error; at most 15 lines), and what it tried.
+
+`git_check` changes files but never stages or commits them; that stays with `git_pr`.
+
 ## The watcher
 
 `watcher.ts` runs one round over the queued PRs; a systemd user timer starts it every minute (see the

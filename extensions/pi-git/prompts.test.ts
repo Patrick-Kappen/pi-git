@@ -1,5 +1,14 @@
 import { describe, expect, test } from "vitest";
-import { fixPrompt, messagePrompt, messageRetryPrompt, pullRequestPrompt } from "./prompts.ts";
+import {
+  checkFixPrompt,
+  ciFixPrompt,
+  conflictPrompt,
+  fixPrompt,
+  messagePrompt,
+  messageRetryPrompt,
+  pullRequestPrompt,
+  summaryPrompt,
+} from "./prompts.ts";
 
 describe("prompts", () => {
   test("fix", () => {
@@ -20,5 +29,14 @@ describe("prompts", () => {
     expect(pullRequestPrompt(true, false)).not.toContain("Keep what is still true");
     expect(pullRequestPrompt(false, true)).toContain("Write the updated title");
     expect(pullRequestPrompt(false, true)).toContain("Keep what is still true");
+  });
+
+  test("watcher and git_check", () => {
+    expect(ciFixPrompt(1, 3)).toContain("fix 1 of 3. CI fails");
+    expect(conflictPrompt("main")).toContain("origin/main stopped at conflicts");
+    expect(checkFixPrompt("npm test", 2, 3)).toContain(
+      "attempt 2 of 3. The checks of this repository fail: `npm test`",
+    );
+    expect(summaryPrompt("npm test")).toContain("The checks `npm test` fail");
   });
 });

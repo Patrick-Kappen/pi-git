@@ -8,6 +8,15 @@ import type { Runner } from "./exec.ts";
 import type { PrResult } from "./pr.ts";
 import type { Entry } from "./state.ts";
 
+vi.mock("./check.ts", () => ({
+  gitCheck: vi.fn(async (input: { command?: string }, deps: { progress: (s: string) => void }) => {
+    deps.progress("running it");
+    return input.command === "fail"
+      ? { ok: false, summary: "Checks fail: x", notes: [] }
+      : { ok: true, summary: "Checks passed", command: input.command, notes: [] };
+  }),
+}));
+
 vi.mock("./pr.ts", () => ({
   gitPr: vi.fn(async (input: { intent: string }, deps: { progress: (s: string) => void }) => {
     deps.progress("step one");
@@ -26,6 +35,7 @@ vi.mock("./pr.ts", () => ({
 
 const { createPiGit, default: piGit, enqueue, guardHelper, POLL_MS, takes } = await import("./index.ts");
 const { gitPr } = await import("./pr.ts");
+const { gitCheck } = await import("./check.ts");
 const state = await import("./state.ts");
 
 type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> };
@@ -80,7 +90,7 @@ afterEach(() => {
 describe("git_pr", () => {
   test("runs the flow, reports progress, and queues the PR", async () => {
     const { tools, ctx, stateDir } = load();
-    expect(tools.map((tool) => tool.name)).toEqual(["git_pr"]);
+    expect(tools.map((tool) => tool.name)).toEqual(["git_pr", "git_check"]);
     const onUpdate = vi.fn();
     const result = await tools[0]?.execute("id", { intent: "x", base: "dev", draft: true }, undefined, onUpdate, ctx());
     expect(result?.content[0]?.text).toBe(
@@ -120,6 +130,22 @@ describe("git_pr", () => {
     const { tools, ctx } = load();
     await expect(tools[0]?.execute("id", { intent: "fail" }, undefined, undefined, ctx())).rejects.toThrow(
       "git_pr stopped: no",
+    );
+  });
+});
+
+describe("git_check", () => {
+  test("runs the checks and reports progress; a red result is an error", async () => {
+    const { tools, ctx } = load();
+    const onUpdate = vi.fn();
+    const result = await tools[1]?.execute("id", { command: "npm test", fix: false }, undefined, onUpdate, ctx());
+    expect(result?.content[0]?.text).toBe("Checks passed");
+    expect(onUpdate).toHaveBeenCalledWith({ content: [{ type: "text", text: "- running it" }], details: undefined });
+    expect(vi.mocked(gitCheck).mock.calls.at(-1)?.[0]).toEqual({ path: "/w", command: "npm test", fix: false });
+    await tools[1]?.execute("id", { path: "/p" }, undefined, undefined, ctx());
+    expect(vi.mocked(gitCheck).mock.calls.at(-1)?.[0]).toEqual({ path: "/p" });
+    await expect(tools[1]?.execute("id", { command: "fail" }, undefined, undefined, ctx())).rejects.toThrow(
+      "Checks fail: x",
     );
   });
 });
@@ -276,6 +302,6 @@ describe("default export", () => {
     delete process.env.PI_GIT_HELPER;
     piGit({ on: vi.fn(), registerTool, sendMessage: vi.fn() } as unknown as ExtensionAPI);
     if (saved !== undefined) process.env.PI_GIT_HELPER = saved;
-    expect(registerTool).toHaveBeenCalledTimes(1);
+    expect(registerTool).toHaveBeenCalledTimes(2);
   });
 });
