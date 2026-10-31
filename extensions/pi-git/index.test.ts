@@ -43,6 +43,7 @@ const { createPiGit, default: piGit, enqueue, guardHelper, POLL_MS, takes } = aw
 const { gitCommit, gitPr } = await import("./pr.ts");
 const { gitCheck } = await import("./check.ts");
 const state = await import("./state.ts");
+const { addAttention, listAttention } = await import("./attention.ts");
 
 type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> };
 
@@ -102,7 +103,7 @@ afterEach(() => {
 describe("git_pr", () => {
   test("runs the flow, reports progress, and queues the PR", async () => {
     const { tools, ctx, stateDir } = load();
-    expect(tools.map((tool) => tool.name)).toEqual(["git_commit", "git_pr", "git_check"]);
+    expect(tools.map((tool) => tool.name)).toEqual(["git_request", "git_commit", "git_pr", "git_check"]);
     const onUpdate = vi.fn();
     const result = await tools
       .find((tool) => tool.name === "git_pr")
@@ -324,7 +325,7 @@ describe("default export", () => {
     delete process.env.PI_GIT_HELPER;
     piGit({ on: vi.fn(), registerTool, registerCommand: vi.fn(), sendMessage: vi.fn() } as unknown as ExtensionAPI);
     if (saved !== undefined) process.env.PI_GIT_HELPER = saved;
-    expect(registerTool).toHaveBeenCalledTimes(3);
+    expect(registerTool).toHaveBeenCalledTimes(4);
   });
 });
 
@@ -467,5 +468,104 @@ describe("the lock", () => {
       reason: expect.stringContaining("commit is locked outside a repository with an origin (git init)"),
     });
     handlers.get("session_shutdown")?.({}, ctx);
+  });
+
+  test("what needs the user: blocked steps, requests, the footer, /git, unlock and clear", async () => {
+    const { handlers, commands, tools, ctx, notify, setStatus, stateDir } = load({ locked: true });
+    await handlers.get("session_start")?.({}, ctx());
+    await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git push" } }, ctx());
+    await handlers.get("tool_call")?.({ toolName: "bash", input: { command: "git push origin x" } }, ctx());
+    expect(notify).toHaveBeenCalledWith(
+      "The agent wanted git push in o/r, but push is locked: /git unlock push, or /git push once.",
+      "warning",
+    );
+    expect(notify.mock.calls.filter(([text]) => String(text).startsWith("The agent wanted git push")).length).toBe(1);
+    expect(setStatus).toHaveBeenLastCalledWith("pi-git", "git: locked ● 1");
+    const request = tools.find((tool) => tool.name === "git_request");
+    const answer = await request?.execute(
+      "id",
+      { reason: "The fix must be committed.", step: "commit" },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    expect(answer?.content[0]?.text).toContain("The user is notified");
+    await request?.execute("id", { reason: "Which API version?" }, undefined, undefined, ctx());
+    expect(
+      listAttention(stateDir)
+        .map((item) => item.text)
+        .sort(),
+    ).toEqual([
+      "The agent wanted git push in o/r, but push is locked: /git unlock push, or /git push once.",
+      "o/r: The fix must be committed. /git unlock commit, or /git commit once.",
+      "o/r: Which API version?",
+    ]);
+    await commands.get("git")?.handler("", ctx());
+    expect(notify.mock.lastCall?.[0]).toContain("needs you:\n- The agent wanted git push in o/r");
+    await commands.get("git")?.handler("unlock push", ctx());
+    expect(
+      listAttention(stateDir)
+        .map((item) => item.step ?? "none")
+        .sort(),
+    ).toEqual(["commit", "none"]);
+    await commands.get("git")?.handler("commit", ctx());
+    expect(listAttention(stateDir).map((item) => item.text)).toEqual(["o/r: Which API version?"]);
+    addAttention(stateDir, { kind: "watcher", repo: "o/r", text: "PR #1 needs you" }, "o__r__1");
+    await commands.get("git")?.handler("lock", ctx());
+    await commands.get("git")?.handler("unlock", ctx());
+    expect(listAttention(stateDir)).toHaveLength(2);
+    await commands.get("git")?.handler("clear", ctx());
+    expect(notify).toHaveBeenLastCalledWith("pi-git: forgot 2 item(s) that needed you", "info");
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("git_commit and git_pr that hit a lock need the user", async () => {
+    const { handlers, commands, tools, ctx, stateDir } = load({ locked: true });
+    await handlers.get("session_start")?.({}, ctx());
+    await expect(
+      tools.find((tool) => tool.name === "git_commit")?.execute("id", { intent: "x" }, undefined, undefined, ctx()),
+    ).rejects.toThrow();
+    expect(listAttention(stateDir).map((item) => item.step)).toEqual(["commit"]);
+    await commands.get("git")?.handler("global unlock", ctx());
+    expect(listAttention(stateDir)).toEqual([]);
+    vi.mocked(gitPr).mockResolvedValueOnce({
+      ok: true,
+      summary: "Committed; stopped before push",
+      notes: [],
+      stopped: "push",
+    });
+    await tools.find((tool) => tool.name === "git_pr")?.execute("id", { intent: "x" }, undefined, undefined, ctx());
+    expect(listAttention(stateDir).map((item) => item.text)).toEqual([
+      "The agent wanted git_pr in o/r, but push is locked: /git unlock push, or /git push once.",
+    ]);
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("git_request outside a repository, and a state directory that cannot be written", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-git-index-"));
+    const file = join(dir, "file");
+    writeFileSync(file, "");
+    writeFileSync(join(dir, "pi-git.json"), JSON.stringify({ stateDir: join(file, "state") }));
+    const tools: Tool[] = [];
+    const failing: Runner = async () => ({ code: 128, stdout: "", stderr: "" });
+    createPiGit(
+      {
+        on: () => {},
+        registerTool: (tool: never) => tools.push(tool),
+        registerCommand: () => {},
+        sendMessage: vi.fn(),
+      } as never,
+      { env: { PI_GIT_CONFIG: join(dir, "pi-git.json") }, home: dir, run: failing },
+    );
+    const ctx = {
+      cwd: "/",
+      hasUI: false,
+      ui: { notify: vi.fn(), setStatus: vi.fn() },
+      sessionManager: { getSessionId: () => "s" },
+    };
+    const answer = await tools
+      .find((tool) => tool.name === "git_request")
+      ?.execute("id", { reason: "Decide." }, undefined, undefined, ctx);
+    expect(answer?.content[0]?.text).toContain("The user is notified");
   });
 });

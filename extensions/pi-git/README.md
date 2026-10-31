@@ -151,6 +151,31 @@ push (`push` step) in a locked repository, also when a script runs git; see the 
 runs its own git commands without `PI_GIT_SWITCH`: it checked the lock itself, and `/git commit`
 must work while `commit` is locked.
 
+## When the work needs you
+
+pi-git keeps a list of what needs you, in `<stateDir>/attention`:
+
+- a step the agent needed but that is locked (a blocked git command, `git_commit`, `git_pr` that
+  stopped before a step);
+- a request of the agent with the `git_request` tool: a locked step that a real change needs, or a
+  decision only you can make. The agent then stops and waits;
+- a PR the watcher cannot finish (the fixes are used up, or a lock holds back a fix).
+
+Each new item is shown in pi and sent as a notification to the terminal of every tmux client
+(OSC 777, which WezTerm and other terminals show as a desktop notification; written to the client's
+tty, so the watcher can do it too, without passthrough). Repeats do not notify again.
+
+`pi-git-status` prints a red `●` with the number of items, for the tmux status line:
+
+```tmux
+set -g status-right '#(pi-git-status)%H:%M'
+```
+
+The pi footer shows the count too (`git: locked ● 2`). `/git` lists the items. An unlock of a step,
+or `/git <step>` once, answers the items about that step; a PR that turns green or is merged answers
+its watcher item; `/git clear` forgets all of them. `PI_GIT_NO_NOTIFY=1` turns the terminal
+notifications off.
+
 ## The helper
 
 The helper is `pi -p` with its own model, started in the worktree:

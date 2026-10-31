@@ -39,6 +39,16 @@ in
       description = "The pi-git extension package.";
     };
 
+    statusPackage = lib.mkOption {
+      type = lib.types.package;
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.pi-git-status;
+      defaultText = lib.literalExpression "pi-git.packages.\${system}.pi-git-status";
+      description = ''
+        pi-git-status, installed in your profile: a red mark with the number of things that need
+        you, for the tmux status line: `set -g status-right '#(pi-git-status)...'`.
+      '';
+    };
+
     agentDir = lib.mkOption {
       type = lib.types.str;
       default = ".pi/agent";
@@ -152,6 +162,8 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    home.packages = [ cfg.statusPackage ];
+
     systemd.user = lib.mkIf cfg.watcher.enable {
       services.pi-git-watcher = {
         Unit.Description = "pi-git watcher: follows the PRs of git_pr";

@@ -69,7 +69,7 @@ export function describeLock(stateDir: string, slug: string | undefined, fallbac
   }
   lines.push(
     "/git unlock|lock|reset [steps]: this repository. /git global unlock|lock|reset [steps]: everywhere else.",
-    "/git commit [intent]: commit once, also when commit is locked.",
+    "/git commit [intent]: commit once, also when commit is locked. /git clear: forget what needs you.",
   );
   return lines.join("\n");
 }
@@ -79,6 +79,7 @@ export type GitCommand =
   | { kind: "show" }
   | { kind: "set"; scope: "repo" | "global"; steps: Step[]; lock: Lock | undefined }
   | { kind: "run"; step: "commit"; intent: string }
+  | { kind: "clear" }
   | { kind: "bad" };
 
 const ACTIONS: Record<string, Lock | undefined> = { lock: "locked", unlock: "unlocked", reset: undefined };
@@ -91,6 +92,7 @@ export function parseGitCommand(args: string): GitCommand {
     .filter((word) => word !== "");
   if (words.length === 0) return { kind: "show" };
   if (words[0] === "commit") return { kind: "run", step: "commit", intent: words.slice(1).join(" ") };
+  if (words[0] === "clear" && words.length === 1) return { kind: "clear" };
   const scope = words[0] === "global" ? "global" : "repo";
   const rest = scope === "global" ? words.slice(1) : words;
   const [action, ...steps] = rest;
@@ -109,6 +111,7 @@ export function gitCompletions(prefix: string): Array<{ value: string; label: st
     "global lock",
     "global reset",
     "commit",
+    "clear",
   ];
   return items.filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
 }
