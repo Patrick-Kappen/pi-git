@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.6.0...v0.7.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** accept PRs through the watch event ([#29](https://github.com/Patrick-Kappen/pi-git/issues/29)) ([00292ae](https://github.com/Patrick-Kappen/pi-git/commit/00292aea49d689543361b340b26a3aeb64d706d9))
+* **pi-git:** ship without questions, in parallel, and ask only for behavior changes ([#26](https://github.com/Patrick-Kappen/pi-git/issues/26)) ([4c275fb](https://github.com/Patrick-Kappen/pi-git/commit/4c275fb58ad9a39560879069ef82c7c1681c74b8))
+
 ## [0.6.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.5.0...v0.6.0) (2026-10-31)
 
 
