@@ -883,9 +883,30 @@ class Shipping {
     const after = Object.fromEntries(verdicts.filter((v) => v.after).map((v) => [v.pr, v.after as number[]]));
     if (Object.keys(after).length > 0) simulated = await run(after);
     return {
-      skips: verdicts.filter((item) => item.action === "skip").map((item) => ({ pr: item.pr, reason: item.reason })),
+      skips: await this.withoutMergedReasons(
+        repo,
+        verdicts.filter((item) => item.action === "skip"),
+      ),
       order: order(),
     };
+  }
+
+  /**
+   * A skip because of another PR that is merged already is wrong: its changes are on the default
+   * branch. Such skips are dropped; every other skip stays.
+   */
+  private async withoutMergedReasons(repo: string, skips: { pr: number; reason: string }[]) {
+    const kept: { pr: number; reason: string }[] = [];
+    for (const skip of skips) {
+      const cited = [...skip.reason.matchAll(/#(\d+)/g)].map((match) => Number(match[1])).filter((n) => n !== skip.pr);
+      const states = await Promise.all(
+        cited.map((n) => this.gh(["pr", "view", String(n), "-R", repo, "--json", "state", "--jq", ".state"])),
+      );
+      const merged = cited.length > 0 && states.every((state) => state === "MERGED");
+      if (merged) this.deps.log?.(`pi-git ship: ${repo}#${skip.pr}: not skipped; the PRs it depends on are merged`);
+      else kept.push({ pr: skip.pr, reason: skip.reason });
+    }
+    return kept;
   }
 
   private async reviewLibrary(

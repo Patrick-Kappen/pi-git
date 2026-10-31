@@ -113,7 +113,9 @@ function prView(repo: string, args: readonly string[]): Reply {
   }[];
   const found = all.find((item) => String(item.number) === n);
   if (!found) return no;
-  return ok({ ...found, state: merged(repo, n) ? "MERGED" : (found.state ?? "OPEN") });
+  const state = merged(repo, n) ? "MERGED" : (found.state ?? "OPEN");
+  if (args.includes(".state")) return ok(state);
+  return ok({ ...found, state });
 }
 
 function api(path: string): Reply {
@@ -508,6 +510,32 @@ describe("shipTick", () => {
     await plan(["o/pi-git"]);
     const ship = await tick();
     expect(ship?.libs[0]).toMatchObject({ release: false, state: "done" });
+  });
+
+  test("the agent's skip because of a PR that is merged already is dropped", async () => {
+    world.prs["o/pi-git"] = [
+      pr(1, "feat: base"),
+      pr(2, "feat: uses base", { mergeable: "CONFLICTING" }),
+      pr(3, "feat: other", { mergeable: "CONFLICTING" }),
+    ];
+    await plan([]);
+    // #1 was merged by an earlier ship; #3 depends on #9, which is still open.
+    world.merged.push("o/pi-git#1");
+    world.prs["o/pi-git"].push(pr(9, "feat: still open"));
+    config = { ...config, pi: "pi-fake" };
+    const agent: Runner = async (command, args, options) =>
+      command === "pi-fake"
+        ? ok({
+            verdicts: [
+              { pr: 1, action: "ship", reason: "merged" },
+              { pr: 2, action: "skip", reason: "It depends on #1, and #1 is not included in this ship." },
+              { pr: 3, action: "skip", reason: "It depends on #9, which is not shipped." },
+            ],
+          })
+        : fake(command, args, options);
+    const ship = await shipTick({ run: agent, config, gitPr, now: () => clock, watchPr, fixNow }, 1);
+    expect(ship?.skipped).toEqual(["o/pi-git#3 feat: other: It depends on #9, which is not shipped."]);
+    expect(ship?.libs[0]?.prs.map((item) => item.number)).toEqual([1, 2]);
   });
 
   test("the watcher gave up on a red PR: that library needs you", async () => {
