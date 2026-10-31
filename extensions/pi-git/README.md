@@ -104,8 +104,9 @@ and looks for summaries every 20 seconds:
 
 Delivered summaries stay in `<stateDir>/delivered` for seven days, then the watcher deletes them.
 
-`delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
-adds it to the context for your next prompt, `notify` only shows it to you.
+Each summary goes into the history once. `delivery` decides how: with `turn` (default), a PR that
+needs the agent (the watcher gave up) starts a turn; green, merged and closed PRs are added quietly
+for the next prompt. `message` adds every summary quietly, `notify` only shows it to you.
 
 ## `git_start`
 

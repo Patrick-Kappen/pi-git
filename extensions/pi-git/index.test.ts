@@ -219,7 +219,7 @@ describe("enqueue", () => {
 });
 
 describe("summaries", () => {
-  test("own summaries start a turn; others of a running session stay", async () => {
+  test("own summaries go into the history once, without a turn; others of a running session stay", async () => {
     const { handlers, ctx, sendMessage, stateDir, config } = load();
     state.heartbeat(config.runtimeDir, "s2");
     state.addSummary(stateDir, summary("s1"));
@@ -228,9 +228,20 @@ describe("summaries", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
       { customType: "pi-git", content: "green for s1", display: true },
-      { triggerTurn: true, deliverAs: "followUp" },
+      { deliverAs: "nextTurn" },
     );
     expect(state.loadSummaries(stateDir).map((s) => s.sessionId)).toEqual(["s2"]);
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+
+  test("only a PR that needs the agent starts a turn", async () => {
+    const { handlers, ctx, sendMessage, stateDir } = load();
+    state.addSummary(stateDir, { ...summary("s1"), status: "failed", text: "needs you" });
+    await handlers.get("session_start")?.({}, ctx("s1"));
+    expect(sendMessage).toHaveBeenCalledWith(
+      { customType: "pi-git", content: "needs you", display: true },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
     handlers.get("session_shutdown")?.({}, ctx());
   });
 

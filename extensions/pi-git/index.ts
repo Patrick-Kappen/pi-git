@@ -279,21 +279,26 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
   let sessionId = "";
   let slug: string | undefined;
 
-  const send = (text: string, ctx: ExtensionContext): void => {
+  /**
+   * A summary goes into the agent's history once. Only a PR that needs the agent (the watcher gave
+   * up: status failed) starts a turn with `delivery: turn`; green, merged, closed and waiting PRs are
+   * added quietly, for the next prompt.
+   */
+  const send = (summary: Summary, ctx: ExtensionContext): void => {
     if (config.delivery === "notify") {
-      if (ctx.hasUI) ctx.ui.notify(text, "info");
+      if (ctx.hasUI) ctx.ui.notify(summary.text, "info");
       return;
     }
     const options =
-      config.delivery === "turn"
+      config.delivery === "turn" && summary.status === "failed"
         ? ({ triggerTurn: true, deliverAs: "followUp" } as const)
         : ({ deliverAs: "nextTurn" } as const);
-    pi.sendMessage({ customType: MESSAGE_TYPE, content: text, display: true }, options);
+    pi.sendMessage({ customType: MESSAGE_TYPE, content: summary.text, display: true }, options);
   };
 
   const deliver = (ctx: ExtensionContext): void => {
     for (const summary of loadSummaries(config.stateDir)) {
-      if (takes(summary, sessionId, slug, config) && claimSummary(config.stateDir, summary.id)) send(summary.text, ctx);
+      if (takes(summary, sessionId, slug, config) && claimSummary(config.stateDir, summary.id)) send(summary, ctx);
     }
   };
 
