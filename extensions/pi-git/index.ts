@@ -24,7 +24,7 @@ import {
   statesOf,
   statusText,
 } from "./lock.ts";
-import { gitCommit, gitPr, type PrResult } from "./pr.ts";
+import { gitCommit, gitPr, gitPush, type PrResult } from "./pr.ts";
 import {
   claimSummary,
   type Entry,
@@ -39,6 +39,7 @@ import {
 } from "./state.ts";
 import { gitStatus, gitWatch } from "./status.ts";
 import { effective, type Lock, loadSwitch, STEPS, type Step, setGlobal, setRepo, switchPath } from "./switch.ts";
+import { gitWorktree } from "./worktree.ts";
 
 export interface Options {
   env?: NodeJS.ProcessEnv;
@@ -53,7 +54,7 @@ export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool" | "sendMessage" 
 export const PROMPT_SECTION = "pi_git";
 
 const GIT_USAGE =
-  "pi-git: /git, /git unlock|lock|reset [worktree commit push pr], /git global unlock|lock|reset [steps], /git commit [intent]";
+  "pi-git: /git, /git unlock|lock|reset [worktree commit push pr], /git global unlock|lock|reset [steps], /git worktree <topic> [type], /git commit|push|pr [intent], /git clear";
 
 /** How often a session sends its heartbeat and looks for summaries. */
 export const POLL_MS = 20_000;
@@ -135,6 +136,22 @@ const statusParameters = Type.Object({});
 const watchParameters = Type.Object({
   pr: Type.String({ description: "The PR: its number or URL." }),
   path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
+});
+
+const worktreeParameters = Type.Object({
+  topic: Type.String({ description: "Short, lower case, with -: what the change is about, e.g. login-timeout." }),
+  type: Type.Optional(
+    Type.String({ description: "Branch type: feat (default), fix, docs, refactor, test, build, ci, chore, perf." }),
+  ),
+  base: Type.Optional(Type.String({ description: "The branch to start from; default: the default branch." })),
+  path: Type.Optional(Type.String({ description: "A directory in the repository; default: the working directory." })),
+});
+
+const pushParameters = Type.Object({
+  path: Type.Optional(Type.String({ description: "A directory in the worktree; default: the working directory." })),
+  intent: Type.Optional(
+    Type.String({ description: "What the branch is for; used when the helper has to commit a fix." }),
+  ),
 });
 
 const requestParameters = Type.Object({
@@ -320,13 +337,30 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     return undefined;
   });
 
-  /** /git commit: the user's own action, allowed once whatever the lock says. */
-  const commitOnce = async (intent: string, ctx: ExtensionContext): Promise<void> => {
-    const result = await gitCommit(
-      { path: ctx.cwd, intent: intent || "(no intent given: describe the change from the diff)" },
-      { run: runner, config, progress: () => {} },
-    );
-    if (result.ok) answered(await slugOf(ctx.cwd), ["commit"]);
+  /** One step as the user's own action: allowed whatever the lock says. */
+  const stepOnce = (step: Step, args: string, ctx: ExtensionContext): Promise<{ ok: boolean; summary: string }> => {
+    const deps = { run: runner, config, progress: () => {} };
+    const intent = args || "(no intent given: describe the change from the diff)";
+    const steps: Record<Step, () => Promise<{ ok: boolean; summary: string }>> = {
+      worktree: () => {
+        const [topic = "", type] = args.split(/\s+/);
+        return gitWorktree({ path: ctx.cwd, topic, ...(type ? { type } : {}) }, deps);
+      },
+      commit: () => gitCommit({ path: ctx.cwd, intent }, deps),
+      push: () => gitPush({ path: ctx.cwd, intent }, deps),
+      pr: async () => {
+        const pr = await gitPr({ path: ctx.cwd, intent }, deps);
+        if (pr.ok) enqueue(config, pr, intent, ctx.sessionManager.getSessionId());
+        return pr;
+      },
+    };
+    return steps[step]();
+  };
+
+  /** /git <step>: the user's own action, allowed once whatever the lock says. */
+  const runOnce = async (step: Step, args: string, ctx: ExtensionContext): Promise<void> => {
+    const result = await stepOnce(step, args, ctx);
+    if (result.ok) answered(await slugOf(ctx.cwd), [step]);
     ctx.ui.notify(result.summary, result.ok ? "info" : "error");
   };
 
@@ -352,7 +386,7 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       if (command.kind === "bad") {
         ctx.ui.notify(GIT_USAGE, "warning");
       } else if (command.kind === "run") {
-        await commitOnce(command.intent, ctx);
+        await runOnce(command.step, command.args, ctx);
       } else if (command.kind === "clear") {
         const count = clearAttention(config.stateDir, () => true);
         showStatus(ctx, here);
@@ -431,6 +465,65 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
       );
       if (!result.ok) throw new Error(result.summary);
       return { content: [{ type: "text", text: result.summary }], details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "git_worktree",
+    label: "Git worktree",
+    description: [
+      "Start a change: create <worktrees>/<repo>/<topic> on a new branch <type>/<topic> from the fresh default branch",
+      "(or base), and run its setup (devenv shell, npm ci, uv sync). Returns the path; work there.",
+    ].join(" "),
+    promptSnippet: "Create a worktree for a change, on a new branch from the fresh default branch",
+    promptGuidelines: [
+      "Use git_worktree to start every change; never edit in the main checkout or on the default branch.",
+    ],
+    parameters: worktreeParameters,
+    async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
+      const path = params.path ?? ctx.cwd;
+      const target = await slugOf(path);
+      if (lockOf(target, "worktree") === "locked") {
+        blocked(ctx, "worktree", "git_worktree", target);
+        throw new Error(lockedReason("worktree", "git_worktree", target));
+      }
+      const input = {
+        path,
+        topic: params.topic,
+        ...(params.type ? { type: params.type } : {}),
+        ...(params.base ? { base: params.base } : {}),
+      };
+      const result = await gitWorktree(input, { run: runner, config, progress: progressOf(onUpdate), signal });
+      if (!result.ok) throw new Error(result.summary);
+      return {
+        content: [{ type: "text", text: result.summary }],
+        details: { path: result.path, branch: result.branch },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "git_push",
+    label: "Git push",
+    description: [
+      "Push the commits of a worktree. The pre-push checks run first; a helper agent fixes failures (as a new commit).",
+      "Uncommitted changes are not pushed: commit them with git_commit first.",
+    ].join(" "),
+    promptSnippet: "Push the commits of a worktree; a helper fixes failing checks",
+    promptGuidelines: ["Use git_push to push; do not run git push yourself."],
+    parameters: pushParameters,
+    async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
+      const path = params.path ?? ctx.cwd;
+      const target = await slugOf(path);
+      if (lockOf(target, "push") === "locked") {
+        blocked(ctx, "push", "git_push", target);
+        throw new Error(lockedReason("push", "git_push", target));
+      }
+      const allowed = (step: Step) => lockOf(target, step) === "unlocked";
+      const deps = { run: runner, config, progress: progressOf(onUpdate), signal, allowed };
+      const result = await gitPush({ path, intent: params.intent ?? "Fix the failing pre-push checks." }, deps);
+      if (!result.ok) throw new Error(result.summary);
+      return { content: [{ type: "text", text: result.summary }], details: { notes: result.notes } };
     },
   });
 

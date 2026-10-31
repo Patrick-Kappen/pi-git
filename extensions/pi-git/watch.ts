@@ -224,6 +224,7 @@ class Watch {
     }
     const remove = await this.deps.run("git", ["worktree", "remove", worktree], { cwd: mainRoot });
     const deleted = await this.deps.run("git", ["branch", "-D", branch], { cwd: mainRoot });
+    const remote = await this.deleteRemoteBranch();
     await this.deps.run("git", ["fetch", "origin", "--prune"], { cwd: mainRoot });
     if (remove.code !== 0 || deleted.code !== 0) {
       return this.finish(
@@ -231,7 +232,22 @@ class Watch {
         `is merged, but the cleanup failed:\n${clipEnd(`${outputOf(remove)}\n${outputOf(deleted)}`, 2000)}`,
       );
     }
-    return this.finish("merged", `is merged; removed the worktree ${worktree} and the branch ${branch}.`);
+    return this.finish("merged", `is merged; removed the worktree ${worktree} and the branch ${branch}${remote}.`);
+  }
+
+  /** Delete the branch on GitHub when GitHub did not (no "delete branch on merge"); the text for the report. */
+  private async deleteRemoteBranch(): Promise<string> {
+    const { mainRoot, branch, repo } = this.entry;
+    const exists = await this.deps.run("git", ["ls-remote", "--exit-code", "--heads", "origin", branch], {
+      cwd: mainRoot,
+    });
+    if (exists.code !== 0) return "";
+    const deleted = await this.deps.run("gh", ["api", "-X", "DELETE", `repos/${repo}/git/refs/heads/${branch}`], {
+      cwd: mainRoot,
+    });
+    return deleted.code === 0
+      ? ", also on GitHub"
+      : `; the branch on GitHub could not be deleted (${outputOf(deleted).split("\n")[0]})`;
   }
 
   /** Bring the worktree to the head of the PR; a string is why that is not possible. */

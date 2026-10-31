@@ -430,6 +430,42 @@ export async function gitCommit(input: PrInput, deps: Deps): Promise<PrResult> {
 
 type Commit = PrResult["commit"];
 
+async function pushOnce(flow: Flow): Promise<string | undefined> {
+  const result = await flow.push();
+  return result.code === 0 ? undefined : clipEnd(outputOf(result), 20_000);
+}
+
+/**
+ * Push the commits of a worktree: the pre-push checks run, and the helper fixes failures (as a new
+ * commit, when commit is allowed). Uncommitted changes stay in the worktree.
+ */
+export async function gitPush(input: PrInput, deps: Deps): Promise<PrResult> {
+  const started = await start(input, deps);
+  if ("ok" in started) return started;
+  const { wt, flow } = started;
+  try {
+    const failure = await pushStep(flow, wt, undefined, deps);
+    if (failure) return failure;
+    const dirty =
+      (await flow.gitText("status", "--porcelain")) !== ""
+        ? " Uncommitted changes stay in the worktree; git_commit commits them."
+        : "";
+    const fixed =
+      flow.notes.length > 0
+        ? `\nThe helper fixed on the way:\n${flow.notes.map((note) => `- ${note}`).join("\n")}`
+        : "";
+    return {
+      ok: true,
+      summary: `Pushed ${wt.branch}; the pre-push checks passed.${dirty}${fixed}`,
+      worktree: wt,
+      base: flow.base,
+      notes: flow.notes,
+    };
+  } finally {
+    flow.dispose();
+  }
+}
+
 /** Stop before a locked step: an error when nothing was done yet, else what was done. */
 function stop(step: Step, flow: Flow, wt: Worktree, commit: Commit): PrResult {
   if (!commit) return failed(stoppedAt(step, ""), flow, { worktree: wt, stopped: step });
@@ -469,7 +505,10 @@ async function pushStep(flow: Flow, wt: Worktree, commit: Commit, deps: Deps): P
   }
   if (!(deps.allowed ?? (() => true))("push")) return stop("push", flow, wt, commit);
   deps.progress("pre-push: pushing (the hook runs the checks)");
-  const pushed = await flow.untilGreen("pre-push", flow.push, flow.commitFix);
+  // A fix of the helper becomes a commit; with commit locked, the push runs once and the helper does not fix.
+  const pushed = (deps.allowed ?? (() => true))("commit")
+    ? await flow.untilGreen("pre-push", flow.push, flow.commitFix)
+    : await pushOnce(flow);
   if (pushed === undefined) return undefined;
   return failed(`The push failed:\n${pushed}\n\nNothing new is on GitHub.`, flow, {
     worktree: wt,

@@ -80,7 +80,7 @@ because the watcher fixes CI there. After that, the PR is followed like one from
 | Conflicts with the base | Rebases the worktree on the base; the helper resolves each conflict; pi-git continues the rebase and force-pushes with a lease on the head it saw. |
 | Base moved (a stacked PR whose base was merged and deleted, so GitHub moved the PR to the next base) | Rebases only the PR's own commits (after the last seen tip of the old base) onto the new base, the helper resolving conflicts, and force-pushes with a lease. No report unless it fails. |
 | Green and mergeable | Reports it once per head. |
-| Merged | Removes the worktree and the local branch (when the worktree is clean), prunes, reports it, and stops. |
+| Merged | Removes the worktree and the local branch (when the worktree is clean), deletes the branch on GitHub when GitHub did not, prunes, reports it, and stops. |
 | Closed | Reports it and stops; the worktree and the branch are kept. |
 
 The helper tries each red head once, and at most `attempts` times per PR; then the watcher reports
@@ -104,6 +104,31 @@ and looks for summaries every 20 seconds:
 
 `delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
 adds it to the context for your next prompt, `notify` only shows it to you.
+
+## `git_worktree`
+
+| Parameter | Meaning |
+|---|---|
+| `topic` | Short, lower case, with `-`: what the change is about. |
+| `type` | The branch type; default `feat` (`fix`, `docs`, `refactor`, ...). |
+| `base` | The branch to start from; default: the default branch. |
+| `path` | A directory in the repository (main checkout or a worktree); default: the working directory. |
+
+Fetches `origin/<base>`, creates `<worktrees>/<repo>/<topic>` (default `~/.worktrees/<repo>/<topic>`)
+on a new branch `<type>/<topic>`, and runs the setup it finds: `devenv shell` for a `devenv.nix`,
+`npm ci` for a `package-lock.json`, `uv sync` for a `uv.lock`. It returns the path; the agent works
+there. It refuses a topic or branch that exists already.
+
+## `git_push`
+
+| Parameter | Meaning |
+|---|---|
+| `path` | A directory in the worktree; default: the working directory. |
+| `intent` | What the branch is for; used when the helper has to commit a fix. |
+
+Pushes the commits of the worktree, as `git_pr` does in its second step: the `pre-push` hook runs the
+checks, and the helper fixes failures as a new commit. With `commit` locked, the push runs once and
+the helper does not fix. Uncommitted changes stay in the worktree.
 
 ## `git_commit`
 
@@ -141,7 +166,10 @@ You switch it in pi; the model cannot:
 | `/git unlock [steps]`, `/git lock [steps]` | This repository (owner/name of `origin`); without steps: all of them. Remembered. |
 | `/git reset [steps]` | Removes this repository's override, so the global state applies |
 | `/git global unlock\|lock\|reset [steps]` | The global state; `reset` goes back to the default of the settings (`locked`) |
-| `/git commit [intent]` | Commits once, as `git_commit` does, also when `commit` is locked: your own action |
+| `/git worktree <topic> [type]` | Creates a worktree once, as `git_worktree` does |
+| `/git commit [intent]` | Commits once, as `git_commit` does |
+| `/git push` | Pushes once, as `git_push` does |
+| `/git pr [intent]` | Runs `git_pr` once: commit, push and PR, and queues the PR for the watcher |
 
 What decides a step, the first that says something:
 

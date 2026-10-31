@@ -43,7 +43,8 @@ export function repoName(url: string): string {
   ).replace(/^.*:/, "");
 }
 
-async function defaultBranch(run: Runner, cwd: string): Promise<string> {
+/** The default branch of origin: from refs/remotes/origin/HEAD, else from gh, else main. */
+export async function defaultBranch(run: Runner, cwd: string): Promise<string> {
   const head = await git(run, cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
   if (head) return head.replace(/^origin\//, "");
   const result = await run("gh", ["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], {
