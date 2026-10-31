@@ -82,6 +82,7 @@ fi
 | Path | Contains |
 |---|---|
 | `extensions/pi-git/` | The extension, with unit tests; `pr.test.ts` runs the whole flow with real git and a fake helper |
+| `test/integration/` | Runs the extension in pi's own session with a scripted model: the lock in the prompt, a blocked commit, `/git unlock` |
 | `nix/package.nix` | The package `pi-git` |
 | `nix/home-manager.nix` | The Home Manager module |
 | `nix/checks.nix`, `test/nix/` | Flake checks: the package, the module, and the generated config with node |

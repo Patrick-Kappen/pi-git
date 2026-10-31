@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { Type } from "@earendil-works/pi-ai";
 import type {
+  BeforeAgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
   ToolCallEvent,
@@ -57,6 +58,27 @@ export function describeLock(stateDir: string, slug: string | undefined, fallbac
   if (overrides.length > 0) lines.push("overrides:", ...overrides.map(([repo, lock]) => `  ${repo}: ${lock}`));
   lines.push("/git unlock | lock | reset: this repository. /git global unlock | lock | reset: everywhere else.");
   return lines.join("\n");
+}
+
+/** The name of the system prompt section with the state of the lock. */
+export const PROMPT_SECTION = "pi_git";
+
+/** What the agent is told about the lock, before every prompt. */
+export function lockPrompt(lock: Lock, slug: string | undefined): string {
+  const where = slug ? `in ${slug}` : "here (not in a repository with an origin)";
+  if (lock === "unlocked") {
+    return [
+      `git: unlocked ${where}. You may change the repository; use git_pr to commit, push and open or update PRs.`,
+      "Other repositories can be locked; a blocked command says so.",
+    ].join("\n");
+  }
+  return [
+    `git: locked ${where}. Git changes are blocked for you: commit, push, add, checkout, branches, rebase,`,
+    "worktrees, and gh commands that change GitHub (pr create, pr merge, ...). Reading is allowed: status, diff, log,",
+    "fetch, gh pr view, gh pr checks, and the like.",
+    "Do not try to work around the lock. When the task needs a git change, finish the work in the files and ask the",
+    "user to run /git unlock; only the user can unlock.",
+  ].join("\n");
 }
 
 const GIT_COMMANDS = ["unlock", "lock", "reset", "global unlock", "global lock", "global reset"];
@@ -236,6 +258,10 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
     } catch {
       // Nothing to clean up in a state directory that cannot be written.
     }
+  });
+
+  pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
+    event.systemPromptOptions.sections[PROMPT_SECTION] = lockPrompt(lockOf(slug), slug);
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx): Promise<ToolCallEventResult | undefined> => {

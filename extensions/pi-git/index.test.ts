@@ -33,7 +33,7 @@ vi.mock("./pr.ts", () => ({
   }),
 }));
 
-const { createPiGit, default: piGit, enqueue, guardHelper, POLL_MS, takes } = await import("./index.ts");
+const { createPiGit, default: piGit, enqueue, guardHelper, lockPrompt, POLL_MS, takes } = await import("./index.ts");
 const { gitPr } = await import("./pr.ts");
 const { gitCheck } = await import("./check.ts");
 const state = await import("./state.ts");
@@ -402,5 +402,29 @@ describe("the lock", () => {
       reason: expect.stringContaining("locked outside a repository with an origin (git init)"),
     });
     handlers.get("session_shutdown")?.({}, ctx);
+  });
+
+  test("the agent is told the state before every prompt", async () => {
+    const { handlers, commands, ctx } = load({ locked: true });
+    await handlers.get("session_start")?.({}, ctx());
+    const prompt = () => {
+      const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+      handlers.get("before_agent_start")?.(event, ctx());
+      return event.systemPromptOptions.sections.pi_git ?? "";
+    };
+    expect(prompt()).toMatch(/^git: locked in o\/r\. Git changes are blocked for you/);
+    expect(prompt()).toContain("ask the\nuser to run /git unlock; only the user can unlock.");
+    await commands.get("git")?.handler("unlock", ctx());
+    expect(prompt()).toBe(
+      "git: unlocked in o/r. You may change the repository; use git_pr to commit, push and open or update PRs.\nOther repositories can be locked; a blocked command says so.",
+    );
+    handlers.get("session_shutdown")?.({}, ctx());
+  });
+});
+
+describe("lockPrompt", () => {
+  test("outside a repository", () => {
+    expect(lockPrompt("locked", undefined)).toMatch(/^git: locked here \(not in a repository with an origin\)\./);
+    expect(lockPrompt("unlocked", undefined)).toMatch(/^git: unlocked here \(not in a repository with an origin\)\./);
   });
 });

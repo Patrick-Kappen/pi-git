@@ -105,6 +105,11 @@ You switch it in pi; the model cannot:
 | `/git reset` | Removes the override of this repository: the global state applies |
 | `/git global unlock`, `/git global lock`, `/git global reset` | The global state; `reset` goes back to the default of the settings (`locked`) |
 
+The agent knows the state from the start: before every prompt, a `pi_git` section of the system
+prompt says `git: locked in owner/name` (what is blocked, what is allowed, and to finish the work and
+ask you for `/git unlock` instead of working around it) or `git: unlocked in owner/name` (use
+`git_pr`). After `/git unlock`, the next prompt carries the new state.
+
 A repository's override wins over the global state, which wins over the default. The state is in
 `<stateDir>/switch.json`, so every pi session and the watcher see a change at once. The footer shows
 `git: locked` or `git: unlocked` for the repository of the session.
