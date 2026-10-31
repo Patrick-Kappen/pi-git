@@ -148,6 +148,32 @@ Commits all changes of the worktree, as `git_pr` does in its first step: stage e
 `pre-commit` hook (the helper fixes failures), let the helper write the message, check it with the
 `commit-msg` hook, commit. It does not push.
 
+## `/ship`
+
+Your command, like `/git commit`: agents never start it, and it ignores the lock. It takes every
+library whose flake input in the NixOS configuration follows `latest`, plus the configuration itself,
+from open PRs to a deployed host:
+
+1. **Index** (reads only, a few seconds): the open PRs of each repository with what blocks them
+   (draft, changes requested, failing or running checks, conflicts), waiting release PRs, and
+   releases that are not locked yet. The `flake.lock` is read from GitHub's default branch.
+2. **Plan**: a widget lists what ships and what does not and why. For each library that would
+   release, you pick Release or Skip; then one confirmation.
+3. **Run**: the watcher advances the ship every minute, out of the agents' sight:
+   - merges the ready PRs (each when it is green and mergeable, on the head it just checked; a PR
+     that conflicts after an earlier merge waits for the watcher's rebase);
+   - for a picked release: waits for the release workflow, merges the release PR when its CI is
+     green, and waits until the tag and `latest` match;
+   - in the NixOS configuration: merges its ready PRs, opens a PR that runs `nix flake update` for
+     the released inputs (the helper writes the commit and PR), merges it when its checks pass;
+   - waits for the check run `…deploy-<host>` on that merge commit.
+4. **Done** when `deploy-<host>` succeeds: one notification with the released versions.
+
+A problem (a failing release workflow, a red check, a deploy that fails, or a stage that waits longer
+than 90 minutes) stops only that part, notifies you, and shows in `/git` and the tmux sign; the rest
+goes on. `/ship status` shows every part. Settings: `shipNixos` (the configuration's main checkout)
+and `shipHost` (default: this machine's host name).
+
 ## The lock
 
 By default, agents may not change git repositories. The lock has four steps, each locked on its own:

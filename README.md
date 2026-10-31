@@ -21,6 +21,10 @@ Agents may not change git repositories until you allow it, per step (`worktree`,
 as your own action. See
 [the lock](extensions/pi-git/README.md#the-lock).
 
+`/ship` is your command to merge what is ready, release what you pick, lock the releases in your
+NixOS configuration and wait until your host is deployed, in one go; the watcher runs it and only
+notifies you when it is done or needs you. See [`/ship`](extensions/pi-git/README.md#ship).
+
 When the work needs you (a locked step, a request of the agent with `git_request`, a PR the watcher
 cannot finish), pi-git sends a notification to your terminals (WezTerm shows it) and `pi-git-status`
 puts a red `●` in the tmux status line. See
@@ -65,6 +69,7 @@ both agents follow: always a worktree in `~/.worktrees/<repo>/<topic>`, never on
 | `delivery` | `"turn"` | How the watcher's summary reaches the main agent: `turn`, `message` or `notify` |
 | `locked` | `true` | Git changes by agents are locked until you run `/git unlock [worktree commit push pr]` in a repository (remembered); `false` unlocks by default |
 | `repos` | `{ }` | Locks per repository pattern, e.g. `{ "my-org/infra" = "locked"; "my-org/*".push = "locked"; }`; they win over `/git global` and `locked` |
+| `ship.nixos`, `ship.host` | `null`, the host name | `/ship`: the main checkout of the NixOS configuration, and the host whose deploy check (`deploy-<host>`) confirms a ship |
 | `watcher.enable` | `true` | The systemd user timer `pi-git-watcher` |
 | `watcher.interval` | `"1min"` | How often the watcher runs |
 | `watcher.environment` | `{ }` | Extra environment, for example `SSH_AUTH_SOCK = "%t/ssh-agent";` for `git push` |

@@ -25,6 +25,7 @@ import {
   statusText,
 } from "./lock.ts";
 import { gitCommit, gitPr, gitPush, type PrResult } from "./pr.ts";
+import { shipCommand } from "./ship-command.ts";
 import { findMainCheckout, gitStart, TYPES } from "./start.ts";
 import {
   claimSummary,
@@ -413,6 +414,11 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         ctx.ui.notify(`${describeLock(config.stateDir, here, fallback(), config.repos)}${waitingText()}`, "info");
       }
     },
+  });
+
+  pi.registerCommand("ship", {
+    description: "Merge what is ready, release what you pick, lock it in NixOS and wait for the deploy (/ship status)",
+    handler: (args, ctx) => shipCommand(args, ctx.ui, { run: runner, config }),
   });
 
   pi.registerTool({
