@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { blockedForHelper, commandsOf } from "./guard.ts";
+import { blockedForHelper, commandsOf, ghWrites, gitChanges, gitWrites } from "./guard.ts";
 
 describe("commandsOf", () => {
   test("splits lines and strips prefixes", () => {
@@ -41,5 +41,91 @@ describe("blockedForHelper", () => {
     ["echo git push"],
   ])("allowed: %s", (line) => {
     expect(blockedForHelper(line)).toBeUndefined();
+  });
+});
+
+describe("gitWrites", () => {
+  test.each([
+    ["status", []],
+    ["log", ["-5"]],
+    ["fetch", ["origin"]],
+    ["branch", []],
+    ["branch", ["-a", "--contains", "abc"]],
+    ["branch", ["--list", "feat/*"]],
+    ["tag", ["-l"]],
+    ["remote", ["-v"]],
+    ["remote", ["get-url", "origin"]],
+    ["stash", ["list"]],
+    ["worktree", ["list"]],
+    ["reflog", []],
+    ["config", ["--get", "user.name"]],
+    ["config", ["user.name"]],
+  ])("reads: git %s %j", (sub, args) => {
+    expect(gitWrites(sub, args)).toBe(false);
+  });
+
+  test.each([
+    ["commit", ["-m", "x"]],
+    ["push", []],
+    ["add", ["-A"]],
+    ["checkout", ["main"]],
+    ["branch", ["new"]],
+    ["branch", ["-D", "old"]],
+    ["tag", ["v1"]],
+    ["tag", ["-a", "v1", "-m", "x"]],
+    ["remote", ["add", "x", "y"]],
+    ["stash", []],
+    ["worktree", ["add", "x"]],
+    ["config", ["user.name", "x"]],
+    ["init", []],
+  ])("writes: git %s %j", (sub, args) => {
+    expect(gitWrites(sub, args)).toBe(true);
+  });
+});
+
+describe("ghWrites", () => {
+  test.each([
+    [[]],
+    [["pr", "view", "1"]],
+    [["pr", "checks", "-R", "o/r"]],
+    [["run", "view", "1", "--log-failed"]],
+    [["search", "repos", "x"]],
+    [["api", "repos/o/r"]],
+    [["api", "-X", "GET", "x"]],
+  ])("reads: %j", (args) => {
+    expect(ghWrites(args)).toBe(false);
+  });
+
+  test.each([
+    [["pr", "create"]],
+    [["pr", "merge", "1"]],
+    [["repo", "create", "x"]],
+    [["api", "-X", "POST", "x"]],
+    [["api", "x", "-f", "a=b"]],
+    [["api", "--method=DELETE", "x"]],
+    [["api", "-XPATCH", "x"]],
+  ])("writes: %j", (args) => {
+    expect(ghWrites(args)).toBe(true);
+  });
+});
+
+describe("gitChanges", () => {
+  test("directories from cd and -C, the repository from gh -R", () => {
+    expect(gitChanges("git status && git commit -m x", "/w", "/home/u")).toEqual([{ what: "git commit", dir: "/w" }]);
+    expect(gitChanges("cd ../other && git push; cd ~/x && git -C sub add .", "/w", "/home/u")).toEqual([
+      { what: "git push", dir: "/w/../other" },
+      { what: "git add", dir: "/home/u/x/sub" },
+    ]);
+    expect(gitChanges("cd /abs && cd && git -c a=b commit", "/w", "/home/u")).toEqual([
+      { what: "git commit", dir: "/home/u" },
+    ]);
+    expect(gitChanges("gh pr create -R o/r --title x", "/w", "/h")).toEqual([
+      { what: "gh pr create", dir: "/w", slug: "o/r" },
+    ]);
+    expect(gitChanges("gh --repo=o/r pr merge 1", "/w", "/h")).toEqual([
+      { what: "gh pr merge", dir: "/w", slug: "o/r" },
+    ]);
+    expect(gitChanges("gh pr list; git log; git; ls", "/w", "/h")).toEqual([]);
+    expect(gitChanges("git -C ~ commit && git -C", "/w", "/h")).toEqual([{ what: "git commit", dir: "/h" }]);
   });
 });

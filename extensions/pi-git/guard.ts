@@ -86,3 +86,194 @@ export function blockedForHelper(line: string): string | undefined {
   }
   return undefined;
 }
+
+/** git subcommands that only read. */
+const READ_GIT = new Set([
+  "annotate",
+  "blame",
+  "cat-file",
+  "check-attr",
+  "check-ignore",
+  "cherry",
+  "count-objects",
+  "describe",
+  "diff",
+  "fetch",
+  "for-each-ref",
+  "grep",
+  "help",
+  "log",
+  "ls-files",
+  "ls-remote",
+  "ls-tree",
+  "merge-base",
+  "name-rev",
+  "range-diff",
+  "rev-list",
+  "rev-parse",
+  "shortlog",
+  "show",
+  "show-ref",
+  "status",
+  "var",
+  "verify-commit",
+  "version",
+  "whatchanged",
+]);
+
+/** git subcommands that read with some arguments: the first argument (or none) that keeps them reading. */
+const READ_SUBCOMMANDS: Record<string, ReadonlySet<string>> = {
+  notes: new Set(["list", "show"]),
+  reflog: new Set(["", "show"]),
+  remote: new Set(["", "-v", "--verbose", "get-url", "show"]),
+  stash: new Set(["list", "show"]),
+  submodule: new Set(["status", "summary"]),
+  worktree: new Set(["list"]),
+};
+
+/** Flags that change something: of `git branch`, and of `git tag`. */
+const WRITE_FLAGS = {
+  branch: /^(-[dDmMcCfu]|--(delete|move|copy|force|set-upstream-to|unset-upstream|edit-description))(=|$)/,
+  tag: /^(-[dfasmu]|--(delete|force|annotate|sign|message|local-user))(=|$)/,
+};
+/** Flags of `git branch` and `git tag` whose next word is a value, not a name. */
+const BRANCH_VALUE_FLAGS = new Set([
+  "--contains",
+  "--no-contains",
+  "--merged",
+  "--no-merged",
+  "--points-at",
+  "--sort",
+  "--format",
+]);
+
+function branchOrTagWrites(sub: "branch" | "tag", args: readonly string[]): boolean {
+  if (args.some((arg) => WRITE_FLAGS[sub].test(arg))) return true;
+  if (args.includes("-l") || args.includes("--list")) return false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (BRANCH_VALUE_FLAGS.has(arg)) i++;
+    else if (!arg.startsWith("-")) return true;
+  }
+  return false;
+}
+
+function configWrites(args: readonly string[]): boolean {
+  if (args.some((arg) => /^--(get|get-all|get-regexp|get-urlmatch|list|show-origin|show-scope)$|^-l$/.test(arg)))
+    return false;
+  return args.filter((arg) => !arg.startsWith("-")).length !== 1;
+}
+
+/** Whether a git command (the words after `git` and its options) changes something. */
+export function gitWrites(sub: string, args: readonly string[]): boolean {
+  if (READ_GIT.has(sub)) return false;
+  const reads = READ_SUBCOMMANDS[sub];
+  if (reads) return !reads.has(args[0] ?? "");
+  if (sub === "branch" || sub === "tag") return branchOrTagWrites(sub, args);
+  if (sub === "config") return configWrites(args);
+  return true;
+}
+
+/** gh commands that only read: `<group> <command>`, or a group where every command reads. */
+const READ_GH = new Set([
+  "auth status",
+  "browse",
+  "cache list",
+  "gist list",
+  "gist view",
+  "issue list",
+  "issue status",
+  "issue view",
+  "label list",
+  "pr checks",
+  "pr diff",
+  "pr list",
+  "pr status",
+  "pr view",
+  "release list",
+  "release view",
+  "repo list",
+  "repo view",
+  "ruleset check",
+  "ruleset list",
+  "ruleset view",
+  "run list",
+  "run view",
+  "run watch",
+  "search",
+  "status",
+  "workflow list",
+  "workflow view",
+]);
+
+/** Whether a gh command changes something. `gh api` reads unless it sets a method or fields. */
+export function ghWrites(args: readonly string[]): boolean {
+  const words = args.filter((arg) => !arg.startsWith("-"));
+  const [group = "", command = ""] = words;
+  if (group === "") return false;
+  if (group === "api") {
+    const method = args.findIndex((arg) => arg === "-X" || arg === "--method");
+    const setsMethod = method !== -1 && (args[method + 1] ?? "").toUpperCase() !== "GET";
+    return setsMethod || args.some((arg) => /^(-[fF]|--(field|raw-field|input)|-X.+|--method=(?!GET$).+)/i.test(arg));
+  }
+  return !READ_GH.has(group) && !READ_GH.has(`${group} ${command}`);
+}
+
+/** A git or gh command that changes something, and where. */
+export interface GitChange {
+  /** For messages: `git commit`, `gh pr create`. */
+  what: string;
+  /** The directory it runs in. */
+  dir: string;
+  /** The repository, when the command names it (`gh -R owner/name`). */
+  slug?: string;
+}
+
+function resolveDir(path: string, cwd: string, home: string): string {
+  if (path === "~") return home;
+  if (path.startsWith("~/")) return `${home}/${path.slice(2)}`;
+  if (path.startsWith("/")) return path;
+  return `${cwd.replace(/\/$/, "")}/${path}`;
+}
+
+function gitChange(words: readonly string[], dir: string, home: string): GitChange | undefined {
+  let where = dir;
+  for (let i = 1; i < words.length; i++) {
+    const word = words[i] as string;
+    if (word === "-C") {
+      where = resolveDir(words[++i] ?? ".", where, home);
+    } else if (GIT_OPTIONS_WITH_VALUE.has(word)) {
+      i++;
+    } else if (!word.startsWith("-")) {
+      return gitWrites(word, words.slice(i + 1)) ? { what: `git ${word}`, dir: where } : undefined;
+    }
+  }
+  return undefined;
+}
+
+function ghChange(words: readonly string[], dir: string): GitChange | undefined {
+  const args = words.slice(1);
+  if (!ghWrites(args)) return undefined;
+  const repo = args.findIndex((arg) => arg === "-R" || arg === "--repo");
+  const inline = args.find((arg) => arg.startsWith("--repo="))?.slice("--repo=".length);
+  const slug = repo === -1 ? inline : args[repo + 1];
+  const what = `gh ${args
+    .filter((arg) => !arg.startsWith("-"))
+    .slice(0, 2)
+    .join(" ")}`;
+  return slug ? { what, dir, slug } : { what, dir };
+}
+
+/** The git and gh commands of a bash line that change something, with the directory each runs in (after `cd`). */
+export function gitChanges(line: string, cwd: string, home: string): GitChange[] {
+  const changes: GitChange[] = [];
+  let dir = cwd;
+  for (const words of commandsOf(line)) {
+    const program = (words[0] as string).replace(/^.*\//, "");
+    if (program === "cd") dir = resolveDir(words[1] ?? home, dir, home);
+    const change =
+      program === "git" ? gitChange(words, dir, home) : program === "gh" ? ghChange(words, dir) : undefined;
+    if (change) changes.push(change);
+  }
+  return changes;
+}

@@ -97,6 +97,16 @@ in
       description = "Seconds for one helper run.";
     };
 
+    locked = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Whether git changes by agents are locked where /git says nothing: commits, pushes, branches,
+        rebases, and gh commands that change GitHub. Unlock one repository with /git unlock in pi;
+        that is remembered. /git global unlock changes the global state.
+      '';
+    };
+
     delivery = lib.mkOption {
       type = lib.types.enum [
         "turn"
@@ -178,6 +188,7 @@ in
             checkTimeout
             helperTimeout
             delivery
+            locked
             ;
         }
         // lib.optionalAttrs (cfg.skill != null) { skill = "${cfg.skill}"; }

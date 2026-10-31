@@ -38,6 +38,8 @@ export interface Entry {
   fixedSha?: string;
   /** The head that was reported green. */
   greenSha?: string;
+  /** The head that was reported as waiting for an unlock. */
+  lockedSha?: string;
   /** Polls in a row where gh failed. */
   errors: number;
   /** What the helper did. */

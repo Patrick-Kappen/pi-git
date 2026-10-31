@@ -104,7 +104,13 @@ beforeEach(() => {
   writeFileSync(join(worktree, "a.txt"), `mine ${n}\n`);
   sh(worktree, "commit", "-q", "-am", "mine");
   sh(worktree, "push", "-q", "-u", "origin", `feat/t${n}`);
-  config = { ...defaults("p", {}, root), stateDir: join(root, `state${n}`), pi: join(bin, "pi"), attempts: 2 };
+  config = {
+    ...defaults("p", {}, root),
+    stateDir: join(root, `state${n}`),
+    pi: join(bin, "pi"),
+    attempts: 2,
+    locked: false,
+  };
   entry = {
     id: `o__r__${n}`,
     repo: "o/r",
@@ -356,5 +362,24 @@ describe("tick", () => {
     view({ statusCheckRollup: [red] });
     expect(await once()).toBe(1);
     expect(logs).toContain(`o__r__${n}: boom`);
+  });
+
+  test("locked: fixes wait for an unlock, reported once; after a merge the worktree stays", async () => {
+    config = { ...config, locked: true };
+    view({ statusCheckRollup: [red] });
+    await once();
+    await once();
+    expect(gitPr).not.toHaveBeenCalled();
+    expect(texts()).toEqual([
+      `pi-git: PR #${n} (o/r): CI fails, but git changes are locked in o/r. Unlock with /git unlock to let the helper fix it. ${entry.url}`,
+    ]);
+    view({ mergeable: "CONFLICTING" });
+    saveEntry(config.stateDir, entry);
+    await once();
+    expect(texts().join("\n")).toContain("it conflicts with the base, but git changes are locked");
+    view({ state: "MERGED" });
+    await once();
+    expect(existsSync(entry.worktree)).toBe(true);
+    expect(texts().join("\n")).toContain("are kept: git changes are locked in o/r.");
   });
 });

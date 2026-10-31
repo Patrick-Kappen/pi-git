@@ -6,6 +6,7 @@ import { runHelper } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { ciFixPrompt, conflictPrompt } from "./prompts.ts";
 import { addSummary, type Entry, type FinalStatus, loadEntries, lock, removeEntry, saveEntry } from "./state.ts";
+import { effective, loadSwitch } from "./switch.ts";
 
 /** gh's view of a PR, as far as the watcher needs it. */
 export interface PrView {
@@ -100,6 +101,12 @@ class Watch {
     return result.code === 0 ? result.stdout.trim() : "";
   }
 
+  /** Whether git changes are locked in the repository of the PR (/git). */
+  private locked(): boolean {
+    const fallback = this.config.locked ? "locked" : "unlocked";
+    return effective(loadSwitch(this.config.stateDir), this.entry.repo, fallback).lock === "locked";
+  }
+
   private notesText(): string {
     return this.entry.notes.length > 0
       ? `\nThe helper:\n${this.entry.notes.map((note) => `- ${note}`).join("\n")}`
@@ -174,6 +181,12 @@ class Watch {
   private async merged(): Promise<void> {
     const { worktree, mainRoot, branch } = this.entry;
     if (!existsSync(worktree)) return this.finish("merged", `is merged. The worktree was already gone.`);
+    if (this.locked()) {
+      return this.finish(
+        "merged",
+        `is merged. The worktree ${worktree} and the branch are kept: git changes are locked in ${this.entry.repo}.`,
+      );
+    }
     if ((await this.gitText("status", "--porcelain")) !== "") {
       return this.finish("merged", `is merged. The worktree ${worktree} has uncommitted changes, so it is kept.`);
     }
@@ -206,6 +219,7 @@ class Watch {
   /** Let the helper fix red CI or a conflict, once per head, within the attempts. */
   private async fix(pr: PrView, kind: "ci" | "conflict"): Promise<void> {
     if (this.entry.fixedSha === pr.headRefOid) return this.save();
+    if (this.locked()) return this.waitForUnlock(pr, kind);
     if (this.entry.attempts >= this.config.attempts) {
       const what = kind === "ci" ? "CI still fails" : "still conflicts with the base";
       return this.finish(
@@ -223,6 +237,18 @@ class Watch {
     const failure = kind === "ci" ? await this.fixCi(pr) : await this.fixConflict(pr);
     if (failure) return this.finish("failed", `needs you: ${failure}. ${this.entry.url}`);
     this.save();
+  }
+
+  /** Report once per head that a fix waits for /git unlock. */
+  private waitForUnlock(pr: PrView, kind: "ci" | "conflict"): void {
+    const reported = this.entry.lockedSha === pr.headRefOid;
+    this.entry.lockedSha = pr.headRefOid;
+    this.save();
+    if (reported) return;
+    const what = kind === "ci" ? "CI fails" : "it conflicts with the base";
+    this.report(
+      `pi-git: PR #${this.entry.number} (${this.entry.repo}): ${what}, but git changes are locked in ${this.entry.repo}. Unlock with /git unlock to let the helper fix it. ${this.entry.url}`,
+    );
   }
 
   private async failedLogs(pr: PrView): Promise<string> {
