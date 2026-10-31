@@ -6,7 +6,16 @@ import { clipEnd, outputOf, type Runner } from "./exec.ts";
 import { runHelper } from "./helper.ts";
 import type { gitPr as GitPr } from "./pr.ts";
 import { ciFixPrompt, conflictPrompt } from "./prompts.ts";
-import { addSummary, type Entry, type FinalStatus, loadEntries, lock, removeEntry, saveEntry } from "./state.ts";
+import {
+  addSummary,
+  type Entry,
+  type FinalStatus,
+  loadEntries,
+  lock,
+  pruneDelivered,
+  removeEntry,
+  saveEntry,
+} from "./state.ts";
 import { effective, loadSwitch, type Step } from "./switch.ts";
 
 /** gh's view of a PR, as far as the watcher needs it. */
@@ -71,6 +80,8 @@ export interface WatchDeps {
 const FIELDS = "state,mergeable,headRefOid,statusCheckRollup,baseRefName,baseRefOid";
 /** A tick that takes longer than this is assumed dead, and its lock is taken over. */
 const LOCK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/** Delivered summaries are kept this long, for a look back, then deleted. */
+const DELIVERED_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 /** After this many failed gh calls in a row, the watcher gives up on a PR. */
 const MAX_ERRORS = 30;
 
@@ -491,6 +502,7 @@ export async function tick(deps: WatchDeps): Promise<number> {
     return 0;
   }
   try {
+    pruneDelivered(deps.config.stateDir, DELIVERED_MAX_AGE_MS, (deps.now?.() ?? new Date()).getTime());
     const entries = loadEntries(deps.config.stateDir);
     for (const entry of entries) {
       try {

@@ -14,6 +14,7 @@ import {
   loadEntries,
   loadSummaries,
   lock,
+  pruneDelivered,
   removeEntry,
   saveEntry,
   sessionAlive,
@@ -129,5 +130,35 @@ describe("lock after a reboot or a crash", () => {
     writeFileSync(path, JSON.stringify({ pid: process.pid }));
     expect(lock(dir, "w", 60_000, Date.now(), undefined)).toBeUndefined();
     expect(bootId()).toMatch(/^[0-9a-f-]{36}$|^$/);
+  });
+});
+
+describe("pruneDelivered", () => {
+  test("deletes delivered summaries older than the limit", () => {
+    const dir = fresh();
+    const old = addSummary(dir, {
+      entryId: "a",
+      repo: "o/r",
+      number: 1,
+      sessionId: "s",
+      status: "green",
+      text: "old",
+      created: "2026-01-01T00:00:00.000Z",
+    });
+    const recent = addSummary(dir, {
+      entryId: "b",
+      repo: "o/r",
+      number: 2,
+      sessionId: "s",
+      status: "green",
+      text: "new",
+      created: "2026-01-02T00:00:00.000Z",
+    });
+    claimSummary(dir, old.id);
+    claimSummary(dir, recent.id);
+    utimesSync(join(dirs(dir).delivered, `${old.id}.json`), new Date(0), new Date(0));
+    expect(pruneDelivered(dir, 60_000)).toBe(1);
+    expect(existsSync(join(dirs(dir).delivered, `${recent.id}.json`))).toBe(true);
+    expect(pruneDelivered(fresh(), 60_000)).toBe(0);
   });
 });
