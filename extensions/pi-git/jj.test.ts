@@ -106,6 +106,11 @@ case "$PI_GIT_HELPER" in
   fix)
     case "$last" in
       *"CI fails"*) echo ci > ci.txt; echo "Fixed CI." ;;
+      *"stopped at conflicts"*)
+        case "$input" in
+          *LEAVE*) echo "left it" ;;
+          *) echo resolved > a.txt; echo "Kept both sides." ;;
+        esac ;;
       *"pre-push checks fail"*) echo OK > push.txt; echo "Set push.txt to OK." ;;
       *) sed -i 's/BAD/GOOD/' bad.txt; echo "Replaced BAD with GOOD." ;;
     esac ;;
@@ -469,11 +474,16 @@ describe("the watcher with a jj workspace", () => {
   };
 
   /** A PR from a jj workspace, in the watcher's queue. */
-  async function opened(): Promise<{ path: string; branch: string }> {
+  async function opened(intent = "Add a."): Promise<{ path: string; branch: string }> {
     const path = await start();
     const branch = `feat/topic-${counter}`;
     writeFileSync(join(path, "a.txt"), "a\n");
     expect((await gitPr({ path, intent: "A.", title: "feat: add a" }, deps())).ok).toBe(true);
+    queue(path, branch, "main", intent);
+    return { path, branch };
+  }
+
+  function queue(path: string, branch: string, base: string, intent: string, baseSha?: string): void {
     const entry: Entry = {
       id: `o__r__${counter}`,
       repo: "o/r",
@@ -482,8 +492,9 @@ describe("the watcher with a jj workspace", () => {
       worktree: path,
       mainRoot: main,
       branch,
-      base: "main",
-      intent: "Add a.",
+      base,
+      ...(baseSha ? { baseSha } : {}),
+      intent,
       sessionId: "s1",
       status: "watching",
       attempts: 0,
@@ -492,7 +503,16 @@ describe("the watcher with a jj workspace", () => {
       updated: "",
     };
     saveEntry(config.stateDir, entry);
-    return { path, branch };
+  }
+
+  /** The default branch on GitHub gets its own a.txt: the PR conflicts with it. */
+  function conflictOnMain(): void {
+    git(other, "fetch", "-q", "origin");
+    git(other, "checkout", "-q", "-B", "main", "origin/main");
+    writeFileSync(join(other, "a.txt"), `theirs ${counter}\n`);
+    git(other, "add", "-A");
+    git(other, "commit", "-q", "--no-verify", "-m", "feat: their a");
+    git(other, "push", "-q", "--no-verify", "origin", "main");
   }
 
   function view(branch: string, fields: Partial<PrView>): void {
@@ -521,11 +541,58 @@ describe("the watcher with a jj workspace", () => {
     expect(loadEntries(config.stateDir)[0]?.notes[0]).toContain("Fixed CI.");
   });
 
-  test("a conflict needs the user: the watcher does not rebase jj workspaces yet", async () => {
-    const { branch } = await opened();
+  test("a conflict: jj rebases, the helper resolves it, and the branch is pushed with a lease", async () => {
+    const { path, branch } = await opened();
+    conflictOnMain();
     view(branch, { mergeable: "CONFLICTING" });
     await once();
-    expect(texts()[0]).toContain("is a jj workspace, which the watcher does not rebase yet");
+    expect(git(origin, "log", "--format=%s", `main..${branch}`)).toBe("feat: add a");
+    expect(git(origin, "merge-base", "--is-ancestor", "main", branch)).toBe("");
+    expect(git(origin, "show", `${branch}:a.txt`)).toBe("resolved");
+    expect(loadEntries(config.stateDir)[0]?.notes.join("\n")).toContain(
+      "conflict with main in a.txt: Kept both sides.",
+    );
+    expect(jj(path, "log", "--no-graph", "-r", "conflicts()", "-T", "commit_id")).toBe("");
+    expect(jj(path, "log", "--no-graph", "-r", "@-", "-T", "commit_id")).toBe(git(origin, "rev-parse", branch));
+  });
+
+  test("a conflict the helper cannot resolve: everything is put back", async () => {
+    const { path, branch } = await opened("LEAVE it");
+    const head = git(origin, "rev-parse", branch);
+    conflictOnMain();
+    view(branch, { mergeable: "CONFLICTING" });
+    await once();
+    expect(texts()[0]).toContain("the helper could not resolve the conflict with main: left it");
+    expect(git(origin, "rev-parse", branch)).toBe(head);
+    expect(jj(path, "log", "--no-graph", "-r", "@-", "-T", "commit_id")).toBe(head);
+    expect(jj(path, "log", "--no-graph", "-r", "conflicts()", "-T", "commit_id")).toBe("");
+  });
+
+  test("a stacked PR whose base was squash-merged: only its own commits move to the new base", async () => {
+    const basePath = await start(`base-${counter}`);
+    const baseBranch = `feat/base-${counter}`;
+    writeFileSync(join(basePath, "base.txt"), "base\n");
+    expect((await gitPr({ path: basePath, intent: "Base.", title: "feat: base" }, deps())).ok).toBe(true);
+    const baseSha = git(origin, "rev-parse", baseBranch);
+    const stacked = await gitStart(
+      { repo: main, topic: `top-${counter}`, base: baseBranch, setup: false },
+      { run: runner, config, home: root, progress: () => {}, backendOf: () => "jj" },
+    );
+    const path = stacked.path as string;
+    const branch = `feat/top-${counter}`;
+    writeFileSync(join(path, "top.txt"), "top\n");
+    expect((await gitPr({ path, intent: "Top.", title: "feat: top", base: baseBranch }, deps())).ok).toBe(true);
+    // GitHub squash-merges the base and deletes its branch.
+    git(other, "fetch", "-q", "origin");
+    git(other, "checkout", "-q", "-B", "main", "origin/main");
+    git(other, "merge", "-q", "--squash", `origin/${baseBranch}`);
+    git(other, "commit", "-q", "--no-verify", "-m", "feat: base (#1)");
+    git(other, "push", "-q", "--no-verify", "origin", "main", `:${baseBranch}`);
+    queue(path, branch, baseBranch, "Top.", baseSha);
+    view(branch, { baseRefName: "main" });
+    await once();
+    expect(git(origin, "log", "--format=%s", `main..${branch}`)).toBe("feat: top");
+    expect(loadEntries(config.stateDir)[0]?.notes.join("\n")).toContain(`the base ${baseBranch} was merged; rebased`);
   });
 
   test("merged: removes the workspace, forgets it in jj and deletes the bookmark", async () => {

@@ -323,9 +323,11 @@ branch.
 - **Pushing** moves the bookmark to the newest logical commit and runs `git push`, so the pre-push
   hook runs. When the branch on GitHub moved (the watcher pushed a fix), jj rebases on it first; on
   conflicts everything is put back (`jj op restore`).
-- **The watcher** fixes red CI in a jj workspace like in a git worktree, and removes the workspace
-  after the merge (`jj workspace forget`, and the bookmark). A conflict with the base, or a stacked
-  PR whose base was merged, needs you for now: the watcher does not rebase jj workspaces yet.
+- **The watcher** fixes red CI in a jj workspace like in a git worktree. On a conflict with the base,
+  or when the base of a stacked PR was merged, it rebases with jj, which records conflicts in the
+  commits; it opens them one by one (with git's conflict markers), the helper resolves each, and the
+  resolution goes into its commit. On a failure everything is put back (`jj op restore`). After the
+  merge it removes the workspace (`jj workspace forget`, and the bookmark).
 - **The lock** also covers jj, which runs no git hooks: `jj git push` is `push`, `jj workspace` and
   `jj bookmark` are `worktree`, and the other jj commands that change history are `commit`. The
   helper may only read with jj.
