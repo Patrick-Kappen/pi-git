@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/Patrick-Kappen/pi-git/compare/v0.9.3...v0.9.4) (2026-10-31)
+
+
+### Bug Fixes
+
+* **pi-git:** report nothing when a PR merged and was cleaned up ([#47](https://github.com/Patrick-Kappen/pi-git/issues/47)) ([527bcbd](https://github.com/Patrick-Kappen/pi-git/commit/527bcbd3e1cff4f7dc50376ae838334c05dd45b0))
+
 ## [0.9.3](https://github.com/Patrick-Kappen/pi-git/compare/v0.9.2...v0.9.3) (2026-10-31)
 
 
