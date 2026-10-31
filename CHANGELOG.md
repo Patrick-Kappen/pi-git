@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.7.0...v0.8.0) (2026-10-31)
+
+
+### Features
+
+* **pi-git:** add a colocated jj backend ([#32](https://github.com/Patrick-Kappen/pi-git/issues/32)) ([b991e01](https://github.com/Patrick-Kappen/pi-git/commit/b991e01525b7ca8c6189b998b5b92b5b33392cd9))
+* **pi-git:** ship every releasing repository, and report shipped PRs only once ([#31](https://github.com/Patrick-Kappen/pi-git/issues/31)) ([3a4014f](https://github.com/Patrick-Kappen/pi-git/commit/3a4014f15c87f90a7376d651df34784dafedff6c))
+
 ## [0.7.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.6.0...v0.7.0) (2026-10-31)
 
 
