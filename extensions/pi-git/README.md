@@ -72,7 +72,13 @@ main agent never reads the output:
 | Closed | Reports it and stops; the worktree and the branch are kept. |
 
 The helper tries each red head once, and at most `attempts` times per PR; then the watcher reports
-that the PR needs you. It never merges. It refuses to touch a worktree with uncommitted changes or
+that the PR needs you.
+
+The watcher survives a reboot: the queue is in files, and the timer starts two minutes after boot
+(with lingering, also before you log in). A fix that a reboot breaks off is not counted for its head:
+on the next round the watcher aborts its own rebase, stashes the changes of its fix
+(`git stash list` shows them as `pi-git: interrupted ... fix of PR #n`), and tries again. Its lock
+records the process and the boot, so a lock from before the reboot does not block it. It never merges. It refuses to touch a worktree with uncommitted changes or
 with commits that are not on GitHub, and reports that instead.
 
 ## Summaries
