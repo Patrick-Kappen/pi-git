@@ -36,6 +36,8 @@ export interface Entry {
   attempts: number;
   /** The head the helper last tried to fix, so one red head is fixed once. */
   fixedSha?: string;
+  /** The last seen tip of the base branch: where the PR's own commits start after a stacked base is merged. */
+  baseSha?: string;
   /** The head that was reported green. */
   greenSha?: string;
   /** The head that was reported as waiting for an unlock. */

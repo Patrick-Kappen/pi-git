@@ -465,3 +465,50 @@ describe("tick", () => {
     expect(listAttention(config.stateDir)).toEqual([]);
   });
 });
+
+describe("a stacked PR whose base was merged", () => {
+  test("rebases only its own commits on the new base, with a lease, without a report", async () => {
+    // The base branch feat/base<n> has one commit; this PR's branch builds on it with one more.
+    const baseBranch = `feat/base${n}`;
+    const wt = entry.worktree;
+    sh(wt, "reset", "-q", "--hard", "origin/main");
+    writeFileSync(join(wt, "base.txt"), "base\n");
+    sh(wt, "add", "-A");
+    sh(wt, "commit", "-q", "-m", "base work");
+    sh(wt, "push", "-q", "origin", `HEAD:${baseBranch}`);
+    const baseTip = head();
+    writeFileSync(join(wt, "top.txt"), "top\n");
+    sh(wt, "add", "-A");
+    sh(wt, "commit", "-q", "-m", "top work");
+    sh(wt, "push", "-q", "-f", "origin", `HEAD:${entry.branch}`);
+    saveEntry(config.stateDir, { ...entry, base: baseBranch });
+    // Round 1: the PR is on the base branch; the watcher remembers the base's tip.
+    view({ baseRefName: baseBranch, baseRefOid: baseTip });
+    await once();
+    expect(saved()?.baseSha).toBe(baseTip);
+    // The base is squash-merged into main, and GitHub moves the PR to main.
+    sh(main, "fetch", "-q", "origin");
+    sh(main, "checkout", "-q", "--detach", "origin/main");
+    writeFileSync(join(main, "base.txt"), "base\n");
+    sh(main, "add", "-A");
+    sh(main, "commit", "-q", "-m", "base work (#1)");
+    sh(main, "push", "-q", "origin", "HEAD:main");
+    const before = head();
+    view({ baseRefName: "main", baseRefOid: sh(main, "rev-parse", "HEAD") });
+    await once();
+    expect(sh(wt, "log", "--format=%s", "-2").split("\n")).toEqual(["top work", "base work (#1)"]);
+    expect(gitPr.mock.calls[0]?.[0]).toMatchObject({ base: "main", forceWithLease: before, updatePr: false });
+    expect(saved()?.base).toBe("main");
+    expect(saved()?.notes.at(-1)).toBe(`the base ${baseBranch} was merged; rebased the PR's own commits on main`);
+    // Only the green report of round 1; the rebase itself is not reported.
+    expect(texts().join("\n")).not.toMatch(/rebase|needs you/);
+  });
+
+  test("locked: waits for an unlock", async () => {
+    saveEntry(config.stateDir, { ...entry, base: "feat/gone" });
+    config = { ...config, locked: true };
+    view({ baseRefName: "main" });
+    await once();
+    expect(texts().join("\n")).toContain("git changes are locked");
+  });
+});
