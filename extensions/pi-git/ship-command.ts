@@ -12,14 +12,34 @@ export interface ShipUi {
 
 const WIDGET = "pi-git-ship";
 
-/** Ask per releasable library whether it releases. */
-async function pickReleases(ui: ShipUi, index: ShipIndex): Promise<string[]> {
-  const releases: string[] = [];
-  for (const lib of index.libs.filter((item) => item.releasable)) {
-    const what = lib.releasePr ? lib.releasePr.title : "the release after the merges";
-    if ((await ui.select(`Release ${lib.repo}? (${what})`, ["Release", "Skip"])) === "Release") releases.push(lib.repo);
+interface Choices {
+  releases: string[];
+  /** Per library: the PR whose title becomes a feat, so a release follows. */
+  retitles: Record<string, number>;
+}
+
+/** Ask per library whether it releases; for changes without a feat or fix, whether one becomes a feat. */
+async function pickReleases(ui: ShipUi, index: ShipIndex): Promise<Choices> {
+  const choices: Choices = { releases: [], retitles: {} };
+  for (const lib of index.libs) {
+    if (lib.releasable) {
+      const what = lib.releasePr ? lib.releasePr.title : "the release after the merges";
+      if ((await ui.select(`Release ${lib.repo}? (${what})`, ["Release", "Skip"])) === "Release") {
+        choices.releases.push(lib.repo);
+      }
+    } else if (lib.noRelease !== undefined) {
+      const pr = lib.ready.find((item) => item.number === lib.noRelease);
+      const answer = await ui.select(
+        `${lib.repo} changes, but no release follows: make #${lib.noRelease} (${pr?.title}) a feat?`,
+        ["Make it a feat and release", "No release"],
+      );
+      if (answer === "Make it a feat and release") {
+        choices.releases.push(lib.repo);
+        choices.retitles[lib.repo] = lib.noRelease;
+      }
+    }
   }
-  return releases;
+  return choices;
 }
 
 /** /ship and /ship status: index, show the plan and its problems, pick releases, confirm, then the watcher runs it. */
@@ -38,8 +58,8 @@ export async function shipCommand(args: string, ui: ShipUi, deps: { run: Runner;
   ui.notify("pi-git ship: looking at every repository…", "info");
   const index = await indexShip(deps.run, config.shipNixos);
   ui.setWidget(WIDGET, ["/ship plan", ...planLines(index)]);
-  const releases = await pickReleases(ui, index);
-  const ship = createShip(index, releases, config.shipHost, new Date());
+  const { releases, retitles } = await pickReleases(ui, index);
+  const ship = createShip(index, releases, config.shipHost, new Date(), retitles);
   if (ship.libs.length === 0 && ship.nixos.prs.length === 0) {
     ui.setWidget(WIDGET, undefined);
     ui.notify("pi-git ship: nothing to ship.", "info");

@@ -131,6 +131,7 @@ class Watch {
 
   private report(text: string): void {
     const { entry } = this;
+    if (entry.quiet) return;
     addSummary(this.config.stateDir, {
       entryId: entry.id,
       repo: entry.repo,
