@@ -226,20 +226,30 @@ export const PREFLIGHT_PROMPT = [
   'with one verdict for every PR in the input; "after" may be left out.',
 ].join("\n");
 
+function parseVerdict(item: Record<string, unknown>): Verdict | Error {
+  if (typeof item.pr !== "number" || !["ship", "fix", "skip"].includes(item.action as string)) {
+    return new Error("every verdict needs pr (a number) and action (ship, fix or skip)");
+  }
+  const after = Array.isArray(item.after)
+    ? (item.after as unknown[]).filter((n): n is number => typeof n === "number")
+    : [];
+  return {
+    pr: item.pr,
+    action: item.action as Action,
+    reason: typeof item.reason === "string" ? item.reason : "",
+    ...(after.length > 0 ? { after } : {}),
+  };
+}
+
 export function parseVerdicts(numbers: readonly number[]) {
   return (value: unknown): Verdict[] | Error => {
     const list = (value as { verdicts?: unknown })?.verdicts;
     if (!Array.isArray(list)) return new Error('expected {"verdicts": [...]}');
     const verdicts: Verdict[] = [];
     for (const item of list as Record<string, unknown>[]) {
-      if (typeof item.pr !== "number" || !["ship", "fix", "skip"].includes(item.action as string)) {
-        return new Error("every verdict needs pr (a number) and action (ship, fix or skip)");
-      }
-      verdicts.push({
-        pr: item.pr,
-        action: item.action as Action,
-        reason: typeof item.reason === "string" ? item.reason : "",
-      });
+      const verdict = parseVerdict(item);
+      if (verdict instanceof Error) return verdict;
+      verdicts.push(verdict);
     }
     const missing = numbers.filter((n) => !verdicts.some((v) => v.pr === n));
     return missing.length > 0 ? new Error(`no verdict for ${missing.map((n) => `#${n}`).join(", ")}`) : verdicts;
