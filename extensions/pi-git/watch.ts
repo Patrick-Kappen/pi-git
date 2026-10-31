@@ -15,6 +15,9 @@ export interface PrView {
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   headRefOid: string;
   statusCheckRollup: Check[];
+  /** The base branch; GitHub changes it when the base of a stacked PR is merged and deleted. */
+  baseRefName?: string;
+  baseRefOid?: string;
 }
 
 /** A check run (GitHub Actions and apps) or a commit status (bots such as a build server). */
@@ -65,7 +68,7 @@ export interface WatchDeps {
   log?: (text: string) => void;
 }
 
-const FIELDS = "state,mergeable,headRefOid,statusCheckRollup";
+const FIELDS = "state,mergeable,headRefOid,statusCheckRollup,baseRefName,baseRefOid";
 /** A tick that takes longer than this is assumed dead, and its lock is taken over. */
 const LOCK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 /** After this many failed gh calls in a row, the watcher gives up on a PR. */
@@ -184,6 +187,13 @@ class Watch {
       return this.finish("closed", "was closed without merging; the worktree and the branch are kept.");
     if (!existsSync(this.entry.worktree))
       return this.finish("failed", `has no worktree any more (${this.entry.worktree}); stopped watching.`);
+    return this.open(pr);
+  }
+
+  /** An open PR with its worktree: follow a moved base, fix conflicts and red CI, report green once. */
+  private async open(pr: PrView): Promise<void> {
+    if (pr.baseRefName && pr.baseRefName !== this.entry.base) return this.restack(pr, pr.baseRefName);
+    if (pr.baseRefOid) this.entry.baseSha = pr.baseRefOid;
     if (pr.mergeable === "CONFLICTING") return this.fix(pr, "conflict");
     const state = rollup(pr.statusCheckRollup ?? []);
     if (state === "failed") return this.fix(pr, "ci");
@@ -236,6 +246,29 @@ class Watch {
     }
     const merge = await this.git(["merge", "--ff-only", head]);
     return merge.code === 0 ? undefined : `could not update the worktree: ${outputOf(merge)}`;
+  }
+
+  /**
+   * The base of a stacked PR was merged, and GitHub moved the PR to the next base. With squash
+   * merges, the branch still has the old base's commits: rebase only the PR's own commits (those
+   * after the last seen tip of the old base) onto the new base, and force-push with a lease.
+   */
+  private async restack(pr: PrView, to: string): Promise<void> {
+    if (this.locked("commit", "push")) return this.waitForUnlock(pr, "conflict");
+    const from = this.entry.base;
+    const upstream = this.entry.baseSha;
+    this.entry.base = to;
+    delete this.entry.baseSha;
+    const problem = await this.atHead(pr.headRefOid);
+    if (problem) return this.finish("failed", `needs you: ${problem}. ${this.entry.url}`);
+    this.entry.working = "conflict";
+    this.save();
+    this.deps.log?.(`${this.entry.id}: ${from} was merged; rebasing on ${to}`);
+    const failure = await this.fixConflict(pr, upstream);
+    delete this.entry.working;
+    if (failure) return this.finish("failed", `needs you: ${failure}. ${this.entry.url}`);
+    this.entry.notes.push(`the base ${from} was merged; rebased the PR's own commits on ${to}`);
+    this.save();
   }
 
   /** Let the helper fix red CI or a conflict, once per head, within the attempts. */
@@ -380,9 +413,12 @@ class Watch {
       });
   }
 
-  private async fixConflict(pr: PrView): Promise<string | undefined> {
+  /** Rebase on the base and let the helper resolve conflicts; `upstream` limits it to commits after that one. */
+  private async fixConflict(pr: PrView, upstream?: string): Promise<string | undefined> {
     const env = { GIT_EDITOR: "true" };
-    const rebase = await this.deps.run("git", ["rebase", `origin/${this.entry.base}`], {
+    const target = `origin/${this.entry.base}`;
+    const args = upstream ? ["rebase", "--onto", target, upstream] : ["rebase", target];
+    const rebase = await this.deps.run("git", args, {
       cwd: this.entry.worktree,
       env,
     });
@@ -411,6 +447,12 @@ class Watch {
       await this.git(["rebase", "--abort"]);
       return `the rebase on ${this.entry.base} did not finish`;
     }
+    return this.pushRebased(pr);
+  }
+
+  /** Push a rebased branch with a lease on the head the watcher saw; nothing when the rebase changed nothing. */
+  private async pushRebased(pr: PrView): Promise<string | undefined> {
+    if ((await this.gitText("rev-parse", "HEAD")) === pr.headRefOid) return undefined;
     const pushed = await this.deps.gitPr(
       {
         path: this.entry.worktree,

@@ -78,6 +78,7 @@ because the watcher fixes CI there. After that, the PR is followed like one from
 | Checks pending | Waits. Checks that wait for an approval count as pending. |
 | Checks failed | The helper gets the failing checks with their logs (`gh run view --log-failed` for GitHub Actions) and fixes the files; pi-git commits and pushes the fix with the `git_pr` flow, checks included. When the helper changes nothing (the failure is not caused by the PR), the failed jobs run again once. |
 | Conflicts with the base | Rebases the worktree on the base; the helper resolves each conflict; pi-git continues the rebase and force-pushes with a lease on the head it saw. |
+| Base moved (a stacked PR whose base was merged and deleted, so GitHub moved the PR to the next base) | Rebases only the PR's own commits (after the last seen tip of the old base) onto the new base, the helper resolving conflicts, and force-pushes with a lease. No report unless it fails. |
 | Green and mergeable | Reports it once per head. |
 | Merged | Removes the worktree and the local branch (when the worktree is clean), prunes, reports it, and stops. |
 | Closed | Reports it and stops; the worktree and the branch are kept. |
