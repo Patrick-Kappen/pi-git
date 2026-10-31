@@ -93,6 +93,10 @@ export interface NixItem extends Stage {
   mergeSha?: string;
   /** How often the flake.lock PR was made again on a newer default branch, after a conflict. */
   refreshes?: number;
+  /** PRs that need a library of this ship (they use what it adds): they land with the new lock. */
+  together?: ShipPr[];
+  /** Which of `together` lands now; the first one gets the lock commit. */
+  togetherAt?: number;
 }
 
 export interface Ship {
@@ -513,6 +517,8 @@ export const RELEASE_PROMPT = [
 /** The preflight of one repository: the PRs to leave out, and the order in which the rest lands. */
 export interface Preflight {
   skips: { pr: number; reason: string }[];
+  /** Configuration PRs that need libraries of this ship: PR number to repositories. */
+  needs?: Record<number, string[]> | undefined;
   /** PR numbers in the order they land: clean ones first, conflicting ones last. */
   order?: number[] | undefined;
 }
@@ -777,8 +783,9 @@ class Shipping {
     for (let round = orphans(); round.length > 0; round = orphans()) {
       for (const pr of round) drop(pr.number, `stacked on ${pr.stackedOn}, whose PR is not shipped`);
     }
-    const { skips, order } = await (this.deps.preflight ?? ((r, p) => this.preflight(r, p, agent)))(repo, prs);
+    const { skips, order, needs } = await (this.deps.preflight ?? ((r, p) => this.preflight(r, p, agent)))(repo, prs);
     for (const skip of skips) drop(skip.pr, skip.reason);
+    if (repo === this.ship.nixos.repo) this.landTogether(prs, needs ?? {}, drop);
     // Merge in the order the simulation found; PRs it did not see keep their place at the end.
     if (order) {
       const rank = (pr: ShipPr) => (order.includes(pr.number) ? order.indexOf(pr.number) : order.length);
@@ -788,6 +795,27 @@ class Shipping {
       for (const pr of round) drop(pr.number, `stacked on ${pr.stackedOn}, whose PR is not shipped`);
     }
     return lines;
+  }
+
+  /**
+   * Configuration PRs that use what a library of this ship adds do not merge early (they are red
+   * until the new lock is in): they wait, and land with the lock. One that needs a library that is
+   * not shipped is left out.
+   */
+  private landTogether(prs: ShipPr[], needs: Record<number, string[]>, drop: (n: number, why: string) => void): void {
+    const shipped = new Set(this.ship.libs.filter((lib) => !lib.outside).map((lib) => lib.repo.toLowerCase()));
+    for (const [key, repos] of Object.entries(needs)) {
+      const number = Number(key);
+      const missing = repos.filter((repo) => !shipped.has(repo.toLowerCase()));
+      if (missing.length > 0) {
+        drop(number, `needs ${missing.join(", ")}, which is not shipped`);
+        continue;
+      }
+      const index = prs.findIndex((pr) => pr.number === number);
+      if (index < 0) continue;
+      const [pr] = prs.splice(index, 1);
+      if (pr) this.ship.nixos.together = [...(this.ship.nixos.together ?? []), pr];
+    }
   }
 
   /**
@@ -824,7 +852,13 @@ class Shipping {
         : Promise.resolve(`no local checkout (${main.error})`);
     let simulated = await run();
     const order = () => (typeof simulated === "string" ? undefined : simulated.map((item) => item.number));
-    const plain = typeof simulated !== "string" && simulated.every((item) => item.clean) && prs.every((pr) => !pr.note);
+    // The configuration is always looked at when libraries ship: a PR there may need one of them.
+    const libsShip = repo === this.ship.nixos.repo && this.ship.libs.some((lib) => !lib.outside && lib.prs.length > 0);
+    const plain =
+      !libsShip &&
+      typeof simulated !== "string" &&
+      simulated.every((item) => item.clean) &&
+      prs.every((pr) => !pr.note);
     if (plain) return { skips: [], order: order() };
     const withBodies = await Promise.all(
       prs.map(async (pr) => ({
@@ -835,7 +869,11 @@ class Shipping {
     const verdicts = await askJson(
       this.deps.run,
       agent,
-      { cwd: this.ship.nixos.root, prompt: PREFLIGHT_PROMPT, input: preflightInput(repo, withBodies, simulated) },
+      {
+        cwd: this.ship.nixos.root,
+        prompt: PREFLIGHT_PROMPT,
+        input: `${preflightInput(repo, withBodies, simulated)}${repo === this.ship.nixos.repo ? this.librariesInput() : ""}`,
+      },
       parseVerdicts(prs.map((pr) => pr.number)),
     );
     if (verdicts instanceof Error) {
@@ -847,10 +885,24 @@ class Shipping {
     // PRs that use what another adds land after it: find the order again with those needs.
     const after = Object.fromEntries(verdicts.filter((v) => v.after).map((v) => [v.pr, v.after as number[]]));
     if (Object.keys(after).length > 0) simulated = await run(after);
+    const needs = Object.fromEntries(verdicts.filter((v) => v.needs).map((v) => [v.pr, v.needs as string[]]));
     return {
       skips: verdicts.filter((item) => item.action === "skip").map((item) => ({ pr: item.pr, reason: item.reason })),
       order: order(),
+      ...(Object.keys(needs).length > 0 ? { needs } : {}),
     };
+  }
+
+  /** For the configuration's preflight: what the libraries of this ship change. */
+  private librariesInput(): string {
+    const lines = this.ship.libs
+      .filter((lib) => !lib.outside && lib.prs.length > 0)
+      .map(
+        (lib) => `- ${lib.repo} (input ${lib.input}): ${lib.prs.map((pr) => `#${pr.number} ${pr.title}`).join("; ")}`,
+      );
+    return lines.length > 0
+      ? `\n\n## Libraries in this ship\nThe configuration gets their new releases through flake.lock after them:\n${lines.join("\n")}`
+      : "";
   }
 
   private async reviewLibrary(
@@ -987,6 +1039,11 @@ class Shipping {
     n.inputs = this.ship.libs
       .filter((lib) => !lib.outside && lib.state === "done" && ((lib.release && lib.tag) || lib.behind))
       .map((lib) => lib.input);
+    if ((n.together ?? []).length > 0 && n.inputs.length === 0) {
+      for (const pr of n.together ?? [])
+        await this.problem(n.repo, `#${pr.number} needs a library whose release failed`);
+      n.together = [];
+    }
     if (n.inputs.length > 0) return this.move(n, "update");
     const last = n.prs.at(-1);
     if (!last) return this.move(n, "done");
@@ -1014,23 +1071,52 @@ class Shipping {
    * updated: fetch, start from (or reset to) origin's default branch, nix flake update. The branch
    * holds only the ship's flake.lock change, so a reset loses nothing. A string is the error.
    */
-  private async freshLock(n: NixItem): Promise<string | undefined> {
+  private async freshLock(n: NixItem, onto?: ShipPr, lock = true): Promise<string | undefined> {
     const { config } = this.deps;
     const id = this.ship.id.slice(0, 16).toLowerCase();
-    n.branch = `flake/ship-${id}`;
-    n.worktree = join(config.worktrees, repoName(n.repo), `ship-${id}`);
     await this.git(n.root, ["fetch", "origin", "--prune"]);
     const head = await this.git(n.root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
     const base = head.code === 0 ? head.stdout.trim() : "origin/main";
-    const placed = existsSync(n.worktree)
-      ? await this.git(n.worktree, ["reset", "--hard", base])
-      : await this.git(n.root, ["worktree", "add", "--no-track", "-b", n.branch, n.worktree, base]);
-    if (placed.code !== 0) return `could not put the worktree on ${base}: ${clipStart(outputOf(placed).trim(), 300)}`;
+    if (onto) {
+      // A PR that needs the libraries: its own branch, rebased on the fresh default branch.
+      const placed = await this.onPrBranch(n, onto, base);
+      if (placed) return placed;
+    } else {
+      n.branch = `flake/ship-${id}`;
+      n.worktree = join(config.worktrees, repoName(n.repo), `ship-${id}`);
+      const placed = existsSync(n.worktree)
+        ? await this.git(n.worktree, ["reset", "--hard", base])
+        : await this.git(n.root, ["worktree", "add", "--no-track", "-b", n.branch, n.worktree, base]);
+      if (placed.code !== 0) return `could not put the worktree on ${base}: ${clipStart(outputOf(placed).trim(), 300)}`;
+    }
+    if (!lock) return undefined;
     const update = await this.deps.run("nix", ["flake", "update", ...(n.inputs ?? [])], {
-      cwd: n.worktree,
+      cwd: n.worktree as string,
       timeoutMs: config.checkTimeout * 1000,
     });
     return update.code === 0 ? undefined : `nix flake update failed: ${clipStart(outputOf(update).trim(), 300)}`;
+  }
+
+  /** The worktree of a configuration PR, on its branch as on GitHub, rebased on `base`; a string is why not. */
+  private async onPrBranch(n: NixItem, pr: ShipPr, base: string): Promise<string | undefined> {
+    const branch =
+      pr.branch ??
+      (await this.gh(["pr", "view", String(pr.number), "-R", n.repo, "--json", "headRefName", "--jq", ".headRefName"]));
+    if (!branch) return `no branch for #${pr.number}`;
+    await this.git(n.root, ["fetch", "origin", branch]);
+    const found = await worktreeOf(this.deps.run, n.root, branch);
+    n.branch = branch;
+    n.worktree = found?.path ?? join(this.deps.config.worktrees, repoName(n.repo), `ship-pr-${pr.number}`);
+    const placed = found
+      ? await this.git(n.worktree, ["reset", "--hard", `origin/${branch}`])
+      : await this.git(n.root, ["worktree", "add", "--track", "-B", branch, n.worktree, `origin/${branch}`]);
+    if (placed.code !== 0) return `no worktree for #${pr.number}: ${clipStart(outputOf(placed).trim(), 300)}`;
+    const rebase = await this.deps.run("git", ["rebase", base], { cwd: n.worktree, env: { GIT_EDITOR: "true" } });
+    if (rebase.code !== 0) {
+      await this.git(n.worktree, ["rebase", "--abort"]);
+      return `#${pr.number} does not rebase cleanly on ${base}: ${clipStart(outputOf(rebase).trim(), 300)}`;
+    }
+    return undefined;
   }
 
   /** The flake.lock commit and PR title, in the style of the configuration: no helper needed. */
@@ -1049,6 +1135,9 @@ class Shipping {
   }
 
   private async nixUpdate(n: NixItem): Promise<void> {
+    const at = n.togetherAt ?? 0;
+    const pr = n.together?.[at];
+    if (pr) return this.landWithLock(n, pr, at === 0);
     const error = await this.freshLock(n);
     if (error) return this.fail(n, error);
     const result = await this.deps.gitPr(
@@ -1060,12 +1149,50 @@ class Shipping {
     this.move(n, "check");
   }
 
+  /**
+   * A configuration PR that needs the libraries: on its own branch, rebased on the fresh default
+   * branch; the first one also gets the lock commit. Force-pushed with a lease, then it merges when
+   * green. The PR keeps its title and body.
+   */
+  private async landWithLock(n: NixItem, pr: ShipPr, lock: boolean): Promise<void> {
+    const head = await this.gh([
+      "pr",
+      "view",
+      String(pr.number),
+      "-R",
+      n.repo,
+      "--json",
+      "headRefOid",
+      "--jq",
+      ".headRefOid",
+    ]);
+    const error = await this.freshLock(n, pr, lock);
+    if (error) return this.fail(n, error);
+    const result = await this.deps.gitPr(
+      {
+        path: n.worktree as string,
+        intent: this.lockIntent(n),
+        title: this.lockTitle(n),
+        updatePr: false,
+        ...(head ? { forceWithLease: head } : {}),
+      },
+      { run: this.deps.run, config: this.deps.config, progress: () => {} },
+    );
+    if (!result.ok)
+      return this.fail(n, `#${pr.number} could not be pushed with the new lock: ${clipStart(result.summary, 300)}`);
+    n.pr = pr.number;
+    this.move(n, "check");
+  }
+
   /** The default branch moved and the flake.lock PR conflicts: make it again on the fresh branch. */
   private async refresh(n: NixItem, head: string): Promise<void> {
     if ((n.refreshes ?? 0) >= MAX_REFRESHES) {
       return this.fail(n, `PR #${n.pr} still conflicts after ${MAX_REFRESHES} new locks on the default branch`);
     }
     n.refreshes = (n.refreshes ?? 0) + 1;
+    const at = n.togetherAt ?? 0;
+    const together = n.together?.[at];
+    if (together) return this.landWithLock(n, together, at === 0);
     const error = await this.freshLock(n);
     if (error) return this.fail(n, error);
     const result = await this.deps.gitPr(
@@ -1094,7 +1221,8 @@ class Shipping {
       "mergeable,headRefOid,state",
     ]);
     if (view?.state === "OPEN" && view.mergeable === "CONFLICTING") return this.refresh(n, view.headRefOid);
-    const merged = await this.mergeWhenReady(n.repo, n.pr, await this.mergeMethod(n.repo));
+    // Red with the new lock: really broken, so a helper fixes it (it stops for a behavior change).
+    const merged = await this.mergeWhenReady(n.repo, n.pr, await this.mergeMethod(n.repo), n);
     if (merged === "wait") return this.wait(n, `the checks of PR #${n.pr}`);
     if (merged !== "merged") return this.fail(n, merged);
     const sha = await this.gh([
@@ -1110,6 +1238,12 @@ class Shipping {
     ]);
     if (!sha) return this.wait(n, `the merge commit of PR #${n.pr}`);
     n.mergeSha = sha;
+    // More configuration PRs that needed the libraries: the next one, rebased on the new lock.
+    const at = n.togetherAt ?? 0;
+    if (n.together && n.together[at]?.number === n.pr && at + 1 < n.together.length) {
+      n.togetherAt = at + 1;
+      return this.move(n, "update");
+    }
     this.move(n, "deploy");
   }
 

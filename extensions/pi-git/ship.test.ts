@@ -14,6 +14,7 @@ import {
   loadShip,
   notReady,
   planLines,
+  watchPr as runWatchPr,
   type Ship,
   STAGE_TIMEOUT_MS,
   saveShip,
@@ -110,8 +111,10 @@ function prView(repo: string, args: readonly string[]): Reply {
     number: number;
     state?: string;
   }[];
-  const found = all.find((item) => String(item.number) === n);
+  const found = all.find((item) => String(item.number) === n) as Record<string, unknown> | undefined;
   if (!found) return no;
+  for (const field of ["headRefOid", "headRefName"])
+    if (args.includes(`.${field}`)) return ok(String(found[field] ?? ""));
   return ok({ ...found, state: merged(repo, n) ? "MERGED" : (found.state ?? "OPEN") });
 }
 
@@ -169,7 +172,8 @@ const fixNow = (repo: string, number: number) => {
 };
 let skips: Record<string, { pr: number; reason: string }[]> = {};
 let orders: Record<string, number[]> = {};
-const preflight = async (repo: string) => ({ skips: skips[repo] ?? [], order: orders[repo] });
+let needs: Record<string, Record<number, string[]>> = {};
+const preflight = async (repo: string) => ({ skips: skips[repo] ?? [], order: orders[repo], needs: needs[repo] });
 const tick = () => shipTick({ run: fake, config, gitPr, now: () => clock, watchPr, fixNow, preflight }, 1);
 
 beforeEach(() => {
@@ -205,6 +209,7 @@ beforeEach(() => {
   fixes.length = 0;
   skips = {};
   orders = {};
+  needs = {};
   gitPr.mockReset();
   gitPr.mockResolvedValue({ ok: true, summary: "PR opened", notes: [], pr: { number: 77, url: "u77" } } as never);
 });
@@ -280,7 +285,98 @@ async function plan(releases: string[]): Promise<Ship> {
   return ship;
 }
 
+describe("watchPr", () => {
+  test("follows a PR when its branch already has a worktree", async () => {
+    const branch = `feat/watch-${n}`;
+    const path = join(root, `watch-tree-${n}`);
+    const runner: Runner = async (command, args, options) => {
+      if (command === "git" && args[0] === "worktree") {
+        return ok(
+          `worktree ${nixos}\nHEAD abc\nbranch refs/heads/main\n\nworktree ${path}\nHEAD def\nbranch refs/heads/${branch}\n`,
+        );
+      }
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") {
+        return args.includes(".headRefName")
+          ? ok(branch)
+          : ok({
+              number: 8,
+              url: "https://example/pr/8",
+              title: "feat: watch",
+              state: "OPEN",
+              headRefName: branch,
+              baseRefName: "main",
+            });
+      }
+      return run(command, args, options);
+    };
+
+    expect(await runWatchPr({ run: runner, config, gitPr }, "session", nixos, 8)).toBeUndefined();
+    expect(loadEntries(config.stateDir)).toMatchObject([
+      { repo: "o/Nixos", number: 8, worktree: path, branch, sessionId: "session", quiet: true },
+    ]);
+  });
+
+  test("reports when GitHub cannot read the PR branch", async () => {
+    const runner: Runner = async (command, args, options) => {
+      if (command === "gh") return ok("");
+      return run(command, args, options);
+    };
+    await expect(runWatchPr({ run: runner, config, gitPr }, "session", nixos, 8)).resolves.toBe(
+      "gh could not read the branch",
+    );
+  });
+
+  test("reports when it cannot create the PR worktree", async () => {
+    const branch = `feat/missing-${n}`;
+    const runner: Runner = async (command, args, options) => {
+      if (command === "gh") return ok(branch);
+      if (command === "git" && args[0] === "fetch") return ok("");
+      if (command === "git" && args[0] === "worktree" && args[1] === "add")
+        return { code: 1, stdout: "", stderr: "worktree creation failed" };
+      return run(command, args, options);
+    };
+    await expect(runWatchPr({ run: runner, config, gitPr }, "session", nixos, 8)).resolves.toContain(
+      "no worktree: worktree creation failed",
+    );
+  });
+
+  test("reports when the main checkout cannot be found", async () => {
+    const gh = vi.fn();
+    const runner: Runner = async (command, args, options) => {
+      if (command === "gh") gh();
+      return run(command, args, options);
+    };
+    await expect(runWatchPr({ run: runner, config, gitPr }, "session", join(root, "missing"), 8)).resolves.toContain(
+      "is not in a git repository",
+    );
+    expect(gh).not.toHaveBeenCalled();
+  });
+});
+
 describe("shipTick", () => {
+  test("default preflight asks about repositories without local checkouts and includes the libraries", async () => {
+    await plan(["o/pi-git"]);
+    const prompts: string[] = [];
+    const runner: Runner = async (command, args, options) => {
+      if (command === "pi") {
+        const input = options.input ?? "";
+        prompts.push(input);
+        const numbers = [...input.matchAll(/^## #(\d+)/gm)].map((match) => Number(match[1]));
+        return ok(JSON.stringify({ verdicts: numbers.map((number) => ({ pr: number, action: "ship" })) }));
+      }
+      return fake(command, args, options);
+    };
+
+    const ship = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr, fixNow }, 1);
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts.every((input) => input.includes("No simulation (no local checkout"))).toBe(true);
+    expect(prompts.find((input) => input.includes("## Libraries in this ship"))).toBeDefined();
+    expect(ship?.reviewed).toBe(true);
+    expect(ship?.libs[0]?.state).toBe("release");
+    expect(ship?.nixos.state).toBe("libs");
+  });
+
   test("the whole chain: merge, release, lock, merge, deploy", async () => {
     await plan(["o/pi-git"]);
     let ship = await tick();
@@ -639,9 +735,9 @@ describe("shipTick", () => {
       return fake(command, args, options);
     };
 
-    await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+    await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr, preflight });
     world.releaseRun = { status: "completed", conclusion: "success" };
-    const ship = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr });
+    const ship = await shipTick({ run: runner, config, gitPr, now: () => clock, watchPr, preflight });
 
     expect(commitQueries).toContain("");
     expect(ship?.libs[0]).toMatchObject({ state: "tag", tag: "v0.3.0" });
@@ -703,6 +799,58 @@ describe("shipTick", () => {
     ]);
   });
 
+  test("a NixOS PR that needs a library of the ship lands together with the new lock", async () => {
+    // The NixOS PR uses an option that pi-git adds: red until the new lock is in.
+    const branch = `feat/use-${n}`;
+    g(nixos, "switch", "-q", "-c", branch, "origin/main");
+    writeFileSync(join(nixos, `use-${n}.nix`), "{ }\n");
+    g(nixos, "add", ".");
+    g(nixos, "commit", "-q", "-m", "feat: use the option");
+    g(nixos, "push", "-q", "origin", branch);
+    const sha = g(nixos, "rev-parse", "HEAD");
+    g(nixos, "switch", "-q", "main");
+    const red = [{ __typename: "CheckRun", name: "build", status: "COMPLETED", conclusion: "FAILURE" }];
+    world.prs["o/Nixos"] = [
+      pr(12, "feat: use the option", { headRefName: branch, headRefOid: sha, statusCheckRollup: red }),
+    ];
+    world.releaseRun = { status: "completed", conclusion: "success" };
+    world.tags["o/pi-git@v0.3.0"] = "new-git";
+    world.latest["o/pi-git"] = "new-git";
+    needs = { "o/Nixos": { 12: ["o/pi-git"] } };
+    // Pushing the lock restarts the PR's checks, as on GitHub.
+    gitPr.mockImplementation(async () => {
+      world.prs["o/Nixos"] = [
+        pr(12, "feat: use the option", { headRefName: branch, headRefOid: "with-lock", statusCheckRollup: pending }),
+      ];
+      return { ok: true, summary: "pushed", notes: [] } as never;
+    });
+    await plan(["o/pi-git"]);
+    let ship = await shipTick({ run: fake, config, gitPr, now: () => clock, watchPr, fixNow, preflight });
+    // Not merged early, not handed to a helper: it waited, and got the lock on its own branch.
+    expect(fixes).toEqual([]);
+    expect(world.merged.filter((item) => item.startsWith("o/Nixos"))).toEqual([]);
+    expect(ship?.nixos).toMatchObject({ state: "check", pr: 12, branch });
+    expect(gitPr.mock.calls.at(-1)?.[0]).toMatchObject({
+      title: "flake: lock pi-git v0.3.0, pi-skills latest",
+      updatePr: false,
+      forceWithLease: sha,
+    });
+    expect(calls).toContain("nix flake update pi-git pi-skills");
+    // Green with the lock: merged, then the deploy.
+    world.prs["o/Nixos"] = [pr(12, "feat: use the option", { headRefName: branch, headRefOid: "with-lock" })];
+    ship = await tick();
+    expect(world.merged).toContain("o/Nixos#12");
+    expect(ship?.nixos).toMatchObject({ state: "deploy", mergeSha: "merge-12" });
+  });
+
+  test("a NixOS PR that needs a library that is not shipped is left out", async () => {
+    world.prs["o/Nixos"] = [pr(12, "feat: use the option")];
+    needs = { "o/Nixos": { 12: ["o/elsewhere"] } };
+    await plan([]);
+    const ship = await tick();
+    expect(ship?.skipped).toEqual(["o/Nixos#12 feat: use the option: needs o/elsewhere, which is not shipped"]);
+  });
+
   test("a skipped base takes its stack with it", async () => {
     world.prs["o/pi-git"] = [
       pr(4, "feat: one", { headRefName: "feat/one" }),
@@ -743,7 +891,7 @@ describe("shipTick", () => {
     expect((await tick())?.libs[0]?.error).toMatch(/there is no release PR/);
   });
 
-  test("the flake.lock PR fails its checks", async () => {
+  test("the flake.lock PR fails its checks: a helper gets it, the ship waits", async () => {
     world.prs["o/pi-git"] = [];
     world.prs["o/Nixos"] = [];
     await plan([]);
@@ -757,7 +905,9 @@ describe("shipTick", () => {
       state: "OPEN",
     };
     const ship = await tick();
-    expect(ship?.nixos).toMatchObject({ state: "failed", error: "#77: checks fail" });
+    expect(watched).toContain("o/Nixos#77");
+    expect(fixes).toContain("o/Nixos#77");
+    expect(ship?.nixos).toMatchObject({ state: "check", adopted: [77] });
   });
 
   test("the flake.lock PR conflicts after main moved: made again on the fresh main, at most 3 times", async () => {

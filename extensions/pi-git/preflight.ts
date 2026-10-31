@@ -203,6 +203,8 @@ export interface Verdict {
   reason: string;
   /** PRs that must land first, because this one uses what they add (not for plain file overlap). */
   after?: number[];
+  /** For a configuration PR: the library repositories of this ship whose new release it needs. */
+  needs?: string[];
 }
 
 export const PREFLIGHT_PROMPT = [
@@ -222,27 +224,60 @@ export const PREFLIGHT_PROMPT = [
   'When a PR uses what another PR here adds (a function, a file, a setting), give that PR in "after", so it',
   "lands first. Not for PRs that only touch the same files: the order is found by merging.",
   "",
-  'Answer with JSON only: {"verdicts": [{"pr": <number>, "action": "ship" | "fix" | "skip", "reason": "<one sentence>", "after": [<numbers>]}]}',
-  'with one verdict for every PR in the input; "after" may be left out.',
+  "For the NixOS configuration the input also lists the libraries in this ship. When a configuration PR uses",
+  'what such a library adds (a new option, module or package), give those repositories in "needs" and the',
+  'action "ship": it lands together with the new lock. Its checks may fail until then; that is no reason to fix it.',
+  "",
+  'Answer with JSON only: {"verdicts": [{"pr": <number>, "action": "ship" | "fix" | "skip", "reason": "<one sentence>", "after": [<numbers>], "needs": ["<owner/repo>"]}]}',
+  'with one verdict for every PR in the input; "after" and "needs" may be left out.',
 ].join("\n");
+
+function numbersIn(value: unknown): number[] {
+  return Array.isArray(value) ? (value as unknown[]).filter((n): n is number => typeof n === "number") : [];
+}
+
+function verdictList(value: unknown): Record<string, unknown>[] | Error {
+  const list = (value as { verdicts?: unknown })?.verdicts;
+  return Array.isArray(list) ? (list as Record<string, unknown>[]) : new Error('expected {"verdicts": [...]}');
+}
+
+function stringsIn(value: unknown): string[] {
+  return Array.isArray(value) ? (value as unknown[]).filter((item): item is string => typeof item === "string") : [];
+}
+
+function parseVerdict(item: Record<string, unknown>): Verdict | Error {
+  if (typeof item.pr !== "number" || !["ship", "fix", "skip"].includes(item.action as string)) {
+    return new Error("every verdict needs pr (a number) and action (ship, fix or skip)");
+  }
+  const after = numbersIn(item.after);
+  const needs = stringsIn(item.needs);
+  return {
+    pr: item.pr,
+    action: item.action as Action,
+    reason: typeof item.reason === "string" ? item.reason : "",
+    ...(after.length > 0 ? { after } : {}),
+    ...(needs.length > 0 ? { needs } : {}),
+  };
+}
+
+function missingVerdicts(numbers: readonly number[], verdicts: Verdict[]): number[] {
+  return numbers.filter((number) => !verdicts.some((verdict) => verdict.pr === number));
+}
 
 export function parseVerdicts(numbers: readonly number[]) {
   return (value: unknown): Verdict[] | Error => {
-    const list = (value as { verdicts?: unknown })?.verdicts;
-    if (!Array.isArray(list)) return new Error('expected {"verdicts": [...]}');
+    const list = verdictList(value);
+    if (list instanceof Error) return list;
     const verdicts: Verdict[] = [];
-    for (const item of list as Record<string, unknown>[]) {
-      if (typeof item.pr !== "number" || !["ship", "fix", "skip"].includes(item.action as string)) {
-        return new Error("every verdict needs pr (a number) and action (ship, fix or skip)");
-      }
-      verdicts.push({
-        pr: item.pr,
-        action: item.action as Action,
-        reason: typeof item.reason === "string" ? item.reason : "",
-      });
+    for (const item of list) {
+      const verdict = parseVerdict(item);
+      if (verdict instanceof Error) return verdict;
+      verdicts.push(verdict);
     }
-    const missing = numbers.filter((n) => !verdicts.some((v) => v.pr === n));
-    return missing.length > 0 ? new Error(`no verdict for ${missing.map((n) => `#${n}`).join(", ")}`) : verdicts;
+    const missing = missingVerdicts(numbers, verdicts);
+    return missing.length > 0
+      ? new Error(`no verdict for ${missing.map((number) => `#${number}`).join(", ")}`)
+      : verdicts;
   };
 }
 

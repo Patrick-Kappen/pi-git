@@ -190,6 +190,10 @@ from open PRs to a deployed host:
    depends on a PR that is not shipped, unfinished). A stacked PR whose base is skipped is skipped
    too. The skipped PRs are reported once, as a notification and in the history; the rest ships.
    Stacked PRs go to the watcher before their base merges, so they are rebased at once afterwards.
+   A configuration PR that uses what a library of the ship adds (a new option, module or package) is
+   not merged early and not "fixed": it waits for the releases and lands with the new lock on its own
+   branch (rebased on the fresh default branch), instead of a separate flake.lock PR. Several such PRs
+   land one after the other; one that needs a library that is not shipped is left out.
 4. **Run**: the watcher advances the ship, out of the agents' sight (every 5 seconds, beside the PR
    watcher): every PR oldest first, each round; green ones merge, conflicting ones get a helper at once
    and at the same time;

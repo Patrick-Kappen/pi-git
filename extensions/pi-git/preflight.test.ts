@@ -125,6 +125,20 @@ describe("the agent's part", () => {
     ]);
   });
 
+  test("parseVerdicts keeps after and needs", () => {
+    expect(
+      parseVerdicts([1, 2])({
+        verdicts: [
+          { pr: 1, action: "ship", reason: "", after: [2, "x"] },
+          { pr: 2, action: "ship", reason: "", needs: ["o/lib", 3] },
+        ],
+      }),
+    ).toEqual([
+      { pr: 1, action: "ship", reason: "", after: [2] },
+      { pr: 2, action: "ship", reason: "", needs: ["o/lib"] },
+    ]);
+  });
+
   test("preflightInput shows each PR with its simulation", () => {
     const input = preflightInput(
       "o/r",
