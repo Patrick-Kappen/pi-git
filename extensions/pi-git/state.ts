@@ -145,6 +145,24 @@ export function claimSummary(stateDir: string, id: string): boolean {
   }
 }
 
+/** Delete delivered summaries older than \`maxAgeMs\`; returns how many. */
+export function pruneDelivered(stateDir: string, maxAgeMs: number, now = Date.now()): number {
+  const { delivered } = dirs(stateDir);
+  let count = 0;
+  for (const name of list(delivered)) {
+    const path = join(delivered, name);
+    try {
+      if (now - statSync(path).mtimeMs > maxAgeMs) {
+        rmSync(path, { force: true });
+        count++;
+      }
+    } catch {
+      // Deleted by another round in the meantime.
+    }
+  }
+  return count;
+}
+
 /** Mark a session as running. */
 export function heartbeat(runtimeDir: string, sessionId: string, now = new Date()): void {
   const { sessions } = dirs(runtimeDir);

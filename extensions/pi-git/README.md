@@ -102,6 +102,8 @@ and looks for summaries every 20 seconds:
 - when that session is gone (no heartbeat for 90 seconds), the next session in the same repository
   takes it, so nothing is lost when pi was closed.
 
+Delivered summaries stay in `<stateDir>/delivered` for seven days, then the watcher deletes them.
+
 `delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
 adds it to the context for your next prompt, `notify` only shows it to you.
 
