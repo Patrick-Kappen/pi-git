@@ -1,3 +1,5 @@
+import type { Step } from "./switch.ts";
+
 /**
  * In a helper process that fixes files, git_pr and the watcher do every git and GitHub step
  * themselves. The helper may read with git (status, diff, log, show) but not change the history,
@@ -219,10 +221,19 @@ export function ghWrites(args: readonly string[]): boolean {
   return !READ_GH.has(group) && !READ_GH.has(`${group} ${command}`);
 }
 
+/** The step a git subcommand belongs to: pushing, starting work (worktrees and branches), or committing. */
+export function gitStep(sub: string): Step {
+  if (sub === "push") return "push";
+  if (sub === "worktree" || sub === "branch") return "worktree";
+  return "commit";
+}
+
 /** A git or gh command that changes something, and where. */
 export interface GitChange {
   /** For messages: `git commit`, `gh pr create`. */
   what: string;
+  /** The lock that applies: gh changes are `pr`. */
+  step: Step;
   /** The directory it runs in. */
   dir: string;
   /** The repository, when the command names it (`gh -R owner/name`). */
@@ -245,7 +256,7 @@ function gitChange(words: readonly string[], dir: string, home: string): GitChan
     } else if (GIT_OPTIONS_WITH_VALUE.has(word)) {
       i++;
     } else if (!word.startsWith("-")) {
-      return gitWrites(word, words.slice(i + 1)) ? { what: `git ${word}`, dir: where } : undefined;
+      return gitWrites(word, words.slice(i + 1)) ? { what: `git ${word}`, step: gitStep(word), dir: where } : undefined;
     }
   }
   return undefined;
@@ -261,7 +272,7 @@ function ghChange(words: readonly string[], dir: string): GitChange | undefined 
     .filter((arg) => !arg.startsWith("-"))
     .slice(0, 2)
     .join(" ")}`;
-  return slug ? { what, dir, slug } : { what, dir };
+  return slug ? { what, step: "pr", dir, slug } : { what, step: "pr", dir };
 }
 
 /** The git and gh commands of a bash line that change something, with the directory each runs in (after `cd`). */

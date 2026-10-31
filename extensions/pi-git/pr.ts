@@ -7,6 +7,7 @@ import { commitStyle, findPullRequest, inspectWorktree, type PullRequest, prNumb
 import { askJson, runHelper } from "./helper.ts";
 import { stringField } from "./json.ts";
 import { fixPrompt, messagePrompt, messageRetryPrompt, pullRequestPrompt, type Stage } from "./prompts.ts";
+import type { Step } from "./switch.ts";
 
 export interface PrInput {
   /** A directory in the worktree. */
@@ -39,6 +40,13 @@ export interface Deps {
   config: Config;
   progress: (text: string) => void;
   signal?: AbortSignal | undefined;
+  /** Whether a step may run; a run stops before the first locked step. Default: every step. */
+  allowed?: (step: Step) => boolean;
+}
+
+/** Why a run stopped before a step. */
+function stoppedAt(step: Step, done: string): string {
+  return `${done}Stopped before ${step}: ${step} is locked here. Ask the user to run /git unlock ${step}, or /git ${step} for one time.`;
 }
 
 /** Diff and log text in a helper's input is cut to this many characters. */
@@ -100,6 +108,8 @@ class Flow {
   git(args: string[], timeoutMs?: number): Promise<RunResult> {
     return this.deps.run("git", args, {
       cwd: this.wt.root,
+      // pi-git checked the lock itself; the hard stop in the git hooks is for the agents' own commands.
+      env: { PI_GIT_SWITCH: "" },
       signal: this.deps.signal,
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
     });
@@ -365,57 +375,141 @@ function success(
   };
 }
 
-/**
- * Commit the changes of a worktree, push them and open (or update) the PR. The checks run as the
- * hooks run them; when they fail, the helper agent fixes the files. The helper also writes the
- * commit message and the PR.
- */
-export async function gitPr(input: PrInput, deps: Deps): Promise<PrResult> {
+/** The worktree, the base, and a flow that fetched the base and knows the commit style; a string is why not. */
+async function start(
+  input: PrInput,
+  deps: Deps,
+): Promise<{ wt: Worktree; flow: Flow; existing: PullRequest | undefined } | PrResult> {
   const wt = await inspectWorktree(deps.run, input.path);
   if (typeof wt === "string") return failed(wt);
   const existing = await findPullRequest(deps.run, wt.root, wt.branch);
   const base = input.base ?? existing?.baseRefName ?? wt.defaultBranch;
   const flow = new Flow(deps, wt, input, base);
+  deps.progress(`fetching origin/${base}`);
+  const fetch = await flow.git(["fetch", "origin", base]);
+  if (fetch.code !== 0) {
+    flow.dispose();
+    return failed(`git fetch origin ${base} failed:\n${outputOf(fetch)}`, flow);
+  }
+  await flow.loadStyle();
+  return { wt, flow, existing };
+}
+
+/**
+ * Commit all changes of a worktree: the pre-commit checks run (the helper fixes failures), the
+ * helper writes the message, the commit-msg hook checks it.
+ */
+export async function gitCommit(input: PrInput, deps: Deps): Promise<PrResult> {
+  const started = await start(input, deps);
+  if ("ok" in started) return started;
+  const { wt, flow } = started;
   try {
-    deps.progress(`fetching origin/${base}`);
-    const fetch = await flow.git(["fetch", "origin", base]);
-    if (fetch.code !== 0) return failed(`git fetch origin ${base} failed:\n${outputOf(fetch)}`, flow);
-    await flow.loadStyle();
+    if ((await flow.gitText("status", "--porcelain")) === "")
+      return failed(`nothing to commit in ${wt.root}`, flow, { worktree: wt });
+    const commit = await flow.commit();
+    if (typeof commit === "string")
+      return failed(`${commit}\n\nThe changes are staged in ${wt.root}.`, flow, { worktree: wt });
+    const fixed =
+      flow.notes.length > 0
+        ? `\nThe helper fixed on the way:\n${flow.notes.map((note) => `- ${note}`).join("\n")}`
+        : "";
+    return {
+      ok: true,
+      summary: `Committed ${commit.sha} "${commit.subject}" on ${wt.branch}; the pre-commit checks passed.${fixed}`,
+      worktree: wt,
+      base: flow.base,
+      commit,
+      notes: flow.notes,
+    };
+  } finally {
+    flow.dispose();
+  }
+}
 
-    let commit: PrResult["commit"];
-    if ((await flow.gitText("status", "--porcelain")) !== "") {
-      const made = await flow.commit();
-      if (typeof made === "string")
-        return failed(`${made}\n\nThe changes are staged in ${wt.root}; nothing was pushed.`, flow, { worktree: wt });
-      commit = made;
-    }
-    if ((await flow.gitText("rev-list", "--count", `origin/${base}..HEAD`)) === "0") {
-      return failed(`nothing to do: no changes in ${wt.root} and no commits ahead of origin/${base}`, flow, {
-        worktree: wt,
-      });
-    }
+type Commit = PrResult["commit"];
 
-    deps.progress("pre-push: pushing (the hook runs the checks)");
-    const pushed = await flow.untilGreen("pre-push", flow.push, flow.commitFix);
-    if (pushed !== undefined)
-      return failed(`The push failed:\n${pushed}\n\nNothing new is on GitHub.`, flow, {
-        worktree: wt,
-        ...(commit ? { commit } : {}),
-      });
+/** Stop before a locked step: an error when nothing was done yet, else what was done. */
+function stop(step: Step, flow: Flow, wt: Worktree, commit: Commit): PrResult {
+  if (!commit) return failed(stoppedAt(step, ""), flow, { worktree: wt });
+  const done = `Committed ${commit.sha} "${commit.subject}" on ${wt.branch}. `;
+  return { ok: true, summary: stoppedAt(step, done), worktree: wt, base: flow.base, commit, notes: flow.notes };
+}
 
-    if (input.updatePr === false) {
-      return {
-        ok: true,
-        summary: `Pushed ${wt.branch}.`,
-        worktree: wt,
-        base,
-        ...(commit ? { commit } : {}),
-        notes: flow.notes,
-      };
-    }
-    const pr = await flow.pullRequest(existing);
-    if (typeof pr === "string") return failed(`${pr}\n\nThe branch ${wt.branch} is pushed.`, flow, { worktree: wt });
-    return success(flow, wt, commit, pr, input.draft === true);
+/** Commit the changes, when there are any and committing is allowed. */
+async function commitStep(
+  flow: Flow,
+  wt: Worktree,
+  allowed: (step: Step) => boolean,
+): Promise<{ commit: Commit } | PrResult> {
+  if ((await flow.gitText("status", "--porcelain")) === "") return { commit: undefined };
+  if (!allowed("commit")) return stop("commit", flow, wt, undefined);
+  const made = await flow.commit();
+  if (typeof made === "string")
+    return failed(`${made}\n\nThe changes are staged in ${wt.root}; nothing was pushed.`, flow, { worktree: wt });
+  return { commit: made };
+}
+
+/** Push, when there is something to push and pushing is allowed. */
+async function pushStep(flow: Flow, wt: Worktree, commit: Commit, deps: Deps): Promise<PrResult | undefined> {
+  const { base } = flow;
+  if ((await flow.gitText("rev-list", "--count", `origin/${base}..HEAD`)) === "0") {
+    return failed(`nothing to do: no changes in ${wt.root} and no commits ahead of origin/${base}`, flow, {
+      worktree: wt,
+    });
+  }
+  if (!(deps.allowed ?? (() => true))("push")) return stop("push", flow, wt, commit);
+  deps.progress("pre-push: pushing (the hook runs the checks)");
+  const pushed = await flow.untilGreen("pre-push", flow.push, flow.commitFix);
+  if (pushed === undefined) return undefined;
+  return failed(`The push failed:\n${pushed}\n\nNothing new is on GitHub.`, flow, {
+    worktree: wt,
+    ...(commit ? { commit } : {}),
+  });
+}
+
+/** Everything after the push: stop, or open or update the PR. */
+async function prStep(
+  input: PrInput,
+  deps: Deps,
+  flow: Flow,
+  wt: Worktree,
+  commit: Commit,
+  existing: PullRequest | undefined,
+): Promise<PrResult> {
+  const committed = commit ? { commit } : {};
+  if (input.updatePr === false)
+    return {
+      ok: true,
+      summary: `Pushed ${wt.branch}.`,
+      worktree: wt,
+      base: flow.base,
+      ...committed,
+      notes: flow.notes,
+    };
+  if (!(deps.allowed ?? (() => true))("pr")) {
+    const done = `${commit ? `Committed ${commit.sha} "${commit.subject}"; ` : ""}pushed ${wt.branch}. `;
+    return { ok: true, summary: stoppedAt("pr", done), worktree: wt, base: flow.base, ...committed, notes: flow.notes };
+  }
+  const pr = await flow.pullRequest(existing);
+  if (typeof pr === "string") return failed(`${pr}\n\nThe branch ${wt.branch} is pushed.`, flow, { worktree: wt });
+  return success(flow, wt, commit, pr, input.draft === true);
+}
+
+/**
+ * Commit the changes of a worktree, push them and open (or update) the PR. The checks run as the
+ * hooks run them; when they fail, the helper agent fixes the files. The helper also writes the
+ * commit message and the PR. The run stops before the first step that \`deps.allowed\` refuses.
+ */
+export async function gitPr(input: PrInput, deps: Deps): Promise<PrResult> {
+  const started = await start(input, deps);
+  if ("ok" in started) return started;
+  const { wt, flow, existing } = started;
+  try {
+    const committed = await commitStep(flow, wt, deps.allowed ?? (() => true));
+    if ("ok" in committed) return committed;
+    const pushFailed = await pushStep(flow, wt, committed.commit, deps);
+    if (pushFailed) return pushFailed;
+    return await prStep(input, deps, flow, wt, committed.commit, existing);
   } finally {
     flow.dispose();
   }

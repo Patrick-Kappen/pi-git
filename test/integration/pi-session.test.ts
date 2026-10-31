@@ -94,13 +94,13 @@ describe("pi applies the pi-git lock", () => {
     expect(system()).toContain("git: locked in Example-Owner/example-repo.");
     const results = session.messages.filter((message) => message.role === "toolResult").map(text);
     expect(results[0]).toContain("?? a.txt");
-    expect(results[1]).toContain("git changes are locked in Example-Owner/example-repo (git add)");
+    expect(results[1]).toContain("commit is locked in Example-Owner/example-repo (git add)");
     // No commit: the repository has no HEAD yet.
     expect(() => git("rev-parse", "--verify", "-q", "HEAD")).toThrow();
     try {
-      await session.prompt("/git unlock");
+      await session.prompt("/git unlock commit");
       await session.prompt("now commit");
-      expect(system()).toContain("git: unlocked in Example-Owner/example-repo.");
+      expect(system()).toContain("git: commit unlocked in Example-Owner/example-repo.");
       expect(git("log", "--format=%s")).toBe("first");
     } finally {
       session.dispose();

@@ -87,39 +87,63 @@ and looks for summaries every 20 seconds:
 `delivery` decides how it arrives: `turn` (default) starts a turn of the main agent with it, `message`
 adds it to the context for your next prompt, `notify` only shows it to you.
 
+## `git_commit`
+
+| Parameter | Meaning |
+|---|---|
+| `intent` | What the change is for and why: the basis of the commit message. |
+| `path` | A directory in the worktree; default: the working directory. |
+
+Commits all changes of the worktree, as `git_pr` does in its first step: stage everything, run the
+`pre-commit` hook (the helper fixes failures), let the helper write the message, check it with the
+`commit-msg` hook, commit. It does not push.
+
 ## The lock
 
-By default, agents may not change git repositories. pi-git blocks every git and gh command of the
-main agent (and of codemode scripts) that changes something, and `git_pr` and the watcher refuse
-too. Reading stays free: `status`, `diff`, `log`, `show`, `fetch`, `branch --list`, `gh pr view`,
-`gh pr checks`, `gh run view`, `gh api` without a method or fields, and so on. Everything else counts
-as a change: `commit`, `push`, `add`, `checkout`, `rebase`, `branch <name>`, `worktree add`,
-`gh pr create`, `gh pr merge`, ...
+By default, agents may not change git repositories. The lock has four steps, each locked on its own:
+
+| Step | Covers |
+|---|---|
+| `worktree` | Creating and removing worktrees and branches |
+| `commit` | `git_commit`, and git commands that change history or files: `commit`, `add`, `reset`, `rebase`, `checkout`, ... |
+| `push` | Pushing |
+| `pr` | Opening and changing PRs, and other gh commands that change GitHub |
+
+pi-git blocks every git and gh command of the main agent (and of codemode scripts) whose step is
+locked, and the tools follow the same steps. `git_pr` runs as far as it may: with only `commit`
+unlocked it commits and stops before the push, and says so. Reading stays free: `status`, `diff`,
+`log`, `show`, `fetch`, `branch --list`, `gh pr view`, `gh pr checks`, `gh run view`, `gh api` without
+a method or fields, and so on.
 
 You switch it in pi; the model cannot:
 
 | Command | Effect |
 |---|---|
-| `/git` | Shows the state here, the global state and the overrides |
-| `/git unlock`, `/git lock` | This repository (owner/name of `origin`); remembered |
-| `/git reset` | Removes the override of this repository: the global state applies |
-| `/git global unlock`, `/git global lock`, `/git global reset` | The global state; `reset` goes back to the default of the settings (`locked`) |
-
-The agent knows the state from the start: before every prompt, a `pi_git` section of the system
-prompt says `git: locked in owner/name` (what is blocked, what is allowed, and to finish the work and
-ask you for `/git unlock` instead of working around it) or `git: unlocked in owner/name` (use
-`git_pr`). After `/git unlock`, the next prompt carries the new state.
+| `/git` | Shows every step here, where its state comes from, and the overrides |
+| `/git unlock [steps]`, `/git lock [steps]` | This repository (owner/name of `origin`); without steps: all of them. Remembered. |
+| `/git reset [steps]` | Removes this repository's override, so the global state applies |
+| `/git global unlock\|lock\|reset [steps]` | The global state; `reset` goes back to the default of the settings (`locked`) |
+| `/git commit [intent]` | Commits once, as `git_commit` does, also when `commit` is locked: your own action |
 
 A repository's override wins over the global state, which wins over the default. The state is in
 `<stateDir>/switch.json`, so every pi session and the watcher see a change at once. The footer shows
-`git: locked` or `git: unlocked` for the repository of the session.
+`git: locked`, `git: unlocked`, or the unlocked steps (`git: commit unlocked`).
+
+The agent knows the state from the start: before every prompt, a `pi_git` section of the system
+prompt lists the allowed and the blocked steps, and says to finish the work and ask you for
+`/git unlock <step>` (or `/git <step>` once) instead of working around a lock. The next prompt
+carries every change.
 
 The repository of a command is found per command: after `cd`, with `git -C <dir>`, or from
-`gh -R owner/name`. Your own commands (`!git ...` in pi, and your terminal) are never blocked.
+`gh -R owner/name`. Your own commands (`!git ...` in pi, and your terminal) are never blocked. The
+watcher fixes CI only with `commit` and `push` unlocked, and cleans up after a merge only with
+`worktree` unlocked.
 
 **Hard stop.** pi-git sets `PI_GIT_SWITCH` (the switch file) and `PI_GIT_DEFAULT` in pi's process, so
-the agents' commands inherit them. A git hook can read them and refuse commits and pushes in a
-locked repository, also when a script runs git; see the main README.
+the agents' commands inherit them. A git hook can read them and refuse a commit (`commit` step) or a
+push (`push` step) in a locked repository, also when a script runs git; see the main README. pi-git
+runs its own git commands without `PI_GIT_SWITCH`: it checked the lock itself, and `/git commit`
+must work while `commit` is locked.
 
 ## The helper
 

@@ -101,9 +101,10 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Whether git changes by agents are locked where /git says nothing: commits, pushes, branches,
-        rebases, and gh commands that change GitHub. Unlock one repository with /git unlock in pi;
-        that is remembered. /git global unlock changes the global state.
+        Whether git changes by agents are locked where /git says nothing. The lock has four steps:
+        worktree, commit, push and pr. Unlock steps of one repository with /git unlock [steps] in pi;
+        that is remembered. /git global unlock [steps] changes the global state, and /git commit
+        commits once.
       '';
     };
 
