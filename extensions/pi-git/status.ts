@@ -96,7 +96,7 @@ interface PrView {
 }
 
 /** The worktree that has `branch` checked out, from `git worktree list` of the repository. */
-async function worktreeOf(
+export async function worktreeOf(
   run: Runner,
   cwd: string,
   branch: string,
@@ -116,7 +116,7 @@ async function worktreeOf(
 /** Hands a PR made outside git_pr to the watcher. Needs a worktree that has its branch checked out. */
 export async function gitWatch(
   deps: StatusDeps,
-  input: { pr: string; path: string; sessionId: string },
+  input: { pr: string; path: string; sessionId: string; quiet?: boolean },
   now = new Date(),
 ): Promise<{ ok: boolean; summary: string; entry?: Entry }> {
   const origin = await git(deps.run, input.path, "remote", "get-url", "origin");
@@ -156,6 +156,7 @@ export async function gitWatch(
     errors: 0,
     notes: previous?.notes ?? [],
     updated: now.toISOString(),
+    ...(input.quiet ? { quiet: true } : {}),
   };
   saveEntry(deps.config.stateDir, entry);
   return {
