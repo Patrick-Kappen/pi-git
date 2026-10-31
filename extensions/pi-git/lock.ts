@@ -1,11 +1,18 @@
-import { effective, isStep, type Lock, loadSwitch, STEPS, type Step } from "./switch.ts";
+import { effective, isStep, type Lock, loadSwitch, type RepoSettings, STEPS, type Step } from "./switch.ts";
 
 /** The state of every step in a repository. */
 export type States = Record<Step, Lock>;
 
-export function statesOf(stateDir: string, slug: string | undefined, fallback: Lock): States {
+export function statesOf(
+  stateDir: string,
+  slug: string | undefined,
+  fallback: Lock,
+  settings: RepoSettings = {},
+): States {
   const value = loadSwitch(stateDir);
-  return Object.fromEntries(STEPS.map((step) => [step, effective(value, slug, step, fallback).lock])) as States;
+  return Object.fromEntries(
+    STEPS.map((step) => [step, effective(value, slug, step, fallback, settings).lock]),
+  ) as States;
 }
 
 function where(slug: string | undefined): string {
@@ -55,12 +62,22 @@ export function lockPrompt(states: States, slug: string | undefined): string {
 }
 
 /** The text of /git: the state of every step here, and where it comes from. */
-export function describeLock(stateDir: string, slug: string | undefined, fallback: Lock): string {
+export function describeLock(
+  stateDir: string,
+  slug: string | undefined,
+  fallback: Lock,
+  settings: RepoSettings = {},
+): string {
   const value = loadSwitch(stateDir);
   const lines = [`git ${slug ? `in ${slug}` : "here"}:`];
   for (const step of STEPS) {
-    const state = effective(value, slug, step, fallback);
-    const source = { repo: "this repository", global: "global", default: "default" }[state.source];
+    const state = effective(value, slug, step, fallback, settings);
+    const source = {
+      repo: "/git, this repository",
+      settings: `settings, ${state.pattern}`,
+      global: "/git global",
+      default: "default of the settings",
+    }[state.source];
     lines.push(`  ${step.padEnd(8)} ${state.lock.padEnd(8)} (${source})`);
   }
   const overrides = Object.entries(value.repos);

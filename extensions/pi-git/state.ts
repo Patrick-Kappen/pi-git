@@ -144,22 +144,22 @@ export function claimSummary(stateDir: string, id: string): boolean {
 }
 
 /** Mark a session as running. */
-export function heartbeat(stateDir: string, sessionId: string, now = new Date()): void {
-  const { sessions } = dirs(stateDir);
+export function heartbeat(runtimeDir: string, sessionId: string, now = new Date()): void {
+  const { sessions } = dirs(runtimeDir);
   mkdirSync(sessions, { recursive: true });
   const path = join(sessions, sessionId);
   writeFileSync(path, "");
   utimesSync(path, now, now);
 }
 
-export function endSession(stateDir: string, sessionId: string): void {
-  rmSync(join(dirs(stateDir).sessions, sessionId), { force: true });
+export function endSession(runtimeDir: string, sessionId: string): void {
+  rmSync(join(dirs(runtimeDir).sessions, sessionId), { force: true });
 }
 
 /** Whether a session sent a heartbeat within \`maxAgeMs\`. */
-export function sessionAlive(stateDir: string, sessionId: string, maxAgeMs: number, now = Date.now()): boolean {
+export function sessionAlive(runtimeDir: string, sessionId: string, maxAgeMs: number, now = Date.now()): boolean {
   try {
-    return now - statSync(join(dirs(stateDir).sessions, sessionId)).mtimeMs <= maxAgeMs;
+    return now - statSync(join(dirs(runtimeDir).sessions, sessionId)).mtimeMs <= maxAgeMs;
   } catch {
     return false;
   }
@@ -203,13 +203,13 @@ function staleLock(path: string, maxAgeMs: number, now: number, boot: string | u
  * than \`maxAgeMs\`, when it is from before a reboot, or when its process is gone.
  */
 export function lock(
-  stateDir: string,
+  runtimeDir: string,
   name: string,
   maxAgeMs: number,
   now = Date.now(),
   boot = bootId(),
 ): (() => void) | undefined {
-  const { locks } = dirs(stateDir);
+  const { locks } = dirs(runtimeDir);
   mkdirSync(locks, { recursive: true });
   const path = join(locks, name);
   const owner = JSON.stringify({ pid: process.pid, ...(boot === undefined ? {} : { boot }) });

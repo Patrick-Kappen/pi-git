@@ -352,7 +352,7 @@ describe("tick", () => {
   });
 
   test("another watcher holds the lock", async () => {
-    const release = lock(config.stateDir, "watcher", 60_000);
+    const release = lock(config.runtimeDir, "watcher", 60_000);
     expect(await once()).toBe(0);
     expect(logs).toEqual(["another watcher is running"]);
     release?.();
