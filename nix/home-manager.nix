@@ -9,6 +9,24 @@
 let
   cfg = config.programs.pi-git;
   json = pkgs.formats.json { };
+  configFile = "${config.home.homeDirectory}/${cfg.agentDir}/pi-git.json";
+  watcherPath = lib.concatStringsSep ":" [
+    (lib.makeBinPath (
+      [
+        pkgs.git
+        pkgs.gh
+        pkgs.nodejs_24
+        pkgs.openssh
+        pkgs.coreutils
+        pkgs.bash
+      ]
+      ++ cfg.watcher.packages
+    ))
+    "${config.home.profileDirectory}/bin"
+    "/etc/profiles/per-user/${config.home.username}/bin"
+    "/run/current-system/sw/bin"
+    "/run/wrappers/bin"
+  ];
 in
 {
   options.programs.pi-git = {
@@ -78,9 +96,76 @@ in
       default = 900;
       description = "Seconds for one helper run.";
     };
+
+    delivery = lib.mkOption {
+      type = lib.types.enum [
+        "turn"
+        "message"
+        "notify"
+      ];
+      default = "turn";
+      description = ''
+        How a summary of the watcher reaches the main agent: `turn` starts a turn with it, `message`
+        adds it to the context for your next prompt, `notify` only shows it to you.
+      '';
+    };
+
+    watcher = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Run the watcher, a systemd user timer that follows the PRs of git_pr.";
+      };
+
+      interval = lib.mkOption {
+        type = lib.types.str;
+        default = "1min";
+        description = "How often the watcher runs (a systemd time span).";
+      };
+
+      packages = lib.mkOption {
+        type = lib.types.listOf lib.types.package;
+        default = [ ];
+        description = "Extra tools on the watcher's PATH, for the hooks of your repositories.";
+      };
+
+      environment = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = {
+          SSH_AUTH_SOCK = "%t/ssh-agent";
+        };
+        description = "Extra environment of the watcher, for example the SSH agent for git push.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    systemd.user = lib.mkIf cfg.watcher.enable {
+      services.pi-git-watcher = {
+        Unit.Description = "pi-git watcher: follows the PRs of git_pr";
+        Service = {
+          Type = "oneshot";
+          ExecStart = "${pkgs.nodejs_24}/bin/node ${cfg.package}/watcher.ts";
+          Environment = lib.mapAttrsToList (name: value: "${name}=${value}") (
+            {
+              PATH = watcherPath;
+              PI_GIT_CONFIG = configFile;
+            }
+            // cfg.watcher.environment
+          );
+        };
+      };
+      timers.pi-git-watcher = {
+        Unit.Description = "Run the pi-git watcher";
+        Timer = {
+          OnBootSec = "2min";
+          OnUnitInactiveSec = cfg.watcher.interval;
+        };
+        Install.WantedBy = [ "timers.target" ];
+      };
+    };
+
     home.file = {
       "${cfg.agentDir}/extensions/pi-git".source = cfg.package;
       "${cfg.agentDir}/pi-git.json".source = json.generate "pi-git.json" (
@@ -92,6 +177,7 @@ in
             attempts
             checkTimeout
             helperTimeout
+            delivery
             ;
         }
         // lib.optionalAttrs (cfg.skill != null) { skill = "${cfg.skill}"; }

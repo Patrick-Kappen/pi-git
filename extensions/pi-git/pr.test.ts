@@ -272,4 +272,23 @@ describe("gitPr", () => {
     );
     expect((await pr()).summary).toContain("gh pr edit failed:\nedit refused");
   });
+  test("for the watcher: push without touching the PR", async () => {
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    const result = await pr({ updatePr: false });
+    expect(result).toMatchObject({ ok: true, summary: `Pushed feat/topic-${counter}.` });
+    expect(readFileSync(ghLog, "utf8")).not.toContain("pr create");
+  });
+
+  test("for the watcher: a force-push with a lease after a rebase", async () => {
+    const branch = `feat/topic-${counter}`;
+    writeFileSync(join(worktree, "a.txt"), "a\n");
+    sh(worktree, "add", "-A");
+    sh(worktree, "commit", "-q", "-m", "feat: first");
+    sh(worktree, "push", "-q", "-u", "origin", branch);
+    const lease = sh(worktree, "rev-parse", "HEAD");
+    sh(worktree, "commit", "-q", "--amend", "-m", "feat: rewritten");
+    expect((await pr({ updatePr: false, forceWithLease: "0000000000000000000000000000000000000000" })).ok).toBe(false);
+    expect((await pr({ updatePr: false, forceWithLease: lease })).ok).toBe(true);
+    expect(sh(origin, "log", "-1", "--format=%s", branch)).toBe("feat: rewritten");
+  });
 });

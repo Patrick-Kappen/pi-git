@@ -8,9 +8,22 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Config, loadConfig } from "./config.ts";
 import { type Runner, run } from "./exec.ts";
+import { repoSlug } from "./git.ts";
 import { blockedForHelper } from "./guard.ts";
 import { HELPER_ENV } from "./helper.ts";
 import { gitPr, type PrResult } from "./pr.ts";
+import {
+  claimSummary,
+  type Entry,
+  endSession,
+  entryId,
+  heartbeat,
+  loadEntries,
+  loadSummaries,
+  type Summary,
+  saveEntry,
+  sessionAlive,
+} from "./state.ts";
 
 export interface Options {
   env?: NodeJS.ProcessEnv;
@@ -19,7 +32,59 @@ export interface Options {
 }
 
 /** The pi methods this extension uses; a subset of ExtensionAPI, so tests can pass a fake. */
-export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool">;
+export type PiGitApi = Pick<ExtensionAPI, "on" | "registerTool" | "sendMessage">;
+
+/** How often a session sends its heartbeat and looks for summaries. */
+export const POLL_MS = 20_000;
+/** A session without a heartbeat for this long is gone; its summaries go to another session of the repository. */
+export const SESSION_MAX_AGE_MS = 90_000;
+export const MESSAGE_TYPE = "pi-git";
+
+/** Queue a PR for the watcher. A PR that is already queued starts over: new head, same fixes count. */
+export function enqueue(
+  config: Config,
+  result: PrResult,
+  intent: string,
+  sessionId: string,
+  now = new Date(),
+): Entry | undefined {
+  const { pr, worktree } = result;
+  if (!pr || !worktree) return undefined;
+  const id = entryId(worktree.slug, pr.number);
+  const previous = loadEntries(config.stateDir).find((entry) => entry.id === id);
+  const entry: Entry = {
+    id,
+    repo: worktree.slug,
+    number: pr.number,
+    url: pr.url,
+    worktree: worktree.root,
+    mainRoot: worktree.mainRoot,
+    branch: worktree.branch,
+    base: result.base ?? worktree.defaultBranch,
+    intent,
+    sessionId,
+    status: "watching",
+    attempts: previous?.attempts ?? 0,
+    errors: 0,
+    notes: previous?.notes ?? [],
+    updated: now.toISOString(),
+  };
+  saveEntry(config.stateDir, entry);
+  return entry;
+}
+
+/** Whether a session should take a summary: its own, or one of a gone session in the same repository. */
+export function takes(
+  summary: Summary,
+  sessionId: string,
+  slug: string | undefined,
+  config: Config,
+  now = Date.now(),
+): boolean {
+  if (summary.sessionId === sessionId) return true;
+  if (sessionAlive(config.stateDir, summary.sessionId, SESSION_MAX_AGE_MS, now)) return false;
+  return slug !== undefined && summary.repo.toLowerCase() === slug.toLowerCase();
+}
 
 const PR_DESCRIPTION = [
   "Commit the changes of a worktree, push them and open or update the PR, without doing it by hand.",
@@ -61,9 +126,57 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
   }
 
   let config: Config = loadConfig(env, home);
-  pi.on("session_start", (_event, ctx) => {
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let sessionId = "";
+  let slug: string | undefined;
+
+  const send = (text: string, ctx: ExtensionContext): void => {
+    if (config.delivery === "notify") {
+      if (ctx.hasUI) ctx.ui.notify(text, "info");
+      return;
+    }
+    const options =
+      config.delivery === "turn"
+        ? ({ triggerTurn: true, deliverAs: "followUp" } as const)
+        : ({ deliverAs: "nextTurn" } as const);
+    pi.sendMessage({ customType: MESSAGE_TYPE, content: text, display: true }, options);
+  };
+
+  const deliver = (ctx: ExtensionContext): void => {
+    for (const summary of loadSummaries(config.stateDir)) {
+      if (takes(summary, sessionId, slug, config) && claimSummary(config.stateDir, summary.id)) send(summary.text, ctx);
+    }
+  };
+
+  const poll = (ctx: ExtensionContext): void => {
+    try {
+      heartbeat(config.stateDir, sessionId);
+      deliver(ctx);
+    } catch {
+      // The state directory may not be writable; git_pr still works.
+    }
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
     config = loadConfig(env, home);
     if (config.errors.length > 0 && ctx.hasUI) ctx.ui.notify(`pi-git:\n${config.errors.join("\n")}`, "warning");
+    sessionId = ctx.sessionManager.getSessionId();
+    const origin = await runner("git", ["remote", "get-url", "origin"], { cwd: ctx.cwd });
+    slug = origin.code === 0 ? repoSlug(origin.stdout) : undefined;
+    if (timer) clearInterval(timer);
+    poll(ctx);
+    timer = setInterval(() => poll(ctx), POLL_MS);
+    timer.unref?.();
+  });
+
+  pi.on("session_shutdown", () => {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    try {
+      if (sessionId) endSession(config.stateDir, sessionId);
+    } catch {
+      // Nothing to clean up in a state directory that cannot be written.
+    }
   });
 
   pi.registerTool({
@@ -94,8 +207,16 @@ export function createPiGit(pi: PiGitApi, options: Options = {}): void {
         { run: runner, config, progress, signal },
       );
       if (!result.ok) throw new Error(result.summary);
+      let text = result.summary;
+      try {
+        if (enqueue(config, result, params.intent, ctx.sessionManager.getSessionId())) {
+          text += "\nThe watcher follows CI and conflicts, and reports back when the PR is green, merged or needs you.";
+        }
+      } catch (error) {
+        text += `\nThe watcher could not queue the PR: ${(error as Error).message}`;
+      }
       return {
-        content: [{ type: "text", text: result.summary }],
+        content: [{ type: "text", text }],
         details: { pr: result.pr, commit: result.commit, notes: result.notes },
       };
     },

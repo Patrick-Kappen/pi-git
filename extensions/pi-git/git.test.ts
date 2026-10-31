@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "vitest";
 import type { Runner } from "./exec.ts";
 import { run } from "./exec.ts";
-import { commitStyle, findPullRequest, inspectWorktree, prNumber, repoName } from "./git.ts";
+import { commitStyle, findPullRequest, inspectWorktree, prNumber, repoName, repoSlug } from "./git.ts";
 
 describe("repoName", () => {
   test.each([
@@ -15,6 +15,16 @@ describe("repoName", () => {
     ["git@host:repo", "repo"],
   ])("%s", (url, name) => {
     expect(repoName(url)).toBe(name);
+  });
+});
+
+describe("repoSlug", () => {
+  test.each([
+    ["git@github.com:Owner/repo.git", "Owner/repo"],
+    ["https://github.com/owner/repo/", "owner/repo"],
+    ["ssh://git@github.com/owner/repo.git", "owner/repo"],
+  ])("%s", (url, slug) => {
+    expect(repoSlug(url)).toBe(slug);
   });
 });
 
@@ -67,6 +77,8 @@ describe("inspectWorktree", () => {
       branch: "trunk",
       defaultBranch: "main",
       repo: "repo",
+      slug: "o/repo",
+      mainRoot: "/m",
     });
     const noOrigin = { ...base, "git remote get-url origin": { code: 2, stdout: "" } };
     expect(await inspectWorktree(fake(noOrigin), "/w")).toBe('/w has no remote "origin"');

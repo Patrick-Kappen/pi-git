@@ -19,6 +19,8 @@ let
           enable = true;
           model = "anthropic/claude-haiku-4-5";
           skill = ../test/nix/git-skill;
+          delivery = "message";
+          watcher.environment.SSH_AUTH_SOCK = "%t/ssh-agent";
         };
       }
     ];
@@ -43,7 +45,14 @@ in
         agent=.pi/agent
         test -f "$homeFiles/$agent/extensions/pi-git/index.ts"
         test ! -e "$homeFiles/$agent/extensions/pi-git/index.test.ts"
-        jq -e '.model == "anthropic/claude-haiku-4-5" and .thinking == "xhigh" and .attempts == 3' "$homeFiles/$agent/pi-git.json"
+        jq -e '.model == "anthropic/claude-haiku-4-5" and .thinking == "xhigh" and .attempts == 3 and .delivery == "message"' "$homeFiles/$agent/pi-git.json"
+        unit="$homeFiles/.config/systemd/user/pi-git-watcher.service"
+        grep -q "ExecStart=.*/bin/node .*/watcher.ts" "$unit"
+        grep -q "SSH_AUTH_SOCK=%t/ssh-agent" "$unit"
+        grep -q "PI_GIT_CONFIG=/home/check/.pi/agent/pi-git.json" "$unit"
+        test -f "$homeFiles/.config/systemd/user/pi-git-watcher.timer"
+        # One round of the watcher with an empty queue.
+        PI_GIT_CONFIG="$homeFiles/$agent/pi-git.json" node "$homeFiles/$agent/extensions/pi-git/watcher.ts" | grep -q "0 PR(s) checked"
         test -f "$(jq -r .skill "$homeFiles/$agent/pi-git.json")/SKILL.md"
         cp "$smoke" smoke.ts
         node smoke.ts "$homeFiles" "$agent"
