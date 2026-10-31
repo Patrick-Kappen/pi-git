@@ -270,7 +270,12 @@ in
 
     systemd.user = lib.mkIf cfg.watcher.enable {
       services.pi-git-watcher = {
-        Unit.Description = "pi-git watcher: follows the PRs of git_pr";
+        Unit = {
+          Description = "pi-git watcher: follows the PRs of git_pr";
+          # A run stays alive while a ship runs, and a ship waits for the deploy of this machine. A
+          # switch must not wait for (or restart) the run: the timer starts the new version next time.
+          X-RestartIfChanged = false;
+        };
         Service = {
           Type = "oneshot";
           ExecStart = "${pkgs.nodejs_24}/bin/node ${cfg.package}/watcher.ts";

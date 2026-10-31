@@ -67,6 +67,8 @@ in
         grep -q "ExecStart=.*/bin/node .*/watcher.ts" "$unit"
         grep -q "SSH_AUTH_SOCK=%t/ssh-agent" "$unit"
         grep -q "PI_GIT_CONFIG=/home/check/.pi/agent/pi-git.json" "$unit"
+        # A switch must not wait for a running watcher (a ship waits for the deploy of this machine).
+        grep -q "X-RestartIfChanged=false" "$unit"
         test -f "$homeFiles/.config/systemd/user/pi-git-watcher.timer"
         test -x "${hm.config.home.path}/bin/pi-git-status"
         # One round of the watcher with an empty queue.

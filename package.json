@@ -15,7 +15,7 @@
   "scripts": {
     "typecheck": "tsc",
     "test": "vitest run",
-    "coverage": "vitest run --coverage",
+    "coverage": "bash scripts/test-coverage.sh",
     "knip": "knip",
     "test:unit": "vitest run --project unit",
     "test:integration": "vitest run --project integration"

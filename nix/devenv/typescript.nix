@@ -42,7 +42,7 @@ in
     test-all.exec = ''
       set -euo pipefail
       knip
-      vitest run --coverage
+      bash scripts/test-coverage.sh
     '';
     security-language.exec = "npm audit --audit-level=moderate";
   };
