@@ -7,7 +7,8 @@ The main agent of pi is good at making a change and expensive at the rest: runni
 their output, fixing lint, writing the commit message and the PR. With pi-git, the main agent calls
 `git_pr` with what the change is for. A cheap helper agent (`pi -p` with another model) fixes failing
 checks and writes the commit message and the PR; pi-git runs every git and GitHub step itself.
-`git_check` runs the checks of a repository the same way: the helper fixes failures, and the main
+`git_status` shows all open work across repositories, and `git_watch` hands a PR made by hand to the
+watcher. `git_check` runs the checks of a repository the same way: the helper fixes failures, and the main
 agent gets "passed" or a short summary instead of the full output. A
 watcher (a systemd user timer) then follows the PR: the helper fixes red CI and conflicts, and the
 main agent gets a summary when the PR is green, merged, or needs you. See the

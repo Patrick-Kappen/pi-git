@@ -56,6 +56,17 @@ main agent never reads the output:
 
 `git_check` changes files but never stages or commits them; that stays with `git_pr`.
 
+## `git_status` and `git_watch`
+
+`git_status` shows all work in progress, across repositories, and reads only: the PRs the watcher
+follows (state, fixes, link), what needs the user, and each worktree under `<worktrees>` with its
+branch, uncommitted files, unpushed commits, and whether the watcher has its PR. The main agent
+uses it instead of listing worktrees and PRs by hand.
+
+`git_watch` hands an open PR that was not made with `git_pr` to the watcher (`pr`: number or URL;
+`path`: a directory in the repository). It needs a worktree that has the PR's branch checked out,
+because the watcher fixes CI there. After that, the PR is followed like one from `git_pr`.
+
 ## The watcher
 
 `watcher.ts` runs one round over the queued PRs; a systemd user timer starts it every minute (see the
