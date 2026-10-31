@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/Patrick-Kappen/pi-git/compare/v0.9.0...v0.9.1) (2026-10-31)
+
+
+### Bug Fixes
+
+* **pi-git:** ship libraries, then one flake update,  ([2f9d949](https://github.com/Patrick-Kappen/pi-git/commit/2f9d949977814a4a6ac31620dfcd0844ada61fae))
+* **pi-git:** ship only the pi-* repositories, and never block a switch ([#42](https://github.com/Patrick-Kappen/pi-git/issues/42)) ([59645f3](https://github.com/Patrick-Kappen/pi-git/commit/59645f36b6bd440b30e69eba4f460a808df20fc3))
+
 ## [0.9.0](https://github.com/Patrick-Kappen/pi-git/compare/v0.8.0...v0.9.0) (2026-10-31)
 
 
