@@ -105,9 +105,10 @@ and looks for summaries every 20 seconds:
 
 Delivered summaries stay in `<stateDir>/delivered` for seven days, then the watcher deletes them.
 
-Each summary goes into the history once. `delivery` decides how: with `turn` (default), a PR that
-needs the agent (the watcher gave up) starts a turn; green, merged and closed PRs are added quietly
-for the next prompt. `message` adds every summary quietly, `notify` only shows it to you.
+Green is only shown to you; it is not done yet. Merged and closed PRs go into the history once,
+quietly, for the next prompt. A PR that needs the agent (the watcher gave up) goes into the history
+and, with `delivery: turn` (default), starts a turn. `message` never starts a turn, `notify` only
+shows everything to you.
 
 ## `git_start`
 
@@ -178,7 +179,9 @@ from open PRs to a deployed host:
      makes the lock again on the fresh default branch and force-pushes with a lease, at most 3
      times;
    - waits for the check run `…deploy-<host>` on that merge commit.
-4. **Done** when `deploy-<host>` succeeds: one notification with the released versions.
+4. **Done** when `deploy-<host>` succeeds: one notification with the released versions, and the
+   same text once, quietly, in the history of the session that started the ship. A problem goes there
+   too, as it happens.
 
 Red checks and conflicts are fixed by the helper, also when it is hard; it stops only when the fix
 would change behavior (choosing between behaviors, dropping a feature, changing what a test expects),

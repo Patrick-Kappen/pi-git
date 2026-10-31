@@ -20,7 +20,7 @@ import {
   shipLines,
   shipTick,
 } from "./ship.ts";
-import { type Entry, entryId, removeEntry, saveEntry } from "./state.ts";
+import { type Entry, entryId, loadSummaries, removeEntry, saveEntry } from "./state.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-git-ship-")));
 const nixos = join(root, "nixos");
@@ -259,7 +259,7 @@ describe("index", () => {
 });
 
 async function plan(releases: string[]): Promise<Ship> {
-  const ship = createShip(await indexShip(fake, nixos), releases, "gaia", clock);
+  const ship = { ...createShip(await indexShip(fake, nixos), releases, "gaia", clock), sessionId: "s-ship" };
   saveShip(config.stateDir, ship);
   return ship;
 }
@@ -313,6 +313,10 @@ describe("shipTick", () => {
     ship = await tick();
     expect(ship).toMatchObject({ status: "done", nixos: { state: "done" } });
     expect(existsSync(ship?.nixos.worktree ?? "x")).toBe(false);
+    // The end goes into the history of the session that started the ship, once and quietly.
+    expect(loadSummaries(config.stateDir).map((item) => [item.status, item.sessionId, item.text])).toEqual([
+      ["merged", "s-ship", "pi-git ship: done. Released o/pi-git v0.3.0. Deployed on gaia."],
+    ]);
     expect(shipLines(ship as Ship)).toEqual(["o/pi-git: done v0.3.0", "o/pi-skills: done", "o/Nixos: done PR #77"]);
     // A finished ship does nothing more.
     calls.length = 0;
@@ -328,6 +332,9 @@ describe("shipTick", () => {
     expect(ship?.libs[0]).toMatchObject({ state: "failed", error: "the release workflow ended with failure" });
     expect(listAttention(config.stateDir).map((item) => item.text)).toEqual([
       "pi-git ship: o/pi-git needs you: the release workflow ended with failure",
+    ]);
+    expect(loadSummaries(config.stateDir).map((item) => [item.status, item.text])).toEqual([
+      ["failed", "pi-git ship: o/pi-git needs you: the release workflow ended with failure"],
     ]);
     // NixOS continues with pi-skills only.
     expect(ship?.nixos).toMatchObject({ state: "merge", inputs: ["pi-skills"] });
